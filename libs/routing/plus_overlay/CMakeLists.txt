@@ -15,6 +15,7 @@ target_link_libraries(${PROJECT_NAME}
     routing
     routing_common
     storage
+    traffic
     indexer
     platform
     geometry

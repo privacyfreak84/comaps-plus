@@ -19,7 +19,11 @@
 #include "routing/data_source.hpp"
 #include "routing/edge_estimator.hpp"
 #include "routing/fake_ending.hpp"
+#include "routing/checkpoints.hpp"
 #include "routing/index_graph_starter.hpp"
+#include "routing/index_router.hpp"
+#include "routing/route.hpp"
+#include "routing/router_delegate.hpp"
 #include "routing/mwm_hierarchy_handler.hpp"
 #include "routing/single_vehicle_world_graph.hpp"
 #include "routing/index_graph.hpp"
@@ -32,7 +36,11 @@
 #include "routing_common/car_model.hpp"
 #include "routing_common/num_mwm_id.hpp"
 
+#include "storage/country_info_getter.hpp"
 #include "storage/country_parent_getter.hpp"
+#include "storage/routing_helpers.hpp"
+
+#include "traffic/traffic_cache.hpp"
 
 #include "indexer/classificator_loader.hpp"
 #include "indexer/data_source.hpp"
@@ -73,6 +81,8 @@ DEFINE_uint32(threads, 2, "Customization threads.");
 DEFINE_uint32(random_queries, 100, "Random in-component query pairs.");
 DEFINE_uint32(verify, 3, "Named pairs to check against CoMaps' AStarAlgorithm (slow, in order of the list).");
 DEFINE_uint32(point_tests, 12, "Random point-to-point routes (plus 3 named) checked against IndexGraphStarter.");
+DEFINE_bool(router_tests, true,
+            "Route through every via-way restriction with CoMaps' real IndexRouter and check it against the overlay.");
 DEFINE_bool(avoid_test, true, "Run the avoid-place recustomization test.");
 DEFINE_double(avoid_radius_m, 1500, "Radius of the avoided area.");
 DEFINE_uint64(seed, 42, "Random seed.");
@@ -936,7 +946,8 @@ int main(int argc, char ** argv)
   }
 
 
-  // 6b. Routes through every via-way restriction.
+  // 6b. Routes through every via-way restriction. The start/end vertices are kept for 6d.
+  std::vector<std::pair<VertexId, VertexId>> viaTests(cm->viaWay.size(), {kNone, kNone});
   if (!cm->viaWay.empty())
   {
     std::cout << "\n[6b] Via-way restrictions: a short route through each one\n"
@@ -1017,6 +1028,7 @@ int main(int argc, char ** argv)
         continue;
       }
       ++tested;
+      viaTests[idx - 1] = {s, t};
       auto const base = BidirectionalDijkstra(g, s, t, sc);
       auto const ovr = OverlayQuery(g, part, ov, s, t, sc, true);
       std::vector<routing::Segment> ours;
@@ -1046,9 +1058,10 @@ int main(int argc, char ** argv)
 
 
   // 6c. Arbitrary start and finish points, the way IndexRouter handles them inside one map.
-  if (FLAGS_point_tests > 0)
+  if (FLAGS_point_tests > 0 || (FLAGS_router_tests && !cm->viaWay.empty()))
   {
-    std::cout << "\n[6c] Point to point: CoMaps IndexGraphStarter (fake endings) + overlay, vs AStarAlgorithm on the starter\n";
+    if (FLAGS_point_tests > 0)
+      std::cout << "\n[6c] Point to point: CoMaps IndexGraphStarter (fake endings) + overlay, vs AStarAlgorithm on the starter\n";
     auto & ig = *cm->graph;
     auto & world = *cm->world;
 
@@ -1172,6 +1185,117 @@ int main(int argc, char ** argv)
       }
     };
 
+    // Copies of each raw segment made for via-way states: a route may arrive at a segment in any state.
+    std::unordered_map<VertexId, std::vector<VertexId>> copiesOf;
+    for (VertexId v = raw.baseN; v < raw.g.n; ++v)
+      copiesOf[raw.Orig(v)].push_back(v);
+
+    // Best route between real segments with entry costs (srcReal) and exit costs (tgtReal). Chains are
+    // walked to the nearest kept vertices on both sides; a target on a source's own chain is caught
+    // directly. |direct|: an already known answer that never leaves the fake vertices.
+    struct Answer
+    {
+      double weight = kInf;
+      std::vector<routing::Segment> segs;
+    };
+    auto solve = [&](std::map<routing::Segment, double> const & srcReal,
+                     std::map<routing::Segment, double> const & tgtReal, double direct)
+    {
+      std::unordered_map<VertexId, double> tRaw;
+      for (auto const & [seg, c] : tgtReal)
+      {
+        VertexId const b = raw.FromSegment(seg);
+        tRaw[b] = c;
+        if (auto it = copiesOf.find(b); it != copiesOf.end())
+          for (VertexId x : it->second)
+            tRaw[x] = c;
+      }
+      std::map<uint32_t, std::pair<double, std::vector<VertexId>>> srcChain, tgtChain;
+      std::vector<VertexId> chain, directPath;
+      for (auto const & [seg, c] : srcReal)
+      {
+        auto const [kc, cost] = walkForward(raw.FromSegment(seg), c, chain);
+        double acc = c;
+        for (size_t i = 0; i < chain.size(); ++i)
+        {
+          if (i > 0)
+            acc += RawEdge(raw.g, chain[i - 1], chain[i]);
+          auto it = tRaw.find(chain[i]);
+          if (it != tRaw.end() && acc + it->second < direct)
+          {
+            direct = acc + it->second;
+            directPath.assign(chain.begin(), chain.begin() + i + 1);
+          }
+        }
+        if (kc != kNone && (!srcChain.count(kc) || cost < srcChain[kc].first))
+          srcChain[kc] = {cost, chain};
+      }
+      for (auto const & [target, c] : tRaw)
+      {
+        VertexId x = target;
+        double cost = c;
+        std::vector<VertexId> back{x};
+        while (rawToComp[x] == kNone && pred[x] != kNone && back.size() < 100000)
+        {
+          cost += predW[x];
+          x = pred[x];
+          back.push_back(x);
+        }
+        if (rawToComp[x] == kNone)
+          continue;
+        std::reverse(back.begin(), back.end());  // kept .. target segment
+        uint32_t const kc = rawToComp[x];
+        if (!tgtChain.count(kc) || cost < tgtChain[kc].first)
+          tgtChain[kc] = {cost, back};
+      }
+      Seeds src, tgt;
+      for (auto const & [kc, v] : srcChain)
+        src.emplace_back(kc, v.first);
+      for (auto const & [kc, v] : tgtChain)
+        tgt.emplace_back(kc, v.first);
+      auto const ovr = OverlayQueryMulti(g, part, ov, src, tgt, sc, true /* wantPath */);
+      Answer out;
+      out.weight = std::min(ovr.weight, direct);
+      std::vector<VertexId> rawPath;
+      if (direct <= ovr.weight)
+      {
+        rawPath = directPath;
+      }
+      else if (!ovr.path.empty())
+      {
+        auto const & pre = srcChain[ovr.path.front()].second;
+        rawPath.assign(pre.begin(), pre.end() - 1);
+        auto const mid = ToRawPath(raw.g, comp, rawToComp, ovr.path);
+        rawPath.insert(rawPath.end(), mid.begin(), mid.end());
+        auto const & suf = tgtChain[ovr.path.back()].second;
+        rawPath.insert(rawPath.end(), suf.begin() + 1, suf.end());
+      }
+      for (VertexId rv : rawPath)
+        out.segs.push_back(raw.ToSegment(cm->mwmId, rv));
+      return out;
+    };
+
+    // Overlay answer for two coordinates, with CoMaps' own fake endings on nearest-segment snaps.
+    auto pointAnswer = [&](double la1, double lo1, double la2, double lo2)
+    {
+      Answer out;
+      auto const sSegs = snap(la1, lo1), fSegs = snap(la2, lo2);
+      if (sSegs.empty() || fSegs.empty())
+        return out;
+      routing::IndexGraphStarter starter(routing::MakeFakeEnding(sSegs, mercator::FromLatLon(la1, lo1), world),
+                                         routing::MakeFakeEnding(fSegs, mercator::FromLatLon(la2, lo2), world),
+                                         0 /* fakeNumerationStart */, false /* strictForward */, world);
+      Parents pf, pb;
+      starter.SetAStarParents(true, pf);
+      starter.SetAStarParents(false, pb);
+      std::map<routing::Segment, double> srcReal, tgtReal;
+      double direct = kInf;
+      fakeSearch(starter, true, srcReal, direct);
+      fakeSearch(starter, false, tgtReal, direct);
+      starter.DropAStarParents();
+      return solve(srcReal, tgtReal, direct);
+    };
+
     struct PointPair
     {
       std::string name;
@@ -1202,7 +1326,7 @@ int main(int argc, char ** argv)
     Algo algo;
     base::Cancellable cancellable;
     uint32_t okW = 0, okP = 0, run = 0;
-    for (auto const & pp : pairs)
+    for (auto const & pp : FLAGS_point_tests > 0 ? pairs : std::vector<PointPair>())
     {
       auto const sSegs = snap(pp.la1, pp.lo1), fSegs = snap(pp.la2, pp.lo2);
       if (sSegs.empty() || fSegs.empty())
@@ -1225,74 +1349,10 @@ int main(int argc, char ** argv)
       fakeSearch(starter, false, tgtReal, direct);
       starter.DropAStarParents();
 
-      // Real entry/exit segments -> overlay vertices, through their chains.
-      std::unordered_map<VertexId, double> tRaw;
-      for (auto const & [seg, c] : tgtReal)
-        tRaw[raw.FromSegment(seg)] = c;
-      std::map<uint32_t, std::pair<double, std::vector<VertexId>>> srcChain, tgtChain;
-      std::vector<VertexId> chain, directPath;
-      for (auto const & [seg, c] : srcReal)
-      {
-        auto const [kc, cost] = walkForward(raw.FromSegment(seg), c, chain);
-        // A target may sit on the same chain, before any junction.
-        double acc = c;
-        for (size_t i = 0; i < chain.size(); ++i)
-        {
-          if (i > 0)
-            acc += RawEdge(raw.g, chain[i - 1], chain[i]);
-          auto it = tRaw.find(chain[i]);
-          if (it != tRaw.end() && acc + it->second < direct)
-          {
-            direct = acc + it->second;
-            directPath.assign(chain.begin(), chain.begin() + i + 1);
-          }
-        }
-        if (kc != kNone && (!srcChain.count(kc) || cost < srcChain[kc].first))
-          srcChain[kc] = {cost, chain};
-      }
-      for (auto const & [seg, c] : tgtReal)
-      {
-        VertexId x = raw.FromSegment(seg);
-        double cost = c;
-        std::vector<VertexId> back{x};
-        while (rawToComp[x] == kNone && pred[x] != kNone && back.size() < 100000)
-        {
-          cost += predW[x];
-          x = pred[x];
-          back.push_back(x);
-        }
-        if (rawToComp[x] == kNone)
-          continue;
-        std::reverse(back.begin(), back.end());  // kept .. target segment
-        uint32_t const kc = rawToComp[x];
-        if (!tgtChain.count(kc) || cost < tgtChain[kc].first)
-          tgtChain[kc] = {cost, back};
-      }
-      Seeds src, tgt;
-      for (auto const & [kc, v] : srcChain)
-        src.emplace_back(kc, v.first);
-      for (auto const & [kc, v] : tgtChain)
-        tgt.emplace_back(kc, v.first);
-      auto const ovr = OverlayQueryMulti(g, part, ov, src, tgt, sc, true /* wantPath */);
-      double const total = std::min(ovr.weight, direct);
-      std::vector<VertexId> rawPath;
-      if (direct <= ovr.weight)
-      {
-        rawPath = directPath;
-      }
-      else if (!ovr.path.empty())
-      {
-        auto const & pre = srcChain[ovr.path.front()].second;
-        rawPath.assign(pre.begin(), pre.end() - 1);
-        auto const mid = ToRawPath(raw.g, comp, rawToComp, ovr.path);
-        rawPath.insert(rawPath.end(), mid.begin(), mid.end());
-        auto const & suf = tgtChain[ovr.path.back()].second;
-        rawPath.insert(rawPath.end(), suf.begin() + 1, suf.end());
-      }
+      auto const ans = solve(srcReal, tgtReal, direct);
+      double const total = ans.weight;
       double const oursMs = Since(t0p) * 1000;
-      std::vector<routing::Segment> ourSegs;
-      for (VertexId rv : rawPath)
-        ourSegs.push_back(raw.ToSegment(cm->mwmId, rv));
+      auto const & ourSegs = ans.segs;
 
       // Reference: the router's own search on the same starter (heuristic, wave-join checks).
       Algo::Params<> params(starter, starter.GetStartSegment(), starter.GetFinishSegment(), cancellable);
@@ -1313,7 +1373,134 @@ int main(int argc, char ** argv)
                 << (wOk ? "MATCH" : "DIFF") << ", real segments " << ourSegs.size() << "/" << theirSegs.size() << " "
                 << (pOk ? "identical" : "differ") << "\n";
     }
-    std::cout << "  point tests: " << run << " run, weight matches " << okW << ", identical paths " << okP << "\n";
+    if (FLAGS_point_tests > 0)
+      std::cout << "  point tests: " << run << " run, weight matches " << okW << ", identical paths " << okP << "\n";
+
+    // 6d. CoMaps' real router through every via-way restriction.
+    if (FLAGS_router_tests && !cm->viaWay.empty())
+    {
+      std::cout << "\n[6d] Via-way restrictions vs CoMaps' real IndexRouter (the app's router: bidirectional A* over joints)\n"
+                << "     points: middle of the 6b start and end segments. 'router' = weight of the router's own\n"
+                << "     real-segment path; 'best' = overlay from the router's first to its last real segment\n"
+                << "     (same endpoints, so any gap is the search itself); 'points' = overlay point to point.\n";
+      std::shared_ptr<storage::CountryInfoGetter> cig = storage::CountryInfoReader::CreateCountryInfoGetter(GetPlatform());
+      auto const countryFileGetter = [cig](m2::PointD const & pt) { return cig->GetRegionCountryId(pt); };
+      auto const rectGetter = [cig](std::string const & id) { return cig->GetLimitRectForLeaf(id); };
+      traffic::TrafficCache trafficCache;
+      routing::IndexRouter router(routing::VehicleType::Car, false /* loadAltitudes */, *cm->cpg, countryFileGetter,
+                                  rectGetter, cm->numMwmIds, routing::MakeNumMwmTree(*cm->numMwmIds, *cig),
+                                  trafficCache, cm->dataSource);
+      routing::RouterDelegate delegate;
+
+      // Weight of a segment path as CoMaps scores it (integrated weights of the raw edges).
+      auto pathWeight = [&](std::vector<routing::Segment> const & segs, size_t & gaps)
+      {
+        double w = 0;
+        gaps = 0;
+        for (size_t i = 1; i < segs.size(); ++i)
+        {
+          VertexId const u = raw.FromSegment(segs[i - 1]), v = raw.FromSegment(segs[i]);
+          double best = kInf;
+          for (uint64_t e = raw.g.fwdOff[u]; e < raw.g.fwdOff[u + 1]; ++e)
+            if (raw.Orig(raw.g.fwdTo[e]) == v)
+              best = std::min(best, raw.g.fwdW[e]);
+          if (best >= kInf)
+            ++gaps;
+          else
+            w += best;
+        }
+        return w;
+      };
+      auto midpoint = [&](routing::Segment const & sg)
+      {
+        auto const & a = ig.GetPoint(sg, false);
+        auto const & b = ig.GetPoint(sg, true);
+        return std::make_pair((a.m_lat + b.m_lat) / 2, (a.m_lon + b.m_lon) / 2);
+      };
+
+      uint32_t run = 0, optimal = 0, worse = 0, failed = 0, violating = 0;
+      std::string worseList, failedList;
+      std::ofstream pts("plus_overlay_viaway_points.txt");
+      for (size_t i = 0; i < viaTests.size(); ++i)
+      {
+        auto const [s, t] = viaTests[i];
+        if (s == kNone)
+          continue;
+        ++run;
+        auto const p1 = midpoint(raw.ToSegment(cm->mwmId, comp.origId[s]));
+        auto const p2 = midpoint(raw.ToSegment(cm->mwmId, comp.origId[t]));
+        pts.precision(7);
+        pts << std::fixed << p1.first << " " << p1.second << " " << p2.first << " " << p2.second << "\n";
+
+        routing::Route route("" /* router */, 0 /* routeId */);
+        delegate.SetTimeout(600);
+        auto const t1 = Clock::now();
+        auto const code = router.CalculateRoute(
+            routing::Checkpoints(mercator::FromLatLon(p1.first, p1.second), mercator::FromLatLon(p2.first, p2.second)),
+            m2::PointD::Zero(), false /* adjustToPrevRoute */, delegate, route);
+        double const secs = Since(t1);
+        auto const pa = pointAnswer(p1.first, p1.second, p2.first, p2.second);
+
+        char head[160];
+        std::snprintf(head, sizeof(head), "  #%zu (%.6f, %.6f -> %.6f, %.6f): ", i + 1, p1.first, p1.second, p2.first,
+                      p2.second);
+        std::cout << head;
+        if (code != routing::RouterResultCode::NoError)
+        {
+          ++failed;
+          failedList += " #" + std::to_string(i + 1);
+          std::cout << "router FAILED (" << routing::DebugPrint(code) << ") after " << secs << " s | points "
+                    << pa.weight << " s, " << CountViolations(pa.segs, cm->viaWay) << " violations\n";
+          continue;
+        }
+        std::vector<routing::Segment> rsegs;
+        for (auto const & rseg : route.GetRouteSegments())
+        {
+          auto const & sg = rseg.GetSegment();
+          if (!sg.IsRealSegment() || sg.GetMwmId() != cm->mwmId)
+            continue;
+          if (rsegs.empty() || !(rsegs.back() == sg))
+            rsegs.push_back(sg);
+        }
+        size_t gaps = 0;
+        double const rw = pathWeight(rsegs, gaps);
+        size_t const viol = CountViolations(rsegs, cm->viaWay);
+        double best = kInf;
+        if (!rsegs.empty())
+          best = solve({{rsegs.front(), 0.0}}, {{rsegs.back(), 0.0}}, rsegs.front() == rsegs.back() ? 0.0 : kInf).weight;
+        bool const same = Same(rw, best);
+        if (viol)
+          ++violating;
+        if (same && !viol && !gaps)
+          ++optimal;
+        else if (!same && rw > best)
+        {
+          ++worse;
+          worseList += " #" + std::to_string(i + 1);
+        }
+        std::cout << "router " << rw << " s (" << rsegs.size() << " segments, ETA " << route.GetTotalTimeSec() << " s, "
+                  << secs << " s)" << (gaps ? " [" + std::to_string(gaps) + " gaps]" : "")
+                  << (viol ? " [VIOLATES]" : "") << " | best " << best << " s | "
+                  << (same ? "OPTIMAL" : (rw > best ? "WORSE by " + std::to_string(rw - best) + " s" : "BETTER?!"))
+                  << " | points " << pa.weight << " s" << (CountViolations(pa.segs, cm->viaWay) ? " [VIOLATES]" : "")
+                  << "\n";
+        auto feats = [](std::vector<routing::Segment> const & v)
+        {
+          std::string out;
+          for (uint32_t f : FeatureSequence(v))
+            out += " " + std::to_string(f);
+          return out;
+        };
+        std::string pat;
+        for (uint32_t f : cm->viaWay[i])
+          pat += " " + std::to_string(f);
+        std::cout << "      restriction:" << pat << " | router features:" << feats(rsegs)
+                  << " | points features:" << feats(pa.segs) << "\n";
+      }
+      std::cout << "  router tests: " << run << " run, optimal " << optimal << ", worse " << worse << " (" << worseList
+                << " ), failed " << failed << " (" << failedList << " ), violating " << violating
+                << "; points written to plus_overlay_viaway_points.txt\n";
+    }
   }
 
   // 7. Avoid a place: block every vertex near the middle of Lucknow -> Agra, recustomize.
