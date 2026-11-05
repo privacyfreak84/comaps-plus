@@ -1853,7 +1853,11 @@ void IndexRouter::SetupAlgorithmMode(IndexGraphStarter & starter, bool guidesAct
   case VehicleType::Transit: starter.GetGraph().SetMode(WorldGraphMode::NoLeaps); break;
   case VehicleType::Car:
   case VehicleType::Decoder:
-    starter.GetGraph().SetMode(AreMwmsNear(starter) ? WorldGraphMode::Joints : WorldGraphMode::LeapsOnly);
+    // Comaps++: COMAPS_PLUS_FORCE_JOINTS=1 skips leaps and runs one search over all maps, for comparison.
+    if (std::getenv("COMAPS_PLUS_FORCE_JOINTS") != nullptr)
+      starter.GetGraph().SetMode(WorldGraphMode::Joints);
+    else
+      starter.GetGraph().SetMode(AreMwmsNear(starter) ? WorldGraphMode::Joints : WorldGraphMode::LeapsOnly);
     break;
   case VehicleType::Count: CHECK(false, ("Unknown vehicle type:", m_vehicleType)); break;
   }
