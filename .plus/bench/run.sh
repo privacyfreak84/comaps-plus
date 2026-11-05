@@ -5,7 +5,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCH="${BENCH:-$HOME/comaps-bench}"
 BUILD="${BUILD:-$REPO/../omim-build-release}"
 ROUTES="${ROUTES:-$REPO/.plus/bench/routes.txt}"
-LAUNCHES="${LAUNCHES:-3}"
+LAUNCHES="${LAUNCHES:-1}"
 STATES="${STATES:-Uttar Pradesh|Madhya Pradesh|Maharashtra|Rajasthan|Gujarat|Chhattisgarh|Telangana|Delhi|Haryana}"
 SERVER="${SERVER:-https://mapgen-fi-1.comaps.app}"
 
