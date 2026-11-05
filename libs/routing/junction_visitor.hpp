@@ -1,6 +1,7 @@
 #pragma once
 
 #include "routing/base/astar_progress.hpp"
+#include "routing/plus_timing.hpp"
 
 #include "routing/router_delegate.hpp"
 
@@ -58,6 +59,7 @@ public:
   void operator()(Vertex const & from, Vertex const & to)
   {
     ++m_visitCounter;
+    plus_timing::OnVisit();
     if (m_visitCounter % m_visitPeriod != 0)
       return;
 

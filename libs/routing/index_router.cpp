@@ -18,6 +18,7 @@
 #include "routing/junction_visitor.hpp"
 #include "routing/latlon_with_altitude.hpp"
 #include "routing/leaps_graph.hpp"
+#include "routing/plus_timing.hpp"
 #include "routing/mwm_hierarchy_handler.hpp"
 #include "routing/pedestrian_directions.hpp"
 #include "routing/route.hpp"
@@ -518,6 +519,7 @@ RouterResultCode IndexRouter::DoCalculateRoute(Checkpoints const & checkpoints, 
                                                RouterDelegate const & delegate, Route & route)
 {
   m_lastRoute.reset();
+  plus_timing::Scope plusTotal("route total");
 
   TrafficStash::Guard guard(m_trafficStash);
   unique_ptr<WorldGraph> graph = MakeWorldGraph();
@@ -685,6 +687,7 @@ RouterResultCode IndexRouter::CalculateSubroute(Checkpoints const & checkpoints,
   LOG(LINFO, ("Routing in mode:", mode));
 
   base::ScopedTimerWithLog timer("Route build");
+  plus_timing::Scope plusSubroute("subroute " + std::to_string(subrouteIdx) + " mode " + DebugPrint(mode));
   switch (mode)
   {
   case WorldGraphMode::Joints: return CalculateSubrouteJointsMode(starter, delegate, progress, subroute);
@@ -829,6 +832,7 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
     base::Timer timer;
 
     using AlgoT = AStarAlgorithm<Vertex, Edge, Weight>;
+    plus_timing::Scope plusLeaps("stage 1 leaps search");
     auto const result = AlgoT().FindPathBidirectionalEx(params, [&](RoutingResultT && route)
     {
       // Take unique routes by key vertices.
@@ -924,6 +928,7 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
   {
     SCOPE_GUARD(progressGuard, [&progress]() { progress->PushAndDropLastSubProgress(); });
     progress->AppendSubProgress(AStarSubProgress(kCandidatesStageContribution));
+    plus_timing::Scope plusScoring("stage 2 candidate scoring, candidates " + std::to_string(candidates.size()));
     double const candidateContribution = kCandidatesStageContribution / (2 * candidates.size());
 
     // Select best candidate by calculating start/end sub-routes and using candidateMidWeights.
@@ -932,6 +937,9 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
     {
       auto const & c = candidates[i];
       LOG(LDEBUG, ("Process leaps:", c.m_distance, c.m_path));
+      plus_timing::Scope plusCandidate("stage 2 candidate " + std::to_string(i) + " " +
+                                       MwmName(c.m_path[1].GetMwmId()) + " .. " +
+                                       MwmName(c.m_path[c.m_path.size() - 2].GetMwmId()));
 
       size_t const sz = c.m_path.size();
       auto const * r1 = calculator.Calc2Times(c.m_path[0], c.m_path[1], progress, candidateContribution);
@@ -957,7 +965,10 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
 
   // Calculate route for the best candidate.
   RoutingResultT result;
-  ProcessLeapsJoints(bestC->m_path, starter, progress, calculator, result);
+  {
+    plus_timing::Scope plusExpand("stage 3 expand best candidate");
+    ProcessLeapsJoints(bestC->m_path, starter, progress, calculator, result);
+  }
 
   if (result.Empty())
     return RouterResultCode::RouteNotFound;
@@ -1373,6 +1384,9 @@ IndexRouter::RoutingResultT const * IndexRouter::RoutesCalculator::Calc(Segment 
 
   // Actually, we can (should?) append/push-drop progress even if the route is already in cache,
   // but I'd like to avoid this unnecessary actions here.
+  if (!itCache.second)
+    LOG(LINFO, ("[plus-timing] cache hit"));
+
   if (itCache.second)
   {
     LOG(LDEBUG, ("Calculating sub-route:", beg, end));
@@ -1427,6 +1441,7 @@ IndexRouter::RoutingResultT const * IndexRouter::RoutesCalculator::Calc2Times(Se
   auto const * r = Calc(beg, end, progress, progressCoef);
   if (r == nullptr)
   {
+    LOG(LINFO, ("[plus-timing] single-mwm search failed, retrying across mwms"));
     m_starter.GetGraph().SetMode(WorldGraphMode::Joints);
     r = Calc(beg, end, progress, progressCoef);
   }
@@ -1476,6 +1491,7 @@ RouterResultCode IndexRouter::ProcessLeapsJoints(vector<Segment> const & input, 
       arrEnd.push_back(i);
 
   size_t const variantsCount = arrBeg.size() * arrEnd.size();
+  LOG(LINFO, ("[plus-timing] stage 3 loop variants:", variantsCount, "leaps:", (input.size() - 2) / 2));
   ASSERT(variantsCount > 0, ());
 
   for (size_t startLeapEnd : arrBeg)
@@ -1497,6 +1513,8 @@ RouterResultCode IndexRouter::ProcessLeapsJoints(vector<Segment> const & input, 
         // worldGraph.ClearCachedGraphs();
         worldGraph.SetMode(mode);
 
+        plus_timing::Scope plusLeg("stage 3 leg " + DebugPrint(mode) + " " + MwmName(input[start].GetMwmId()) +
+                                   " -> " + MwmName(input[end].GetMwmId()));
         return calculator.Calc(input[start], input[end], progress, contribCoef);
       };
 
@@ -1616,6 +1634,7 @@ RouterResultCode IndexRouter::ProcessLeapsJoints(vector<Segment> const & input, 
 RouterResultCode IndexRouter::RedressRoute(vector<Segment> const & segments, base::Cancellable const & cancellable,
                                            IndexGraphStarter & starter, Route & route)
 {
+  plus_timing::Scope plusRedress("redress route");
   CHECK(!segments.empty(), ());
   IndexGraphStarter::CheckValidRoute(segments);
 
@@ -1715,6 +1734,13 @@ RouterResultCode IndexRouter::RedressRoute(vector<Segment> const & segments, bas
   route.SetMwmsPartlyProhibitedForSpeedCams(std::move(speedCamProhibited));
 
   return RouterResultCode::NoError;
+}
+
+std::string IndexRouter::MwmName(NumMwmId id) const
+{
+  if (id == kFakeNumMwmId || !m_numMwmIds->ContainsFileForMwm(id))
+    return "fake";
+  return m_numMwmIds->GetFile(id).GetName();
 }
 
 bool IndexRouter::AreSpeedCamerasProhibited(NumMwmId mwmID) const

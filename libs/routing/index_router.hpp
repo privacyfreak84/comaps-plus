@@ -239,6 +239,7 @@ private:
                                 IndexGraphStarter & starter, Route & route);
 
   bool AreSpeedCamerasProhibited(NumMwmId mwmID) const;
+  std::string MwmName(NumMwmId id) const;
   bool AreMwmsNear(IndexGraphStarter const & starter) const;
   bool DoesTransitSectionExist(NumMwmId numMwmId);
 

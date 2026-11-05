@@ -107,6 +107,7 @@ set(SRC
   opening_hours_serdes.hpp
   pedestrian_directions.cpp
   pedestrian_directions.hpp
+  plus_timing.hpp
   position_accumulator.cpp
   position_accumulator.hpp
   regions_router.cpp
