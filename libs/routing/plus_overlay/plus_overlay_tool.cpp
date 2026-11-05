@@ -8,8 +8,8 @@
 // 5. Avoid-place test: blocks an area, recustomizes only the touched cells, re-checks.
 //
 // Example:
-//   plus_overlay_tool --resources_path=data --maps_path=~/comaps-bench/maps \
-//     --mwm="India_Uttar Pradesh" --mwm_version=261004 --cache=/tmp/up.graph
+//   plus_overlay_tool --resources_path=data --maps_path=~/comaps-bench/maps
+//     --mwm="India_Uttar Pradesh" --mwm_version=261004 --cache=/tmp/up.graph   (one line)
 
 #include "routing/plus_overlay/overlay.hpp"
 
@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <random>
 #include <sstream>
@@ -110,8 +111,19 @@ struct Raw
   std::vector<uint8_t> valid;
   std::vector<uint32_t> featBase;  // segment index of the first segment of feature f; size maxF + 2
 
+  // Vertices >= baseN are copies of segments made for via-way restriction states.
+  uint32_t baseN = 0;
+  std::vector<VertexId> copyOrig;
+
+  VertexId Orig(VertexId v) const { return v < baseN ? v : copyOrig[v - baseN]; }
+  uint32_t FeatureOf(VertexId v) const
+  {
+    uint32_t const segIdx = Orig(v) / 2;
+    return static_cast<uint32_t>(std::upper_bound(featBase.begin(), featBase.end(), segIdx) - featBase.begin()) - 1;
+  }
   routing::Segment ToSegment(routing::NumMwmId mwm, VertexId v) const
   {
+    v = Orig(v);
     uint32_t const segIdx = v / 2;
     auto it = std::upper_bound(featBase.begin(), featBase.end(), segIdx);
     uint32_t const f = static_cast<uint32_t>(it - featBase.begin()) - 1;
@@ -188,6 +200,7 @@ struct CoMaps
   routing::IndexGraph * graph = nullptr;
   std::shared_ptr<storage::CountryParentGetter> cpg;
   time_t fixedTime = 0;
+  std::vector<std::vector<uint32_t>> viaWay;  // forbidden feature chains [from, via..., to], 3+ features
 
   void Init()
   {
@@ -227,7 +240,11 @@ struct CoMaps
     auto restrictions = rl.StealRestrictions();
     size_t bySize[6] = {};
     for (auto const & r : restrictions)
+    {
       ++bySize[std::min<size_t>(r.size(), 5)];
+      if (r.size() >= 3)
+        viaWay.push_back(r);
+    }
     std::cout << "  restrictions (as 'no' chains): total " << restrictions.size() << ", 2-feature " << bySize[2]
               << ", via-way (3+ features) " << (bySize[3] + bySize[4] + bySize[5]) << "\n";
     routing::RoadAccess ra;
@@ -321,22 +338,266 @@ void Extract(CoMaps & cm, Raw & raw)
             << " with pass-through/access penalties) in " << Since(t0) << " s, " << Mem() << "\n";
 }
 
+
+// Via-way restrictions ---------------------------------------------------------------------------
+//
+// CoMaps forbids a sequence of distinct consecutive features [F0, F1, ..., Fk] (k >= 2) by looking at
+// the A* parents. A parent-dependent check is not exact for a label-setting search, so here the
+// state is made explicit instead: an Aho-Corasick automaton over the feature sequence, and a copy
+// of a segment for every automaton state of depth >= 2 it can be in. Forbidden transitions become
+// missing edges, so everything downstream (compression, cells, queries) stays a plain graph search.
+class ViaWayAutomaton
+{
+public:
+  explicit ViaWayAutomaton(std::vector<std::vector<uint32_t>> const & patterns)
+  {
+    NewNode(0, 0);
+    for (auto const & pat : patterns)
+    {
+      uint32_t n = 0;
+      for (uint32_t f : pat)
+      {
+        auto it = m_next[n].find(f);
+        if (it == m_next[n].end())
+        {
+          uint32_t const c = NewNode(f, m_depth[n] + 1);
+          m_next[n][f] = c;
+          n = c;
+        }
+        else
+        {
+          n = it->second;
+        }
+      }
+      m_term[n] = 1;
+    }
+    std::vector<uint32_t> queue;
+    for (auto const & [f, c] : m_next[0])
+      queue.push_back(c);
+    for (size_t i = 0; i < queue.size(); ++i)
+    {
+      uint32_t const u = queue[i];
+      m_term[u] |= m_term[m_fail[u]];
+      for (auto const & [f, c] : m_next[u])
+      {
+        m_fail[c] = (u == 0) ? 0 : Step(m_fail[u], f);
+        queue.push_back(c);
+      }
+    }
+  }
+
+  uint32_t Step(uint32_t n, uint32_t f) const
+  {
+    while (true)
+    {
+      auto it = m_next[n].find(f);
+      if (it != m_next[n].end())
+        return it->second;
+      if (n == 0)
+        return 0;
+      n = m_fail[n];
+    }
+  }
+  uint32_t Start(uint32_t f) const { return Step(0, f); }
+  uint32_t Size() const { return static_cast<uint32_t>(m_depth.size()); }
+  uint32_t Depth(uint32_t n) const { return m_depth[n]; }
+  uint32_t Label(uint32_t n) const { return m_label[n]; }
+  bool Terminal(uint32_t n) const { return m_term[n]; }
+
+private:
+  uint32_t NewNode(uint32_t label, uint32_t depth)
+  {
+    m_next.emplace_back();
+    m_fail.push_back(0);
+    m_depth.push_back(depth);
+    m_label.push_back(label);
+    m_term.push_back(0);
+    return Size() - 1;
+  }
+  std::vector<std::map<uint32_t, uint32_t>> m_next;
+  std::vector<uint32_t> m_fail, m_depth, m_label;
+  std::vector<uint8_t> m_term;
+};
+
+void ExpandViaWay(Raw & raw, std::vector<std::vector<uint32_t>> const & patterns)
+{
+  auto const t0 = Clock::now();
+  Graph & g = raw.g;
+  raw.baseN = g.n;
+  if (patterns.empty())
+    return;
+  ViaWayAutomaton ac(patterns);
+
+  // Copies: (state, original vertex) for every non-terminal state of depth >= 2.
+  std::vector<std::pair<uint32_t, VertexId>> copies;
+  std::map<std::pair<uint32_t, VertexId>, VertexId> copyId;
+  for (uint32_t n = 0; n < ac.Size(); ++n)
+  {
+    if (ac.Depth(n) < 2 || ac.Terminal(n))
+      continue;
+    uint32_t const f = ac.Label(n);
+    for (uint32_t v = 2 * raw.featBase[f]; v < 2 * raw.featBase[f + 1]; ++v)
+    {
+      if (!raw.valid[v])
+        continue;
+      copyId[{n, v}] = g.n + static_cast<VertexId>(copies.size());
+      copies.emplace_back(n, v);
+    }
+  }
+
+  std::vector<uint32_t> feat(g.n);
+  for (VertexId v = 0; v < g.n; ++v)
+    feat[v] = raw.FeatureOf(v);
+
+  uint64_t dropped = 0, redirected = 0;
+  Graph out;
+  out.n = g.n + static_cast<uint32_t>(copies.size());
+  out.fwdOff.assign(out.n + 1, 0);
+  out.fwdTo.reserve(g.fwdTo.size() + copies.size() * 3);
+  out.fwdW.reserve(g.fwdTo.size() + copies.size() * 3);
+  auto emit = [&](VertexId v, uint32_t state)
+  {
+    for (uint64_t e = g.fwdOff[v]; e < g.fwdOff[v + 1]; ++e)
+    {
+      VertexId const t = g.fwdTo[e];
+      uint32_t next = state;
+      if (feat[t] != feat[v])
+        next = ac.Step(state, feat[t]);
+      if (ac.Terminal(next))
+      {
+        ++dropped;
+        continue;
+      }
+      VertexId target = t;
+      if (ac.Depth(next) >= 2)
+      {
+        target = copyId.at({next, t});
+        ++redirected;
+      }
+      out.fwdTo.push_back(target);
+      out.fwdW.push_back(g.fwdW[e]);
+    }
+  };
+  for (VertexId v = 0; v < g.n; ++v)
+  {
+    if (raw.valid[v])
+      emit(v, ac.Start(feat[v]));
+    out.fwdOff[v + 1] = out.fwdTo.size();
+  }
+  for (size_t i = 0; i < copies.size(); ++i)
+  {
+    emit(copies[i].second, copies[i].first);
+    out.fwdOff[g.n + i + 1] = out.fwdTo.size();
+  }
+  out.lat = g.lat;
+  out.lon = g.lon;
+  raw.copyOrig.clear();
+  for (auto const & [n, v] : copies)
+  {
+    out.lat.push_back(g.lat[v]);
+    out.lon.push_back(g.lon[v]);
+    raw.copyOrig.push_back(v);
+  }
+  raw.valid.resize(out.n, 1);
+  g = std::move(out);
+  std::cout << "  via-way restrictions: " << patterns.size() << " patterns, automaton states " << ac.Size()
+            << ", segment copies " << copies.size() << ", edges redirected " << redirected << ", forbidden "
+            << dropped << " (" << Since(t0) << " s)\n";
+}
+
+// Cheapest raw edge u -> v, or kInf.
+double RawEdge(Graph const & g, VertexId u, VertexId v)
+{
+  double w = kInf;
+  for (uint64_t e = g.fwdOff[u]; e < g.fwdOff[u + 1]; ++e)
+    if (g.fwdTo[e] == v)
+      w = std::min(w, g.fwdW[e]);
+  return w;
+}
+
+// Compressed vertex path -> raw vertex path, walking the chain behind every compressed edge.
+std::vector<VertexId> ToRawPath(Graph const & raw, Compressed const & comp, std::vector<uint32_t> const & rawToComp,
+                                std::vector<VertexId> const & path)
+{
+  std::vector<VertexId> out;
+  if (path.empty())
+    return out;
+  out.push_back(comp.origId[path[0]]);
+  std::vector<VertexId> chain, best;
+  for (size_t i = 1; i < path.size(); ++i)
+  {
+    VertexId const ru = comp.origId[path[i - 1]], rw = comp.origId[path[i]];
+    double bestW = kInf;
+    for (uint64_t e = raw.fwdOff[ru]; e < raw.fwdOff[ru + 1]; ++e)
+    {
+      chain.assign(1, raw.fwdTo[e]);
+      double w = raw.fwdW[e];
+      VertexId x = raw.fwdTo[e];
+      while (rawToComp[x] == kNone && raw.fwdOff[x + 1] - raw.fwdOff[x] == 1 && chain.size() <= raw.n)
+      {
+        w += raw.fwdW[raw.fwdOff[x]];
+        x = raw.fwdTo[raw.fwdOff[x]];
+        chain.push_back(x);
+      }
+      if (x == rw && w < bestW)
+      {
+        bestW = w;
+        best = chain;
+      }
+    }
+    out.insert(out.end(), best.begin(), best.end());
+  }
+  return out;
+}
+
+double RawPathWeight(Graph const & raw, std::vector<VertexId> const & p)
+{
+  double w = 0;
+  for (size_t i = 1; i < p.size(); ++i)
+    w += RawEdge(raw, p[i - 1], p[i]);
+  return w;
+}
+
+// Distinct consecutive features along a segment path.
+std::vector<uint32_t> FeatureSequence(std::vector<routing::Segment> const & segs)
+{
+  std::vector<uint32_t> out;
+  for (auto const & s : segs)
+    if (out.empty() || out.back() != s.GetFeatureId())
+      out.push_back(s.GetFeatureId());
+  return out;
+}
+
+// Number of forbidden via-way chains that appear in the path.
+size_t CountViolations(std::vector<routing::Segment> const & segs, std::vector<std::vector<uint32_t>> const & patterns)
+{
+  auto const fs = FeatureSequence(segs);
+  size_t n = 0;
+  for (auto const & p : patterns)
+    for (size_t i = 0; i + p.size() <= fs.size(); ++i)
+      if (std::equal(p.begin(), p.end(), fs.begin() + i))
+        ++n;
+  return n;
+}
+
 // CoMaps reference: AStarAlgorithm (zero heuristic) directly on IndexGraph, with parents so
 // via-way restrictions are applied the way the router applies them.
 class IndexGraphAStar final : public routing::AStarGraph<routing::Segment, routing::SegmentEdge, routing::RouteWeight>
 {
 public:
-  explicit IndexGraphAStar(routing::IndexGraph & g) : m_g(g) {}
+  // ignoreParents: behave as if no via-way restriction existed (parents are what CoMaps uses to
+  // check them). Used to show which test routes the restrictions actually change.
+  IndexGraphAStar(routing::IndexGraph & g, bool ignoreParents = false) : m_g(g), m_ignoreParents(ignoreParents) {}
   Weight HeuristicCostEstimate(Vertex const &, Vertex const &) override { return routing::GetAStarWeightZero<Weight>(); }
   void GetOutgoingEdgesList(routing::astar::VertexData<Vertex, Weight> const & vd, EdgeListT & edges) override
   {
     edges.clear();
-    m_g.GetEdgeList(vd, true, true, edges, m_fwd ? *m_fwd : m_empty);
+    m_g.GetEdgeList(vd, true, true, edges, (m_fwd && !m_ignoreParents) ? *m_fwd : m_empty);
   }
   void GetIngoingEdgesList(routing::astar::VertexData<Vertex, Weight> const & vd, EdgeListT & edges) override
   {
     edges.clear();
-    m_g.GetEdgeList(vd, false, true, edges, m_bwd ? *m_bwd : m_empty);
+    m_g.GetEdgeList(vd, false, true, edges, (m_bwd && !m_ignoreParents) ? *m_bwd : m_empty);
   }
   void SetAStarParents(bool forward, Parents & parents) override { (forward ? m_fwd : m_bwd) = &parents; }
   void DropAStarParents() override { m_fwd = m_bwd = nullptr; }
@@ -345,6 +606,7 @@ public:
 
 private:
   routing::IndexGraph & m_g;
+  bool m_ignoreParents = false;
   Parents * m_fwd = nullptr;
   Parents * m_bwd = nullptr;
   Parents m_empty;
@@ -441,9 +703,9 @@ int main(int argc, char ** argv)
   // 1. Raw graph.
   std::cout << "\n[1] Raw segment graph\n";
   Raw raw;
+  ensureCoMaps();
   if (FLAGS_cache.empty() || !LoadRaw(raw, FLAGS_cache))
   {
-    ensureCoMaps();
     Extract(*cm, raw);
     if (!FLAGS_cache.empty())
       SaveRaw(raw, FLAGS_cache);
@@ -452,6 +714,7 @@ int main(int argc, char ** argv)
   {
     std::cout << "  loaded from cache " << FLAGS_cache << "\n";
   }
+  ExpandViaWay(raw, cm->viaWay);
   std::cout << "  vertices " << raw.g.n << ", edges " << raw.g.NumEdges() << "\n";
 
   // 2. Compression.
@@ -460,20 +723,20 @@ int main(int argc, char ** argv)
   Compressed comp = CompressChains(raw.g, raw.valid);
   Graph & g = comp.g;
   std::cout << "  " << g.n << " vertices, " << g.NumEdges() << " edges in " << Since(t0) << " s, " << Mem() << "\n";
-  {
-    // Raw edges are no longer needed; keep featBase/valid for Segment decoding.
-    Graph().fwdOff.swap(raw.g.fwdOff);
-    std::vector<VertexId>().swap(raw.g.fwdTo);
-    std::vector<double>().swap(raw.g.fwdW);
-    std::vector<float>().swap(raw.g.lat);
-    std::vector<float>().swap(raw.g.lon);
-  }
+  // The raw graph stays: it turns overlay answers into segment lists.
+  std::vector<uint32_t> rawToComp(raw.g.n, kNone);
+  for (uint32_t cv = 0; cv < g.n; ++cv)
+    rawToComp[comp.origId[cv]] = cv;
 
   // Main strongly connected component, seeded near Lucknow.
   std::vector<uint8_t> all(g.n, 1);
   VertexId const seed = Nearest(g, all, kPlaces[0].lat, kPlaces[0].lon);
   uint32_t sccSize = 0;
   auto inScc = StronglyConnectedFrom(g, seed, sccSize);
+  // Routes start and end on real segments, never on via-way state copies.
+  std::vector<uint8_t> startOk(g.n, 0);
+  for (uint32_t v = 0; v < g.n; ++v)
+    startOk[v] = inScc[v] && comp.origId[v] < raw.baseN;
   std::cout << "  main strongly connected component: " << sccSize << " vertices (" << (100.0 * sccSize / g.n)
             << "%)\n";
 
@@ -527,7 +790,34 @@ int main(int argc, char ** argv)
   Scratch sc(g.n);
   std::vector<VertexId> placeV;
   for (auto const & pl : kPlaces)
-    placeV.push_back(Nearest(g, inScc, pl.lat, pl.lon));
+    placeV.push_back(Nearest(g, startOk, pl.lat, pl.lon));
+
+  // Overlay answer -> raw path -> CoMaps segments, with consistency checks.
+  auto toSegments = [&](std::vector<VertexId> const & compPath)
+  {
+    std::vector<routing::Segment> segs;
+    for (VertexId rv : ToRawPath(raw.g, comp, rawToComp, compPath))
+      segs.push_back(raw.ToSegment(cm->mwmId, rv));
+    return segs;
+  };
+  auto pathReport = [&](QueryResult const & r, std::vector<routing::Segment> & segs)
+  {
+    if (r.weight == kInf)
+      return std::string("no route");
+    if (r.path.empty())
+      return std::string("UNPACK FAILED");
+    auto const rawPath = ToRawPath(raw.g, comp, rawToComp, r.path);
+    segs.clear();
+    for (VertexId rv : rawPath)
+      segs.push_back(raw.ToSegment(cm->mwmId, rv));
+    double const pw = RawPathWeight(raw.g, rawPath);
+    size_t const viol = CountViolations(segs, cm->viaWay);
+    std::string out = std::to_string(segs.size()) + " segments, path weight " +
+                      (Same(pw, r.weight) ? "ok" : "WRONG (" + std::to_string(pw) + ")");
+    if (viol)
+      out += ", " + std::to_string(viol) + " VIA-WAY VIOLATIONS";
+    return out;
+  };
 
   uint64_t mismatches = 0;
   double maxAbsDiff = 0;
@@ -535,6 +825,7 @@ int main(int argc, char ** argv)
   {
     int a, b;
     double w;
+    std::vector<routing::Segment> segs;
   };
   std::vector<Named> named;
   for (auto const & pr : kPairs)
@@ -546,20 +837,25 @@ int main(int argc, char ** argv)
     t1 = Clock::now();
     auto ovr = OverlayQuery(g, part, ov, s, t, sc);
     double const os = Since(t1);
+    t1 = Clock::now();
+    auto withPath = OverlayQuery(g, part, ov, s, t, sc, true /* wantPath */);
+    double const ps = Since(t1);
     bool const ok = Same(base.weight, ovr.weight);
     mismatches += !ok;
     if (base.weight < kInf)
       maxAbsDiff = std::max(maxAbsDiff, std::abs(base.weight - ovr.weight));
-    named.push_back({pr.first, pr.second, base.weight});
+    named.push_back({pr.first, pr.second, base.weight, {}});
+    std::string const pr2 = pathReport(withPath, named.back().segs);
     std::cout << "  " << kPlaces[pr.first].name << " -> " << kPlaces[pr.second].name << ": weight "
               << Hms(base.weight) << " (" << base.weight << " s) | dijkstra " << bs * 1000 << " ms, "
               << base.settled << " settled | overlay " << os * 1000 << " ms, " << ovr.settled << " settled | "
-              << (ok ? "MATCH" : "MISMATCH") << "\n";
+              << (ok ? "MATCH" : "MISMATCH") << "\n"
+              << "      with path unpacking " << ps * 1000 << " ms: " << pr2 << "\n";
   }
 
   std::vector<VertexId> sccList;
   for (uint32_t v = 0; v < g.n; ++v)
-    if (inScc[v])
+    if (startOk[v])
       sccList.push_back(v);
   std::mt19937_64 rng(FLAGS_seed);
   std::vector<double> bT, oT, bS, oS;
@@ -609,12 +905,125 @@ int main(int argc, char ** argv)
       auto const code = algo.FindPathBidirectional(params, res);
       double const secs = Since(t1);
       double const cw = code == decltype(code)::OK ? res.m_distance.GetIntegratedWeight() : kInf;
+      std::string pathCmp = "path IDENTICAL";
+      if (res.m_path != nm.segs)
+      {
+        size_t i0 = 0;
+        while (i0 < res.m_path.size() && i0 < nm.segs.size() && res.m_path[i0] == nm.segs[i0])
+          ++i0;
+        pathCmp = "path differs from segment " + std::to_string(i0) + " (equal-weight alternative)";
+      }
+      size_t const cViol = CountViolations(res.m_path, cm->viaWay);
       std::cout << "  " << kPlaces[nm.a].name << " -> " << kPlaces[nm.b].name << ": CoMaps " << cw
                 << " s in " << secs << " s (" << res.m_path.size() << " segments) | prototype " << nm.w << " s | "
-                << (Same(cw, nm.w) ? "MATCH" : "DIFF " + std::to_string(cw - nm.w) + " s") << ", " << Mem()
-                << "\n"
-                << std::flush;
+                << (Same(cw, nm.w) ? "MATCH" : "DIFF " + std::to_string(cw - nm.w) + " s") << " | " << pathCmp
+                << (cViol ? " | CoMaps path has via-way violations" : "") << "\n";
     }
+  }
+
+
+  // 6b. Routes through every via-way restriction.
+  if (!cm->viaWay.empty())
+  {
+    std::cout << "\n[6b] Via-way restrictions: a short route through each one\n"
+              << "     (weights in s; 'ignoring' = CoMaps with the restriction switched off; CoMaps capped at 1800 s)\n";
+    using Algo = routing::AStarAlgorithm<routing::Segment, routing::SegmentEdge, routing::RouteWeight>;
+    IndexGraphAStar strict(*cm->graph), loose(*cm->graph, true /* ignoreParents */);
+    Algo algo;
+    base::Cancellable cancellable;
+    auto comaps = [&](IndexGraphAStar & gr, routing::Segment const & a, routing::Segment const & b, bool bidir,
+                      std::vector<routing::Segment> & path)
+    {
+      // Capped: these are local routes through one junction; an uncapped search on an unreachable
+      // pair would sweep the whole state several times over.
+      struct Cap
+      {
+        bool operator()(routing::RouteWeight const & w) const { return w.GetIntegratedWeight() <= 1800.0; }
+      };
+      Algo::Params<routing::astar::DefaultVisitor, Cap> params(gr, a, b, cancellable, routing::astar::DefaultVisitor(),
+                                                              Cap());
+      routing::RoutingResult<routing::Segment, routing::RouteWeight> res;
+      auto const code = bidir ? algo.FindPathBidirectional(params, res) : algo.FindPath(params, res);
+      path = res.m_path;
+      return code == Algo::Result::OK ? res.m_distance.GetIntegratedWeight() : kInf;
+    };
+
+    // Start/end candidates per feature, among real (non-copy) compressed vertices.
+    std::map<uint32_t, std::vector<VertexId>> byFeature;
+    for (auto const & pat : cm->viaWay)
+      for (uint32_t f : pat)
+        byFeature[f];
+    for (uint32_t v = 0; v < g.n; ++v)
+    {
+      if (!startOk[v])
+        continue;
+      auto it = byFeature.find(raw.FeatureOf(comp.origId[v]));
+      if (it != byFeature.end())
+        it->second.push_back(v);
+    }
+    auto centroid = [&](uint32_t f)
+    {
+      double la = 0, lo = 0;
+      uint32_t n = 0;
+      for (VertexId v = 2 * raw.featBase[f]; v < 2 * raw.featBase[f + 1]; ++v)
+      {
+        la += raw.g.lat[v];
+        lo += raw.g.lon[v];
+        ++n;
+      }
+      return std::make_pair(n ? la / n : 0.0, n ? lo / n : 0.0);
+    };
+    auto nearestOf = [&](uint32_t f, std::pair<double, double> c)
+    {
+      VertexId best = kNone;
+      double bd = 1e30;
+      for (VertexId v : byFeature[f])
+      {
+        double const d = std::pow(g.lat[v] - c.first, 2) + std::pow(g.lon[v] - c.second, 2);
+        if (d < bd)
+        {
+          bd = d;
+          best = v;
+        }
+      }
+      return best;
+    };
+
+    uint32_t idx = 0, agree = 0, changed = 0, tested = 0;
+    for (auto const & pat : cm->viaWay)
+    {
+      ++idx;
+      VertexId const s = nearestOf(pat.front(), centroid(pat[1]));
+      VertexId const t = nearestOf(pat.back(), centroid(pat[pat.size() - 2]));
+      std::cout << "  #" << idx << " (" << pat.size() << " features): ";
+      if (s == kNone || t == kNone || s == t)
+      {
+        std::cout << "skipped, no usable start/end segment on the first/last feature\n";
+        continue;
+      }
+      ++tested;
+      auto const base = BidirectionalDijkstra(g, s, t, sc);
+      auto const ovr = OverlayQuery(g, part, ov, s, t, sc, true);
+      std::vector<routing::Segment> ours;
+      std::string const rep = pathReport(ovr, ours);
+      auto const a = raw.ToSegment(cm->mwmId, comp.origId[s]);
+      auto const b = raw.ToSegment(cm->mwmId, comp.origId[t]);
+      std::vector<routing::Segment> pUni, pBi, pLoose;
+      double const cUni = comaps(strict, a, b, false, pUni);
+      double const cBi = comaps(strict, a, b, true, pBi);
+      double const cLoose = comaps(loose, a, b, false, pLoose);
+      bool const ok = Same(base.weight, ovr.weight);
+      mismatches += !ok;
+      double const capped = ovr.weight <= 1800.0 ? ovr.weight : kInf;
+      agree += Same(cUni, capped);
+      changed += cLoose < ovr.weight - 1e-6;
+      std::cout << "overlay " << ovr.weight << (ok ? "" : " MISMATCH vs dijkstra") << " (" << rep << ") | CoMaps uni "
+                << cUni << (CountViolations(pUni, cm->viaWay) ? " [violates]" : "") << ", bidir " << cBi
+                << (CountViolations(pBi, cm->viaWay) ? " [violates]" : "") << " | ignoring " << cLoose
+                << (CountViolations(pLoose, cm->viaWay) ? " [uses the forbidden turn]" : "") << "\n";
+    }
+    std::cout << "  tested " << tested << ", restriction changed the best route in " << changed
+              << ", CoMaps unidirectional agrees with the overlay in " << agree << "\n";
   }
 
   // 7. Avoid a place: block every vertex near the middle of Lucknow -> Agra, recustomize.

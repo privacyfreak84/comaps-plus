@@ -91,7 +91,7 @@ struct QueryResult
 {
   double weight = kInf;
   uint64_t settled = 0;
-  std::vector<VertexId> path;  // only for plain Dijkstra with wantPath
+  std::vector<VertexId> path;  // with wantPath: every vertex from s to t on this graph (overlay hops unpacked)
 };
 
 class Scratch
@@ -104,6 +104,7 @@ public:
     std::vector<double> dist;
     std::vector<uint32_t> stamp;
     std::vector<VertexId> parent;
+    std::vector<uint8_t> parentLevel;  // 0 = graph edge, k = clique of a level-k cell
     struct Item
     {
       double d;
@@ -127,7 +128,7 @@ private:
 
 QueryResult BidirectionalDijkstra(Graph const & g, VertexId s, VertexId t, Scratch & sc, bool wantPath = false);
 QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & ov, VertexId s, VertexId t,
-                         Scratch & sc);
+                         Scratch & sc, bool wantPath = false);
 
 // Storage accounting for the overlay (what a device would have to keep next to the map).
 struct OverlayStorage

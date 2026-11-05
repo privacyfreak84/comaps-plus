@@ -321,6 +321,7 @@ Scratch::Scratch(uint32_t n)
     s.dist.assign(n, kInf);
     s.stamp.assign(n, 0);
     s.parent.assign(n, kNone);
+    s.parentLevel.assign(n, 0);
     s.heap.reserve(1 << 16);
   }
   m_done[0].assign(n, 0);
@@ -541,13 +542,14 @@ QueryResult Bidirectional(Graph const & g, VertexId s, VertexId t, Scratch & sc,
   double mu = (s == t) ? 0.0 : kInf;
   VertexId meet = (s == t) ? s : kNone;
 
-  auto relaxF = [&](VertexId v, double d, VertexId par)
+  auto relaxF = [&](VertexId v, double d, VertexId par, uint8_t lvl)
   {
     if (F.stamp[v] != st || d < F.dist[v])
     {
       F.stamp[v] = st;
       F.dist[v] = d;
       F.parent[v] = par;
+      F.parentLevel[v] = lvl;
       HeapPush(F.heap, d, v);
       if (B.stamp[v] == st && d + B.dist[v] < mu)
       {
@@ -556,13 +558,14 @@ QueryResult Bidirectional(Graph const & g, VertexId s, VertexId t, Scratch & sc,
       }
     }
   };
-  auto relaxB = [&](VertexId v, double d, VertexId par)
+  auto relaxB = [&](VertexId v, double d, VertexId par, uint8_t lvl)
   {
     if (B.stamp[v] != st || d < B.dist[v])
     {
       B.stamp[v] = st;
       B.dist[v] = d;
       B.parent[v] = par;
+      B.parentLevel[v] = lvl;
       HeapPush(B.heap, d, v);
       if (F.stamp[v] == st && d + F.dist[v] < mu)
       {
@@ -609,13 +612,13 @@ QueryResult BidirectionalDijkstra(Graph const & g, VertexId s, VertexId t, Scrat
   {
     for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
       if (g.fwdW[e] < kInf)
-        relax(g.fwdTo[e], d + g.fwdW[e], x);
+        relax(g.fwdTo[e], d + g.fwdW[e], x, 0);
   };
   auto scanB = [&](VertexId x, double d, auto & relax)
   {
     for (uint64_t e = g.revOff[x]; e < g.revOff[x + 1]; ++e)
       if (g.revW[e] < kInf)
-        relax(g.revFrom[e], d + g.revW[e], x);
+        relax(g.revFrom[e], d + g.revW[e], x, 0);
   };
   QueryResult r = Bidirectional(g, s, t, sc, scanF, scanB);
   if (!wantPath || r.path.empty())
@@ -633,8 +636,99 @@ QueryResult BidirectionalDijkstra(Graph const & g, VertexId s, VertexId t, Scrat
   return r;
 }
 
+namespace
+{
+struct Hop
+{
+  VertexId u, v;
+  uint8_t level;  // 0 = graph edge, k = clique of the level-k cell containing u and v
+};
+
+// Replaces one clique hop by the path it stands for: a Dijkstra from u to v inside the same cell,
+// one level down, then recursively for every clique hop found there. Returns false if v is not
+// reached, which would mean the clique and the cell contents disagree.
+bool UnpackHop(Graph const & g, Partition const & p, Overlay const & ov, Hop const & h, Scratch & sc,
+               std::vector<VertexId> & out)
+{
+  if (h.level == 0)
+  {
+    out.push_back(h.v);
+    return true;
+  }
+  size_t const li = h.level - 1;
+  uint32_t const c = p.cell[li][h.u];
+  auto & S = sc.Fwd();
+  auto & done = sc.Done(0);
+  uint32_t const st = sc.NewStamp();
+  S.heap.clear();
+  S.stamp[h.u] = st;
+  S.dist[h.u] = 0;
+  S.parent[h.u] = kNone;
+  S.parentLevel[h.u] = 0;
+  HeapPush(S.heap, 0, h.u);
+  auto relax = [&](VertexId y, double d, VertexId par, uint8_t lvl)
+  {
+    if (S.stamp[y] != st || d < S.dist[y])
+    {
+      S.stamp[y] = st;
+      S.dist[y] = d;
+      S.parent[y] = par;
+      S.parentLevel[y] = lvl;
+      HeapPush(S.heap, d, y);
+    }
+  };
+  while (!S.heap.empty())
+  {
+    Item const it = HeapPop(S.heap);
+    VertexId const x = it.v;
+    if (done[x] == st)
+      continue;
+    done[x] = st;
+    if (x == h.v)
+      break;
+    double const d = it.d;
+    if (li == 0)
+    {
+      for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
+        if (p.cell[0][g.fwdTo[e]] == c && g.fwdW[e] < kInf)
+          relax(g.fwdTo[e], d + g.fwdW[e], x, 0);
+      continue;
+    }
+    LevelOverlay const & C = ov.levels[li - 1];
+    uint32_t const cc = p.cell[li - 1][x];
+    uint64_t const cx0 = C.exitOff[cc], cnEx = C.exitOff[cc + 1] - cx0;
+    if (C.entryIdx[x] != kNone)
+    {
+      uint64_t const base = C.matOff[cc] + C.entryIdx[x] * cnEx;
+      for (uint64_t j = 0; j < cnEx; ++j)
+        if (C.mat[base + j] < kInf)
+          relax(C.exits[cx0 + j], d + C.mat[base + j], x, static_cast<uint8_t>(li));
+    }
+    if (C.exitIdx[x] != kNone)
+    {
+      for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
+      {
+        VertexId const y = g.fwdTo[e];
+        if (p.cell[li][y] == c && p.cell[li - 1][y] != cc && g.fwdW[e] < kInf)
+          relax(y, d + g.fwdW[e], x, 0);
+      }
+    }
+  }
+  if (done[h.v] != st)
+    return false;
+  std::vector<Hop> sub;
+  for (VertexId y = h.v; y != h.u; y = S.parent[y])
+    sub.push_back({S.parent[y], y, S.parentLevel[y]});
+  std::reverse(sub.begin(), sub.end());
+  for (auto const & s2 : sub)
+    if (!UnpackHop(g, p, ov, s2, sc, out))
+      return false;
+  return true;
+}
+}  // namespace
+
 QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & ov, VertexId s, VertexId t,
-                         Scratch & sc)
+                         Scratch & sc, bool wantPath)
 {
   size_t const levels = p.Levels();
   uint32_t cs[16], ct[16];
@@ -661,7 +755,7 @@ QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & o
     {
       for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
         if (g.fwdW[e] < kInf)
-          relax(g.fwdTo[e], d + g.fwdW[e], x);
+          relax(g.fwdTo[e], d + g.fwdW[e], x, 0);
       return;
     }
     size_t const li = lvl - 1;
@@ -673,11 +767,11 @@ QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & o
       uint64_t const base = L.matOff[c] + L.entryIdx[x] * nEx;
       for (uint64_t j = 0; j < nEx; ++j)
         if (L.mat[base + j] < kInf)
-          relax(L.exits[x0 + j], d + L.mat[base + j], x);
+          relax(L.exits[x0 + j], d + L.mat[base + j], x, static_cast<uint8_t>(lvl));
     }
     for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
       if (p.cell[li][g.fwdTo[e]] != c && g.fwdW[e] < kInf)
-        relax(g.fwdTo[e], d + g.fwdW[e], x);
+        relax(g.fwdTo[e], d + g.fwdW[e], x, 0);
   };
   auto scanB = [&](VertexId x, double d, auto & relax)
   {
@@ -686,7 +780,7 @@ QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & o
     {
       for (uint64_t e = g.revOff[x]; e < g.revOff[x + 1]; ++e)
         if (g.revW[e] < kInf)
-          relax(g.revFrom[e], d + g.revW[e], x);
+          relax(g.revFrom[e], d + g.revW[e], x, 0);
       return;
     }
     size_t const li = lvl - 1;
@@ -701,15 +795,35 @@ QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & o
       {
         double const w = L.mat[L.matOff[c] + i * nEx + col];
         if (w < kInf)
-          relax(L.entries[e0 + i], d + w, x);
+          relax(L.entries[e0 + i], d + w, x, static_cast<uint8_t>(lvl));
       }
     }
     for (uint64_t e = g.revOff[x]; e < g.revOff[x + 1]; ++e)
       if (p.cell[li][g.revFrom[e]] != c && g.revW[e] < kInf)
-        relax(g.revFrom[e], d + g.revW[e], x);
+        relax(g.revFrom[e], d + g.revW[e], x, 0);
   };
   QueryResult r = Bidirectional(g, s, t, sc, scanF, scanB);
-  r.path.clear();
+  if (!wantPath || r.weight == kInf || r.path.empty())
+  {
+    r.path.clear();
+    return r;
+  }
+  VertexId const meet = r.path.front();
+  std::vector<Hop> hops;
+  for (VertexId v = meet; v != s; v = sc.Fwd().parent[v])
+    hops.push_back({sc.Fwd().parent[v], v, sc.Fwd().parentLevel[v]});
+  std::reverse(hops.begin(), hops.end());
+  for (VertexId v = meet; v != t; v = sc.Bwd().parent[v])
+    hops.push_back({v, sc.Bwd().parent[v], sc.Bwd().parentLevel[v]});
+  r.path.assign(1, s);
+  for (auto const & h : hops)
+  {
+    if (!UnpackHop(g, p, ov, h, sc, r.path))
+    {
+      r.path.clear();  // signals an unpacking failure to the caller
+      break;
+    }
+  }
   return r;
 }
 
