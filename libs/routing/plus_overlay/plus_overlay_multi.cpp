@@ -790,6 +790,16 @@ int main(int argc, char ** argv)
     }
     return best;
   };
+  // Driving time of a segment path as CoMaps' Route computes it (no penalties).
+  auto etaOf = [&](std::vector<routing::Segment> const & p)
+  {
+    if (p.empty())
+      return 0.0;
+    double t = world.CalculateETAWithoutPenalty(p[0]);
+    for (size_t k = 1; k < p.size(); ++k)
+      t += world.CalculateETA(p[k - 1], p[k]);
+    return t;
+  };
   // Map changes along a path, for the report.
   auto mapChanges = [&](std::vector<routing::Segment> const & p)
   {
@@ -943,6 +953,8 @@ int main(int argc, char ** argv)
                        : (bestSplit < kInf && bestSplit > pp2.ans.weight
                               ? "ROUTER WORSE by " + std::to_string(bestSplit - pp2.ans.weight) + " s"
                               : "OVERLAY WORSE / router path not scorable (" + std::to_string(bestSplit) + ")"))
+              << "\n      ETA (real segments): overlay " << Hms(etaOf(pp2.ans.segs)) << ", router "
+              << Hms(etaOf(rs)) << " (router's own " << Hms(ra.eta) << ")"
               << "\n      map changes: router" << mapChanges(rs) << " | overlay" << mapChanges(pp2.ans.segs)
               << (firstGap.empty() ? "" : "\n      first unscorable router step:" + firstGap) << "\n";
   }
