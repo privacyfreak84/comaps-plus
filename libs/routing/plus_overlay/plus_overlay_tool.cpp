@@ -20,6 +20,7 @@
 #include "routing/edge_estimator.hpp"
 #include "routing/fake_ending.hpp"
 #include "routing/checkpoints.hpp"
+#include "routing/cross_mwm_index_graph.hpp"
 #include "routing/index_graph_starter.hpp"
 #include "routing/index_router.hpp"
 #include "routing/route.hpp"
@@ -90,6 +91,7 @@ DEFINE_double(router_backoff_m, 60, "Via-way router test: also start/end this fa
 DEFINE_int32(router_random, 10, "Random point pairs routed by both the real IndexRouter and the overlay.");
 DEFINE_double(router_random_min_km, 5, "Minimum straight-line distance of random router pairs.");
 DEFINE_double(router_random_max_km, 60, "Maximum straight-line distance of random router pairs.");
+DEFINE_bool(connector_stats, false, "Only print the MWM's car cross-mwm connector (border transitions) and exit.");
 DEFINE_bool(avoid_test, true, "Run the avoid-place recustomization test.");
 DEFINE_double(avoid_radius_m, 1500, "Radius of the avoided area.");
 DEFINE_uint64(seed, 42, "Random seed.");
@@ -287,10 +289,9 @@ struct CoMaps
   }
 };
 
-void Extract(CoMaps & cm, Raw & raw)
+void Extract(routing::IndexGraph & ig, routing::NumMwmId mwmId, Raw & raw)
 {
   auto const t0 = Clock::now();
-  routing::IndexGraph & ig = *cm.graph;
 
   std::vector<uint32_t> roads;
   ig.ForEachRoad([&](uint32_t f, routing::RoadJointIds const &) { roads.push_back(f); });
@@ -337,7 +338,7 @@ void Extract(CoMaps & cm, Raw & raw)
       {
         if (!fwd && oneway[f])
           continue;
-        routing::Segment const s(cm.mwmId, f, i, fwd);
+        routing::Segment const s(mwmId, f, i, fwd);
         VertexId const v = raw.FromSegment(s);
         while (next <= v)
           g.fwdOff[++next] = g.fwdTo.size();  // close earlier (possibly empty) vertices
@@ -369,6 +370,8 @@ void Extract(CoMaps & cm, Raw & raw)
             << " with pass-through/access penalties) in " << Since(t0) << " s, " << Mem() << "\n";
 }
 
+
+void Extract(CoMaps & cm, Raw & raw) { Extract(*cm.graph, cm.mwmId, raw); }
 
 // Via-way restrictions ---------------------------------------------------------------------------
 //
@@ -710,6 +713,7 @@ std::string Hms(double seconds)
 }
 }  // namespace
 
+#ifndef PLUS_OVERLAY_TOOL_NO_MAIN
 int main(int argc, char ** argv)
 {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -730,6 +734,23 @@ int main(int argc, char ** argv)
       cm->ReportRestrictionsAndAccess();
     }
   };
+
+  if (FLAGS_connector_stats)
+  {
+    ensureCoMaps();
+    routing::CrossMwmIndexGraph<base::GeoObjectId> cross(*cm->mwmDataSource, routing::VehicleType::Car);
+    auto const & c = cross.GetCrossMwmConnectorWithTransitions(cm->mwmId);
+    uint32_t transitions = 0, oneWay = 0;
+    std::set<uint32_t> features;
+    c.ForEachEnter([&](uint32_t, routing::Segment const & s) { features.insert(s.GetFeatureId()); });
+    c.ForEachExit([&](uint32_t, routing::Segment const & s) { features.insert(s.GetFeatureId()); });
+    std::cout << "  car connector: " << c.GetNumEnters() << " enters, " << c.GetNumExits() << " exits, on "
+              << features.size() << " features; enter x exit = "
+              << uint64_t(c.GetNumEnters()) * c.GetNumExits() << "\n";
+    (void)transitions;
+    (void)oneWay;
+    return 0;
+  }
 
   // 1. Raw graph.
   std::cout << "\n[1] Raw segment graph\n";
@@ -1759,3 +1780,4 @@ int main(int argc, char ** argv)
   std::cout << "\nDone. " << Mem() << "\n";
   return mismatches == 0 ? 0 : 1;
 }
+#endif  // PLUS_OVERLAY_TOOL_NO_MAIN
