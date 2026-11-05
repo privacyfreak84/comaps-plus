@@ -193,14 +193,8 @@ public:
     double latSum = 0;
     for (uint32_t v = 0; v < g.n; ++v)
       latSum += g.lat[v];
-    double const k = std::cos((g.n ? latSum / g.n : 0.0) * M_PI / 180.0);
-    m_x.resize(g.n);
-    m_y.resize(g.n);
-    for (uint32_t v = 0; v < g.n; ++v)
-    {
-      m_x[v] = static_cast<float>(g.lon[v] * k);
-      m_y[v] = g.lat[v];
-    }
+    // Projection reads lat/lon directly (no x/y copies): x = lon * k, y = lat.
+    m_k = static_cast<float>(std::cos((g.n ? latSum / g.n : 0.0) * M_PI / 180.0));
     m_freeThreads = static_cast<int>(std::max(1u, params.threads)) - 1;
   }
 
@@ -234,7 +228,7 @@ public:
     size_t const kHi = std::min<size_t>(m - 1, static_cast<size_t>(std::floor((1.0 - m_params.minBalance) * m)));
 
     std::vector<std::pair<float, VertexId>> kv(m);
-    std::vector<int64_t> diff(m + 2);
+    std::vector<int32_t> diff(m + 2);
     std::vector<VertexId> bestOrder;
     int64_t bestCut = std::numeric_limits<int64_t>::max();
     size_t bestK = m / 2;
@@ -243,10 +237,10 @@ public:
     for (int d = 0; d < m_params.directions; ++d)
     {
       double const a = M_PI * d / m_params.directions;
-      float const c = static_cast<float>(std::cos(a));
+      float const c = static_cast<float>(std::cos(a)) * m_k;
       float const s = static_cast<float>(std::sin(a));
       for (size_t i = 0; i < m; ++i)
-        kv[i] = {m_x[verts[i]] * c + m_y[verts[i]] * s, verts[i]};
+        kv[i] = {m_g.lon[verts[i]] * c + m_g.lat[verts[i]] * s, verts[i]};
       std::sort(kv.begin(), kv.end());
       for (size_t i = 0; i < m; ++i)
         m_rank[kv[i].second] = static_cast<uint32_t>(i);
@@ -290,7 +284,7 @@ public:
       }
     }
     std::vector<std::pair<float, VertexId>>().swap(kv);
-    std::vector<int64_t>().swap(diff);
+    std::vector<int32_t>().swap(diff);
 
     std::vector<VertexId> left(bestOrder.begin(), bestOrder.begin() + bestK);
     std::vector<VertexId> right(bestOrder.begin() + bestK, bestOrder.end());
@@ -327,7 +321,7 @@ private:
   Partition & m_p;
   std::unique_ptr<std::atomic<uint32_t>[]> m_memb;
   std::vector<uint32_t> m_rank;
-  std::vector<float> m_x, m_y;
+  float m_k = 1;
   std::atomic<uint32_t> m_stamp{0};
   std::atomic<int> m_freeThreads{0};
   std::mutex m_cellMutex;

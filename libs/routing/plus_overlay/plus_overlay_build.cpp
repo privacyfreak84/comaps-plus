@@ -434,7 +434,6 @@ int main(int argc, char ** argv)
   LeanExtract(*cm->graph, cm->mwmId, forced, cm->viaWay, lg);
   LeanExpandViaWay(lg, cm->viaWay);
   std::vector<uint8_t>().swap(lg.interior);
-  g_shrink(lg.g);
   double const extractSec = Since(t0);
   Graph & g = lg.g;
   if (!FLAGS_verify_raw)
