@@ -521,7 +521,8 @@ uint64_t Recustomize(Graph const & g, Partition const & p, Overlay & ov, std::ve
 namespace
 {
 template <typename ScanF, typename ScanB>
-QueryResult Bidirectional(Graph const & g, VertexId s, VertexId t, Scratch & sc, ScanF && scanF, ScanB && scanB)
+QueryResult Bidirectional(Graph const & g, Seeds const & sources, Seeds const & targets, Scratch & sc, ScanF && scanF,
+                          ScanB && scanB)
 {
   QueryResult r;
   auto & F = sc.Fwd();
@@ -531,16 +532,34 @@ QueryResult Bidirectional(Graph const & g, VertexId s, VertexId t, Scratch & sc,
   uint32_t const st = sc.NewStamp();
   F.heap.clear();
   B.heap.clear();
-  F.stamp[s] = st;
-  F.dist[s] = 0;
-  F.parent[s] = kNone;
-  B.stamp[t] = st;
-  B.dist[t] = 0;
-  B.parent[t] = kNone;
-  HeapPush(F.heap, 0, s);
-  HeapPush(B.heap, 0, t);
-  double mu = (s == t) ? 0.0 : kInf;
-  VertexId meet = (s == t) ? s : kNone;
+  for (auto const & [v, d] : sources)
+  {
+    if (F.stamp[v] == st && F.dist[v] <= d)
+      continue;
+    F.stamp[v] = st;
+    F.dist[v] = d;
+    F.parent[v] = kNone;
+    HeapPush(F.heap, d, v);
+  }
+  for (auto const & [v, d] : targets)
+  {
+    if (B.stamp[v] == st && B.dist[v] <= d)
+      continue;
+    B.stamp[v] = st;
+    B.dist[v] = d;
+    B.parent[v] = kNone;
+    HeapPush(B.heap, d, v);
+  }
+  double mu = kInf;
+  VertexId meet = kNone;
+  for (auto const & [v, d] : targets)
+  {
+    if (F.stamp[v] == st && F.dist[v] + B.dist[v] < mu)
+    {
+      mu = F.dist[v] + B.dist[v];
+      meet = v;
+    }
+  }
 
   auto relaxF = [&](VertexId v, double d, VertexId par, uint8_t lvl)
   {
@@ -620,7 +639,7 @@ QueryResult BidirectionalDijkstra(Graph const & g, VertexId s, VertexId t, Scrat
       if (g.revW[e] < kInf)
         relax(g.revFrom[e], d + g.revW[e], x, 0);
   };
-  QueryResult r = Bidirectional(g, s, t, sc, scanF, scanB);
+  QueryResult r = Bidirectional(g, Seeds{{s, 0.0}}, Seeds{{t, 0.0}}, sc, scanF, scanB);
   if (!wantPath || r.path.empty())
   {
     r.path.clear();
@@ -730,19 +749,30 @@ bool UnpackHop(Graph const & g, Partition const & p, Overlay const & ov, Hop con
 QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & ov, VertexId s, VertexId t,
                          Scratch & sc, bool wantPath)
 {
+  return OverlayQueryMulti(g, p, ov, Seeds{{s, 0.0}}, Seeds{{t, 0.0}}, sc, wantPath);
+}
+
+QueryResult OverlayQueryMulti(Graph const & g, Partition const & p, Overlay const & ov, Seeds const & sources,
+                              Seeds const & targets, Scratch & sc, bool wantPath)
+{
   size_t const levels = p.Levels();
-  uint32_t cs[16], ct[16];
+  // A vertex is searched at the highest level whose cell holds no source and no target.
+  std::vector<std::vector<uint32_t>> endCells(levels);
   for (size_t li = 0; li < levels; ++li)
   {
-    cs[li] = p.cell[li][s];
-    ct[li] = p.cell[li][t];
+    for (auto const & sd : sources)
+      endCells[li].push_back(p.cell[li][sd.first]);
+    for (auto const & sd : targets)
+      endCells[li].push_back(p.cell[li][sd.first]);
+    std::sort(endCells[li].begin(), endCells[li].end());
+    endCells[li].erase(std::unique(endCells[li].begin(), endCells[li].end()), endCells[li].end());
   }
   auto queryLevel = [&](VertexId v) -> size_t
   {
     for (size_t li = levels; li-- > 0;)
     {
       uint32_t const c = p.cell[li][v];
-      if (c != cs[li] && c != ct[li])
+      if (!std::binary_search(endCells[li].begin(), endCells[li].end(), c))
         return li + 1;
     }
     return 0;
@@ -802,20 +832,24 @@ QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & o
       if (p.cell[li][g.revFrom[e]] != c && g.revW[e] < kInf)
         relax(g.revFrom[e], d + g.revW[e], x, 0);
   };
-  QueryResult r = Bidirectional(g, s, t, sc, scanF, scanB);
-  if (!wantPath || r.weight == kInf || r.path.empty())
+  QueryResult r = Bidirectional(g, sources, targets, sc, scanF, scanB);
+  if (!wantPath || r.weight >= kInf || r.path.empty())
   {
     r.path.clear();
     return r;
   }
   VertexId const meet = r.path.front();
   std::vector<Hop> hops;
-  for (VertexId v = meet; v != s; v = sc.Fwd().parent[v])
+  VertexId first = meet;
+  for (VertexId v = meet; sc.Fwd().parent[v] != kNone; v = sc.Fwd().parent[v])
+  {
     hops.push_back({sc.Fwd().parent[v], v, sc.Fwd().parentLevel[v]});
+    first = sc.Fwd().parent[v];
+  }
   std::reverse(hops.begin(), hops.end());
-  for (VertexId v = meet; v != t; v = sc.Bwd().parent[v])
+  for (VertexId v = meet; sc.Bwd().parent[v] != kNone; v = sc.Bwd().parent[v])
     hops.push_back({v, sc.Bwd().parent[v], sc.Bwd().parentLevel[v]});
-  r.path.assign(1, s);
+  r.path.assign(1, first);
   for (auto const & h : hops)
   {
     if (!UnpackHop(g, p, ov, h, sc, r.path))

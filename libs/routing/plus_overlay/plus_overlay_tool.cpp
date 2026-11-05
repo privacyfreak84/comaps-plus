@@ -18,6 +18,10 @@
 #include "routing/base/routing_result.hpp"
 #include "routing/data_source.hpp"
 #include "routing/edge_estimator.hpp"
+#include "routing/fake_ending.hpp"
+#include "routing/index_graph_starter.hpp"
+#include "routing/mwm_hierarchy_handler.hpp"
+#include "routing/single_vehicle_world_graph.hpp"
 #include "routing/index_graph.hpp"
 #include "routing/index_graph_loader.hpp"
 #include "routing/restriction_loader.hpp"
@@ -33,6 +37,8 @@
 #include "indexer/classificator_loader.hpp"
 #include "indexer/data_source.hpp"
 
+#include "geometry/mercator.hpp"
+
 #include "platform/local_country_file.hpp"
 #include "platform/platform.hpp"
 
@@ -46,6 +52,8 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
+#include <unordered_map>
 #include <memory>
 #include <random>
 #include <sstream>
@@ -64,6 +72,7 @@ DEFINE_double(min_balance, 0.3, "Smallest share of a cell each bisection half ma
 DEFINE_uint32(threads, 2, "Customization threads.");
 DEFINE_uint32(random_queries, 100, "Random in-component query pairs.");
 DEFINE_uint32(verify, 3, "Named pairs to check against CoMaps' AStarAlgorithm (slow, in order of the list).");
+DEFINE_uint32(point_tests, 12, "Random point-to-point routes (plus 3 named) checked against IndexGraphStarter.");
 DEFINE_bool(avoid_test, true, "Run the avoid-place recustomization test.");
 DEFINE_double(avoid_radius_m, 1500, "Radius of the avoided area.");
 DEFINE_uint64(seed, 42, "Random seed.");
@@ -196,6 +205,7 @@ struct CoMaps
   std::shared_ptr<routing::VehicleModelFactoryInterface> factory;
   std::shared_ptr<routing::EdgeEstimator> estimator;
   std::unique_ptr<routing::IndexGraphLoader> loader;
+  std::unique_ptr<routing::SingleVehicleWorldGraph> world;  // owns the loader after Init
   routing::NumMwmId mwmId = 0;
   routing::IndexGraph * graph = nullptr;
   std::shared_ptr<storage::CountryParentGetter> cpg;
@@ -231,6 +241,10 @@ struct CoMaps
                                                estimator, *mwmDataSource, routing::RoutingOptions(),
                                                [t = fixedTime]() { return t; });
     graph = &loader->GetIndexGraph(mwmId);
+    // Single-MWM world graph, as IndexRouter uses for routes inside one map; the starter needs it.
+    world = std::make_unique<routing::SingleVehicleWorldGraph>(nullptr /* crossMwmGraph */, std::move(loader),
+                                                               estimator, routing::MwmHierarchyHandler());
+    world->SetMode(routing::WorldGraphMode::SingleMwm);
   }
 
   void ReportRestrictionsAndAccess()
@@ -647,8 +661,8 @@ VertexId Nearest(Graph const & g, std::vector<uint8_t> const & inScc, double lat
 
 bool Same(double a, double b)
 {
-  if (a == kInf || b == kInf)
-    return a == b;
+  if (a >= kInf || b >= kInf)
+    return (a >= kInf) == (b >= kInf);
   return std::abs(a - b) <= 1e-6 * std::max(1.0, std::abs(a));
 }
 
@@ -802,7 +816,7 @@ int main(int argc, char ** argv)
   };
   auto pathReport = [&](QueryResult const & r, std::vector<routing::Segment> & segs)
   {
-    if (r.weight == kInf)
+    if (r.weight >= kInf)
       return std::string("no route");
     if (r.path.empty())
       return std::string("UNPACK FAILED");
@@ -990,6 +1004,7 @@ int main(int argc, char ** argv)
     };
 
     uint32_t idx = 0, agree = 0, changed = 0, tested = 0;
+    std::string disagree;
     for (auto const & pat : cm->viaWay)
     {
       ++idx;
@@ -1015,7 +1030,10 @@ int main(int argc, char ** argv)
       bool const ok = Same(base.weight, ovr.weight);
       mismatches += !ok;
       double const capped = ovr.weight <= 1800.0 ? ovr.weight : kInf;
-      agree += Same(cUni, capped);
+      bool const same = Same(cUni, capped);
+      agree += same;
+      if (!same)
+        disagree += " #" + std::to_string(idx);
       changed += cLoose < ovr.weight - 1e-6;
       std::cout << "overlay " << ovr.weight << (ok ? "" : " MISMATCH vs dijkstra") << " (" << rep << ") | CoMaps uni "
                 << cUni << (CountViolations(pUni, cm->viaWay) ? " [violates]" : "") << ", bidir " << cBi
@@ -1023,7 +1041,279 @@ int main(int argc, char ** argv)
                 << (CountViolations(pLoose, cm->viaWay) ? " [uses the forbidden turn]" : "") << "\n";
     }
     std::cout << "  tested " << tested << ", restriction changed the best route in " << changed
-              << ", CoMaps unidirectional agrees with the overlay in " << agree << "\n";
+              << ", CoMaps unidirectional agrees with the overlay in " << agree << " (differs:" << disagree << ")\n";
+  }
+
+
+  // 6c. Arbitrary start and finish points, the way IndexRouter handles them inside one map.
+  if (FLAGS_point_tests > 0)
+  {
+    std::cout << "\n[6c] Point to point: CoMaps IndexGraphStarter (fake endings) + overlay, vs AStarAlgorithm on the starter\n";
+    auto & ig = *cm->graph;
+    auto & world = *cm->world;
+
+    // Chain predecessor of every non-kept raw vertex, to walk back from a target segment.
+    std::vector<VertexId> pred(raw.g.n, kNone);
+    std::vector<double> predW(raw.g.n, 0.0);
+    for (VertexId u = 0; u < raw.g.n; ++u)
+      for (uint64_t e = raw.g.fwdOff[u]; e < raw.g.fwdOff[u + 1]; ++e)
+        if (rawToComp[raw.g.fwdTo[e]] == kNone)
+        {
+          pred[raw.g.fwdTo[e]] = u;
+          predW[raw.g.fwdTo[e]] = raw.g.fwdW[e];
+        }
+
+    // Forward chain from raw r to the next kept vertex: (kept, cost, raw vertices r..kept).
+    auto walkForward = [&](VertexId r, double cost, std::vector<VertexId> & chain)
+    {
+      chain.assign(1, r);
+      VertexId x = r;
+      while (rawToComp[x] == kNone && raw.g.fwdOff[x + 1] - raw.g.fwdOff[x] == 1 && chain.size() < 100000)
+      {
+        cost += raw.g.fwdW[raw.g.fwdOff[x]];
+        x = raw.g.fwdTo[raw.g.fwdOff[x]];
+        chain.push_back(x);
+      }
+      return std::make_pair(rawToComp[x], cost);
+    };
+
+    // Nearest road segment to a point (that leads into the main component), both directions.
+    auto snap = [&](double lat, double lon)
+    {
+      double const k = std::cos(lat * M_PI / 180.0);
+      std::vector<std::pair<double, VertexId>> near;
+      for (VertexId v = 0; v < raw.baseN; v += 2)
+      {
+        if (!raw.valid[v])
+          continue;
+        double const dy = raw.g.lat[v] - lat, dx = (raw.g.lon[v] - lon) * k;
+        double const d = dx * dx + dy * dy;
+        if (d < 1e-4)
+          near.emplace_back(d, v);
+      }
+      std::sort(near.begin(), near.end());
+      if (near.size() > 300)
+        near.resize(300);
+      double best = 1e30;
+      VertexId bv = kNone;
+      std::vector<VertexId> chain;
+      for (auto const & [d0, v] : near)
+      {
+        auto const seg = raw.ToSegment(cm->mwmId, v);
+        auto const & a = ig.GetPoint(seg, false), & b = ig.GetPoint(seg, true);
+        double const ax = (a.m_lon - lon) * k, ay = a.m_lat - lat, bx = (b.m_lon - lon) * k, by = b.m_lat - lat;
+        double const vx = bx - ax, vy = by - ay, len2 = vx * vx + vy * vy;
+        double const tt = len2 > 0 ? std::clamp(-(ax * vx + ay * vy) / len2, 0.0, 1.0) : 0.0;
+        double const px = ax + tt * vx, py = ay + tt * vy, d = px * px + py * py;
+        if (d >= best)
+          continue;
+        auto const kc = walkForward(v, 0, chain).first;
+        if (kc == kNone || !inScc[kc])
+          continue;
+        best = d;
+        bv = v;
+      }
+      std::vector<routing::Segment> segs;
+      if (bv == kNone)
+        return segs;
+      segs.push_back(raw.ToSegment(cm->mwmId, bv));
+      if (raw.valid[bv + 1])
+        segs.push_back(raw.ToSegment(cm->mwmId, bv + 1));
+      return segs;
+    };
+
+    using Parents = routing::AStarGraph<routing::Segment, routing::SegmentEdge, routing::RouteWeight>::Parents;
+    // Cheapest cost from the start fake vertex to every real segment it reaches through fake vertices only
+    // (forward), or from every real segment to the finish (backward). |direct|: start to finish without
+    // leaving fake vertices (both points on the same segment).
+    auto fakeSearch = [&](routing::IndexGraphStarter & starter, bool forward, std::map<routing::Segment, double> & real,
+                          double & direct)
+    {
+      auto const src = forward ? starter.GetStartSegment() : starter.GetFinishSegment();
+      auto const dst = forward ? starter.GetFinishSegment() : starter.GetStartSegment();
+      std::map<routing::Segment, double> dist{{src, 0.0}};
+      std::set<std::pair<double, routing::Segment>> pq{{0.0, src}};
+      std::set<routing::Segment> done;
+      routing::IndexGraphStarter::EdgeListT edges;
+      while (!pq.empty())
+      {
+        auto const [d, x] = *pq.begin();
+        pq.erase(pq.begin());
+        if (!done.insert(x).second)
+          continue;
+        if (x == dst)
+        {
+          direct = std::min(direct, d);
+          continue;
+        }
+        if (!routing::IndexGraphStarter::IsFakeSegment(x))
+        {
+          auto it = real.find(x);
+          if (it == real.end() || d < it->second)
+            real[x] = d;
+          continue;
+        }
+        edges.clear();
+        routing::astar::VertexData<routing::Segment, routing::RouteWeight> const vd(x, routing::RouteWeight(d));
+        if (forward)
+          starter.GetOutgoingEdgesList(vd, edges);
+        else
+          starter.GetIngoingEdgesList(vd, edges);
+        for (auto const & e : edges)
+        {
+          double const nd = d + e.GetWeight().GetIntegratedWeight();
+          auto it = dist.find(e.GetTarget());
+          if (it == dist.end() || nd < it->second)
+          {
+            dist[e.GetTarget()] = nd;
+            pq.insert({nd, e.GetTarget()});
+          }
+        }
+      }
+    };
+
+    struct PointPair
+    {
+      std::string name;
+      double la1, lo1, la2, lo2;
+    };
+    std::vector<PointPair> pairs;
+    for (size_t i = 0; i < 3; ++i)
+    {
+      auto const & a = kPlaces[kPairs[i].first];
+      auto const & b = kPlaces[kPairs[i].second];
+      pairs.push_back({std::string(a.name) + " -> " + b.name + " (city centre coordinates)", a.lat, a.lon, b.lat, b.lon});
+    }
+    std::mt19937_64 prng(FLAGS_seed + 7);
+    std::uniform_real_distribution<double> off(-0.002, 0.002);  // about +-200 m off the road
+    while (pairs.size() < 3 + FLAGS_point_tests)
+    {
+      VertexId const a = sccList[prng() % sccList.size()];
+      VertexId const b = sccList[prng() % sccList.size()];
+      double const dl = std::hypot(g.lat[a] - g.lat[b], g.lon[a] - g.lon[b]);
+      if (dl > 1.0)
+        continue;  // keep the CoMaps reference searches short enough to run many
+      char name[96];
+      std::snprintf(name, sizeof(name), "random #%zu (%.0f km apart)", pairs.size() - 2, dl * 105);
+      pairs.push_back({name, g.lat[a] + off(prng), g.lon[a] + off(prng), g.lat[b] + off(prng), g.lon[b] + off(prng)});
+    }
+
+    using Algo = routing::AStarAlgorithm<routing::Segment, routing::SegmentEdge, routing::RouteWeight>;
+    Algo algo;
+    base::Cancellable cancellable;
+    uint32_t okW = 0, okP = 0, run = 0;
+    for (auto const & pp : pairs)
+    {
+      auto const sSegs = snap(pp.la1, pp.lo1), fSegs = snap(pp.la2, pp.lo2);
+      if (sSegs.empty() || fSegs.empty())
+      {
+        std::cout << "  " << pp.name << ": no road nearby, skipped\n";
+        continue;
+      }
+      ++run;
+      auto const t0p = Clock::now();
+      routing::IndexGraphStarter starter(
+          routing::MakeFakeEnding(sSegs, mercator::FromLatLon(pp.la1, pp.lo1), world),
+          routing::MakeFakeEnding(fSegs, mercator::FromLatLon(pp.la2, pp.lo2), world), 0 /* fakeNumerationStart */,
+          false /* strictForward */, world);
+      Parents pf, pb;
+      starter.SetAStarParents(true, pf);
+      starter.SetAStarParents(false, pb);
+      std::map<routing::Segment, double> srcReal, tgtReal;
+      double direct = kInf;
+      fakeSearch(starter, true, srcReal, direct);
+      fakeSearch(starter, false, tgtReal, direct);
+      starter.DropAStarParents();
+
+      // Real entry/exit segments -> overlay vertices, through their chains.
+      std::unordered_map<VertexId, double> tRaw;
+      for (auto const & [seg, c] : tgtReal)
+        tRaw[raw.FromSegment(seg)] = c;
+      std::map<uint32_t, std::pair<double, std::vector<VertexId>>> srcChain, tgtChain;
+      std::vector<VertexId> chain, directPath;
+      for (auto const & [seg, c] : srcReal)
+      {
+        auto const [kc, cost] = walkForward(raw.FromSegment(seg), c, chain);
+        // A target may sit on the same chain, before any junction.
+        double acc = c;
+        for (size_t i = 0; i < chain.size(); ++i)
+        {
+          if (i > 0)
+            acc += RawEdge(raw.g, chain[i - 1], chain[i]);
+          auto it = tRaw.find(chain[i]);
+          if (it != tRaw.end() && acc + it->second < direct)
+          {
+            direct = acc + it->second;
+            directPath.assign(chain.begin(), chain.begin() + i + 1);
+          }
+        }
+        if (kc != kNone && (!srcChain.count(kc) || cost < srcChain[kc].first))
+          srcChain[kc] = {cost, chain};
+      }
+      for (auto const & [seg, c] : tgtReal)
+      {
+        VertexId x = raw.FromSegment(seg);
+        double cost = c;
+        std::vector<VertexId> back{x};
+        while (rawToComp[x] == kNone && pred[x] != kNone && back.size() < 100000)
+        {
+          cost += predW[x];
+          x = pred[x];
+          back.push_back(x);
+        }
+        if (rawToComp[x] == kNone)
+          continue;
+        std::reverse(back.begin(), back.end());  // kept .. target segment
+        uint32_t const kc = rawToComp[x];
+        if (!tgtChain.count(kc) || cost < tgtChain[kc].first)
+          tgtChain[kc] = {cost, back};
+      }
+      Seeds src, tgt;
+      for (auto const & [kc, v] : srcChain)
+        src.emplace_back(kc, v.first);
+      for (auto const & [kc, v] : tgtChain)
+        tgt.emplace_back(kc, v.first);
+      auto const ovr = OverlayQueryMulti(g, part, ov, src, tgt, sc, true /* wantPath */);
+      double const total = std::min(ovr.weight, direct);
+      std::vector<VertexId> rawPath;
+      if (direct <= ovr.weight)
+      {
+        rawPath = directPath;
+      }
+      else if (!ovr.path.empty())
+      {
+        auto const & pre = srcChain[ovr.path.front()].second;
+        rawPath.assign(pre.begin(), pre.end() - 1);
+        auto const mid = ToRawPath(raw.g, comp, rawToComp, ovr.path);
+        rawPath.insert(rawPath.end(), mid.begin(), mid.end());
+        auto const & suf = tgtChain[ovr.path.back()].second;
+        rawPath.insert(rawPath.end(), suf.begin() + 1, suf.end());
+      }
+      double const oursMs = Since(t0p) * 1000;
+      std::vector<routing::Segment> ourSegs;
+      for (VertexId rv : rawPath)
+        ourSegs.push_back(raw.ToSegment(cm->mwmId, rv));
+
+      // Reference: the router's own search on the same starter (heuristic, wave-join checks).
+      Algo::Params<> params(starter, starter.GetStartSegment(), starter.GetFinishSegment(), cancellable);
+      routing::RoutingResult<routing::Segment, routing::RouteWeight> res;
+      auto const t1 = Clock::now();
+      auto const code = algo.FindPathBidirectional(params, res);
+      double const cs = Since(t1);
+      double const cw = code == Algo::Result::OK ? res.m_distance.GetIntegratedWeight() : kInf;
+      std::vector<routing::Segment> theirSegs;
+      for (auto const & sg : res.m_path)
+        if (!routing::IndexGraphStarter::IsFakeSegment(sg))
+          theirSegs.push_back(sg);
+      bool const wOk = Same(cw, total), pOk = theirSegs == ourSegs;
+      okW += wOk;
+      okP += pOk;
+      std::cout << "  " << pp.name << ": overlay " << Hms(total) << " (" << total << " s) in " << oursMs
+                << " ms incl. fake endings + unpacking | CoMaps " << cw << " s in " << cs * 1000 << " ms | "
+                << (wOk ? "MATCH" : "DIFF") << ", real segments " << ourSegs.size() << "/" << theirSegs.size() << " "
+                << (pOk ? "identical" : "differ") << "\n";
+    }
+    std::cout << "  point tests: " << run << " run, weight matches " << okW << ", identical paths " << okP << "\n";
   }
 
   // 7. Avoid a place: block every vertex near the middle of Lucknow -> Agra, recustomize.

@@ -13,12 +13,16 @@
 
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace plus_overlay
 {
 using VertexId = uint32_t;
-constexpr double kInf = std::numeric_limits<double>::infinity();
+// "Unreachable"/"blocked". Deliberately finite: CoMaps builds with -ffast-math, under which the
+// compiler may assume no value is ever infinite and fold comparisons against infinity away.
+// Sums of a few kInf stay finite and compare >= kInf.
+constexpr double kInf = 1e18;
 constexpr uint32_t kNone = std::numeric_limits<uint32_t>::max();
 
 struct Graph
@@ -126,9 +130,16 @@ private:
   uint32_t m_stamp = 0;
 };
 
+// (vertex, initial distance) pairs: several start or end candidates, as a projected point gives.
+using Seeds = std::vector<std::pair<VertexId, double>>;
+
 QueryResult BidirectionalDijkstra(Graph const & g, VertexId s, VertexId t, Scratch & sc, bool wantPath = false);
 QueryResult OverlayQuery(Graph const & g, Partition const & p, Overlay const & ov, VertexId s, VertexId t,
                          Scratch & sc, bool wantPath = false);
+// Same with several sources and targets; path (if wanted) starts at the source used and ends at the
+// target used.
+QueryResult OverlayQueryMulti(Graph const & g, Partition const & p, Overlay const & ov, Seeds const & sources,
+                              Seeds const & targets, Scratch & sc, bool wantPath = false);
 
 // Storage accounting for the overlay (what a device would have to keep next to the map).
 struct OverlayStorage
