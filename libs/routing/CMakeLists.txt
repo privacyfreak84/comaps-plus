@@ -221,6 +221,7 @@ target_link_libraries(${PROJECT_NAME}
 if (PLATFORM_DESKTOP)
   add_subdirectory(routing_quality)
   add_subdirectory(routes_builder)
+  add_subdirectory(plus_overlay)
 endif()
 
 omim_add_test_subdirectory(routing_benchmarks)
