@@ -39,3 +39,19 @@ target_link_libraries(plus_overlay_multi
     base
     gflags::gflags
 )
+
+# Lean per-map overlay builder (what a phone would run after downloading a map).
+omim_add_executable(plus_overlay_build overlay.cpp overlay.hpp plus_overlay_build.cpp)
+target_link_libraries(plus_overlay_build
+  PRIVATE
+    routing
+    routing_common
+    storage
+    traffic
+    indexer
+    platform
+    geometry
+    coding
+    base
+    gflags::gflags
+)

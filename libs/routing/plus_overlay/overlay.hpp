@@ -11,6 +11,7 @@
 //
 // No CoMaps dependencies on purpose: this is the part that would move into the router later.
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -59,6 +60,7 @@ struct PartitionParams
   std::vector<uint32_t> cellSizes;  // max vertices per cell, level 1 first, increasing
   double minBalance = 0.3;           // each half gets at least this share of the vertices
   int directions = 8;                // projection angles tried per bisection
+  unsigned threads = 1;              // subtrees are split on this many threads
 };
 
 struct Partition
@@ -72,9 +74,23 @@ Partition Bisect(Graph const & g, PartitionParams const & params);
 struct LevelOverlay
 {
   std::vector<uint64_t> entryOff, exitOff, matOff;  // per cell, numCells + 1
-  std::vector<VertexId> entries, exits;
+  std::vector<VertexId> entries, exits;             // per cell, ascending vertex ids
   std::vector<double> mat;                          // per cell: row-major entry x exit
-  std::vector<uint32_t> entryIdx, exitIdx;          // per vertex: index in its cell, or kNone
+  std::vector<uint8_t> role;                        // per vertex: bit 1 entry, bit 2 exit (of its cell)
+
+  bool IsEntry(VertexId v) const { return role[v] & 1; }
+  bool IsExit(VertexId v) const { return role[v] & 2; }
+  // Index of |v| among the entries (exits) of |cell|; |v| must be one.
+  uint32_t EntryIdx(VertexId v, uint32_t cell) const
+  {
+    auto const b = entries.begin() + entryOff[cell], e = entries.begin() + entryOff[cell + 1];
+    return static_cast<uint32_t>(std::lower_bound(b, e, v) - b);
+  }
+  uint32_t ExitIdx(VertexId v, uint32_t cell) const
+  {
+    auto const b = exits.begin() + exitOff[cell], e = exits.begin() + exitOff[cell + 1];
+    return static_cast<uint32_t>(std::lower_bound(b, e, v) - b);
+  }
 };
 
 struct Overlay
@@ -82,7 +98,10 @@ struct Overlay
   std::vector<LevelOverlay> levels;
 };
 
-void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov);
+// Entries/exits of every cell at every level. |extraRole| (optional, per vertex: bit 1 entry, bit 2 exit)
+// marks vertices that are boundary at every level, e.g. map border transitions joined to another map.
+void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov,
+                     std::vector<uint8_t> const * extraRole = nullptr);
 // Computes all clique matrices bottom-up. Returns seconds per level.
 std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov, unsigned threads);
 // Recomputes only the cells (at every level) that contain any of |touched|. Used after edge

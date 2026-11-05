@@ -797,6 +797,7 @@ int main(int argc, char ** argv)
   PartitionParams pp;
   pp.cellSizes = ParseSizes(FLAGS_cell_sizes);
   pp.minBalance = FLAGS_min_balance;
+  pp.threads = FLAGS_threads;
   t0 = Clock::now();
   Partition part = Bisect(g, pp);
   double const partSec = Since(t0);

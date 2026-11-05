@@ -1,6 +1,8 @@
 #include "routing/plus_overlay/overlay.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <chrono>
 #include <memory>
 #include <cmath>
@@ -182,9 +184,11 @@ namespace
 class Bisector
 {
 public:
-  Bisector(Graph const & g, PartitionParams const & params, Partition & p) : m_g(g), m_params(params), m_p(p)
+  Bisector(Graph const & g, PartitionParams const & params, Partition & p)
+    : m_g(g), m_params(params), m_p(p), m_memb(new std::atomic<uint32_t>[g.n])
   {
-    m_memb.assign(g.n, 0);
+    for (uint32_t v = 0; v < g.n; ++v)
+      m_memb[v].store(0, std::memory_order_relaxed);
     m_rank.assign(g.n, 0);
     double latSum = 0;
     for (uint32_t v = 0; v < g.n; ++v)
@@ -197,8 +201,11 @@ public:
       m_x[v] = static_cast<float>(g.lon[v] * k);
       m_y[v] = g.lat[v];
     }
+    m_freeThreads = static_cast<int>(std::max(1u, params.threads)) - 1;
   }
 
+  // Subtrees touch disjoint vertex sets, so they can run on different threads: m_rank is only written
+  // for the subtree's own vertices, and m_memb (read for neighbours) holds a stamp unique to the call.
   void Run(std::vector<VertexId> verts, uint64_t parentSize)
   {
     auto const & cs = m_params.cellSizes;
@@ -207,7 +214,11 @@ public:
     {
       if (m <= cs[li] && parentSize > cs[li])
       {
-        uint32_t const id = m_p.numCells[li]++;
+        uint32_t id;
+        {
+          std::lock_guard<std::mutex> lock(m_cellMutex);
+          id = m_p.numCells[li]++;
+        }
         for (VertexId v : verts)
           m_p.cell[li][v] = id;
       }
@@ -215,9 +226,9 @@ public:
     if (m <= cs[0] || m < 2)
       return;
 
-    ++m_stamp;
+    uint32_t const stamp = m_stamp.fetch_add(1) + 1;
     for (VertexId v : verts)
-      m_memb[v] = m_stamp;
+      m_memb[v].store(stamp, std::memory_order_relaxed);
 
     size_t const kLo = std::max<size_t>(1, static_cast<size_t>(std::ceil(m_params.minBalance * m)));
     size_t const kHi = std::min<size_t>(m - 1, static_cast<size_t>(std::floor((1.0 - m_params.minBalance) * m)));
@@ -227,6 +238,7 @@ public:
     std::vector<VertexId> bestOrder;
     int64_t bestCut = std::numeric_limits<int64_t>::max();
     size_t bestK = m / 2;
+    int bestDir = -1;
 
     for (int d = 0; d < m_params.directions; ++d)
     {
@@ -246,7 +258,7 @@ public:
         for (uint64_t e = m_g.fwdOff[v]; e < m_g.fwdOff[v + 1]; ++e)
         {
           VertexId const w = m_g.fwdTo[e];
-          if (m_memb[w] != m_stamp)
+          if (m_memb[w].load(std::memory_order_relaxed) != stamp)
             continue;
           uint32_t lo = rv, hi = m_rank[w];
           if (lo > hi)
@@ -267,34 +279,58 @@ public:
         {
           bestCut = cut;
           bestK = k;
-          if (bestOrder.size() != m || d != m_bestDir)
+          if (bestOrder.size() != m || d != bestDir)
           {
             bestOrder.resize(m);
             for (size_t i = 0; i < m; ++i)
               bestOrder[i] = kv[i].second;
-            m_bestDir = d;
+            bestDir = d;
           }
         }
       }
     }
-    m_bestDir = -1;
+    std::vector<std::pair<float, VertexId>>().swap(kv);
+    std::vector<int64_t>().swap(diff);
 
     std::vector<VertexId> left(bestOrder.begin(), bestOrder.begin() + bestK);
     std::vector<VertexId> right(bestOrder.begin() + bestK, bestOrder.end());
     std::vector<VertexId>().swap(verts);
     std::vector<VertexId>().swap(bestOrder);
-    Run(std::move(left), m);
-    Run(std::move(right), m);
+
+    // Hand the left half to another thread if one is free and the half is worth it.
+    bool spawn = false;
+    if (left.size() > 20000)
+    {
+      int f = m_freeThreads.load();
+      while (f > 0 && !m_freeThreads.compare_exchange_weak(f, f - 1))
+      {
+      }
+      spawn = f > 0;
+    }
+    if (spawn)
+    {
+      std::thread t([this, l = std::move(left), m]() mutable { Run(std::move(l), m); });
+      Run(std::move(right), m);
+      t.join();
+      m_freeThreads.fetch_add(1);
+    }
+    else
+    {
+      Run(std::move(left), m);
+      Run(std::move(right), m);
+    }
   }
 
 private:
   Graph const & m_g;
   PartitionParams const & m_params;
   Partition & m_p;
-  std::vector<uint32_t> m_memb, m_rank;
+  std::unique_ptr<std::atomic<uint32_t>[]> m_memb;
+  std::vector<uint32_t> m_rank;
   std::vector<float> m_x, m_y;
-  uint32_t m_stamp = 0;
-  int m_bestDir = -1;
+  std::atomic<uint32_t> m_stamp{0};
+  std::atomic<int> m_freeThreads{0};
+  std::mutex m_cellMutex;
 };
 }  // namespace
 
@@ -328,7 +364,7 @@ Scratch::Scratch(uint32_t n)
   m_done[1].assign(n, 0);
 }
 
-void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov)
+void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov, std::vector<uint8_t> const * extraRole)
 {
   ov.levels.assign(p.Levels(), {});
   for (size_t li = 0; li < p.Levels(); ++li)
@@ -336,23 +372,20 @@ void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov)
     auto const & cell = p.cell[li];
     LevelOverlay & L = ov.levels[li];
     uint32_t const nc = p.numCells[li];
-    std::vector<uint8_t> role(g.n, 0);  // bit 1 entry, bit 2 exit
-    L.entryOff.assign(nc + 1, 0);
-    L.exitOff.assign(nc + 1, 0);
+    // bit 1 entry, bit 2 exit. Forward edges only: an edge leaving the cell makes its source an exit and
+    // its target an entry of the target's cell.
+    std::vector<uint8_t> role = extraRole ? *extraRole : std::vector<uint8_t>(g.n, 0);
     for (uint32_t v = 0; v < g.n; ++v)
-    {
-      for (uint64_t e = g.revOff[v]; e < g.revOff[v + 1]; ++e)
-        if (cell[g.revFrom[e]] != cell[v])
-        {
-          role[v] |= 1;
-          break;
-        }
       for (uint64_t e = g.fwdOff[v]; e < g.fwdOff[v + 1]; ++e)
         if (cell[g.fwdTo[e]] != cell[v])
         {
           role[v] |= 2;
-          break;
+          role[g.fwdTo[e]] |= 1;
         }
+    L.entryOff.assign(nc + 1, 0);
+    L.exitOff.assign(nc + 1, 0);
+    for (uint32_t v = 0; v < g.n; ++v)
+    {
       if (role[v] & 1)
         ++L.entryOff[cell[v] + 1];
       if (role[v] & 2)
@@ -365,24 +398,17 @@ void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov)
     }
     L.entries.assign(L.entryOff[nc], 0);
     L.exits.assign(L.exitOff[nc], 0);
-    L.entryIdx.assign(g.n, kNone);
-    L.exitIdx.assign(g.n, kNone);
     std::vector<uint64_t> ep(L.entryOff.begin(), L.entryOff.end() - 1);
     std::vector<uint64_t> xp(L.exitOff.begin(), L.exitOff.end() - 1);
     for (uint32_t v = 0; v < g.n; ++v)
     {
       uint32_t const c = cell[v];
       if (role[v] & 1)
-      {
-        L.entryIdx[v] = static_cast<uint32_t>(ep[c] - L.entryOff[c]);
         L.entries[ep[c]++] = v;
-      }
       if (role[v] & 2)
-      {
-        L.exitIdx[v] = static_cast<uint32_t>(xp[c] - L.exitOff[c]);
         L.exits[xp[c]++] = v;
-      }
     }
+    L.role = std::move(role);
     L.matOff.assign(nc + 1, 0);
     for (uint32_t c = 0; c < nc; ++c)
       L.matOff[c + 1] = L.matOff[c] + (L.entryOff[c + 1] - L.entryOff[c]) * (L.exitOff[c + 1] - L.exitOff[c]);
@@ -392,9 +418,80 @@ void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov)
 
 namespace
 {
+// Per-thread work arrays sized to one cell's vertex set, not to the whole graph.
+struct CellScratch
+{
+  std::vector<double> dist;
+  std::vector<uint32_t> stamp, done;
+  std::vector<std::pair<double, uint32_t>> heap;
+  uint32_t cur = 0;
+
+  void Reset(size_t n)
+  {
+    if (dist.size() < n)
+    {
+      dist.resize(n);
+      stamp.resize(n, 0);
+      done.resize(n, 0);
+    }
+  }
+};
+
+// Vertices taking part in a cell's searches: at level 1 the cell's vertices, above that the entries and
+// exits of its child cells. Cells of one level are disjoint, so |localId| can be shared by all threads.
+struct LevelCells
+{
+  std::vector<uint64_t> off;
+  std::vector<VertexId> verts;
+};
+
+LevelCells CellVertexLists(Graph const & g, Partition const & p, Overlay const & ov, size_t li)
+{
+  LevelCells lc;
+  uint32_t const nc = p.numCells[li];
+  lc.off.assign(nc + 1, 0);
+  auto const & cell = p.cell[li];
+  if (li == 0)
+  {
+    for (uint32_t v = 0; v < g.n; ++v)
+      if (cell[v] != kNone)
+        ++lc.off[cell[v] + 1];
+    for (uint32_t c = 0; c < nc; ++c)
+      lc.off[c + 1] += lc.off[c];
+    lc.verts.resize(lc.off[nc]);
+    std::vector<uint64_t> pos(lc.off.begin(), lc.off.end() - 1);
+    for (uint32_t v = 0; v < g.n; ++v)
+      if (cell[v] != kNone)
+        lc.verts[pos[cell[v]]++] = v;
+    return lc;
+  }
+  LevelOverlay const & C = ov.levels[li - 1];
+  uint32_t const ncc = p.numCells[li - 1];
+  // Child boundary vertices, each once (a vertex can be both entry and exit of its child).
+  std::vector<VertexId> all;
+  for (uint32_t cc = 0; cc < ncc; ++cc)
+  {
+    for (uint64_t i = C.entryOff[cc]; i < C.entryOff[cc + 1]; ++i)
+      all.push_back(C.entries[i]);
+    for (uint64_t i = C.exitOff[cc]; i < C.exitOff[cc + 1]; ++i)
+      if (!C.IsEntry(C.exits[i]))
+        all.push_back(C.exits[i]);
+  }
+  for (VertexId v : all)
+    ++lc.off[cell[v] + 1];
+  for (uint32_t c = 0; c < nc; ++c)
+    lc.off[c + 1] += lc.off[c];
+  lc.verts.resize(lc.off[nc]);
+  std::vector<uint64_t> pos(lc.off.begin(), lc.off.end() - 1);
+  for (VertexId v : all)
+    lc.verts[pos[cell[v]]++] = v;
+  return lc;
+}
+
 // One cell: Dijkstra from every entry, restricted to the cell. Level 1 runs on original edges,
 // higher levels on the children's cliques plus original edges between children.
-void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, uint32_t c, Scratch & sc)
+void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, uint32_t c, LevelCells const & lc,
+                 std::vector<uint32_t> & localId, CellScratch & sc)
 {
   LevelOverlay & L = ov.levels[li];
   auto const & cellOf = p.cell[li];
@@ -402,39 +499,49 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
   uint64_t const x0 = L.exitOff[c], nEx = L.exitOff[c + 1] - x0;
   if (nEn == 0 || nEx == 0)
     return;
+  uint64_t const v0 = lc.off[c], nv = lc.off[c + 1] - v0;
+  for (uint64_t i = 0; i < nv; ++i)
+    localId[lc.verts[v0 + i]] = static_cast<uint32_t>(i);
+  sc.Reset(nv);
+  auto push = [&](double d, uint32_t l)
+  {
+    sc.heap.emplace_back(d, l);
+    std::push_heap(sc.heap.begin(), sc.heap.end(), std::greater<>());
+  };
 
-  auto & S = sc.Fwd();
-  auto & done = sc.Done(0);
   for (uint64_t i = 0; i < nEn; ++i)
   {
-    uint32_t const st = sc.NewStamp();
+    uint32_t const st = ++sc.cur;
     VertexId const src = L.entries[e0 + i];
-    S.heap.clear();
-    S.stamp[src] = st;
-    S.dist[src] = 0;
-    HeapPush(S.heap, 0, src);
+    sc.heap.clear();
+    uint32_t const ls = localId[src];
+    sc.stamp[ls] = st;
+    sc.dist[ls] = 0;
+    push(0, ls);
     uint64_t remaining = nEx;
 
     auto relax = [&](VertexId y, double d)
     {
-      if (S.stamp[y] != st || d < S.dist[y])
+      uint32_t const ly = localId[y];
+      if (sc.stamp[ly] != st || d < sc.dist[ly])
       {
-        S.stamp[y] = st;
-        S.dist[y] = d;
-        HeapPush(S.heap, d, y);
+        sc.stamp[ly] = st;
+        sc.dist[ly] = d;
+        push(d, ly);
       }
     };
 
-    while (!S.heap.empty())
+    while (!sc.heap.empty())
     {
-      Item const it = HeapPop(S.heap);
-      VertexId const x = it.v;
-      if (done[x] == st)
+      std::pop_heap(sc.heap.begin(), sc.heap.end(), std::greater<>());
+      auto const [d, lx] = sc.heap.back();
+      sc.heap.pop_back();
+      if (sc.done[lx] == st)
         continue;
-      done[x] = st;
-      if (L.exitIdx[x] != kNone && --remaining == 0)
+      sc.done[lx] = st;
+      VertexId const x = lc.verts[v0 + lx];
+      if (L.IsExit(x) && --remaining == 0)
         break;
-      double const d = it.d;
       if (li == 0)
       {
         for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
@@ -445,14 +552,14 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
       LevelOverlay const & C = ov.levels[li - 1];
       uint32_t const cc = p.cell[li - 1][x];
       uint64_t const cx0 = C.exitOff[cc], cnEx = C.exitOff[cc + 1] - cx0;
-      if (C.entryIdx[x] != kNone)
+      if (C.IsEntry(x))
       {
-        uint64_t const base = C.matOff[cc] + C.entryIdx[x] * cnEx;
+        uint64_t const base = C.matOff[cc] + C.EntryIdx(x, cc) * cnEx;
         for (uint64_t j = 0; j < cnEx; ++j)
           if (C.mat[base + j] < kInf)
             relax(C.exits[cx0 + j], d + C.mat[base + j]);
       }
-      if (C.exitIdx[x] != kNone)
+      if (C.IsExit(x))
       {
         for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
         {
@@ -464,8 +571,8 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
     }
     for (uint64_t j = 0; j < nEx; ++j)
     {
-      VertexId const y = L.exits[x0 + j];
-      L.mat[L.matOff[c] + i * nEx + j] = (done[y] == st) ? S.dist[y] : kInf;
+      uint32_t const ly = localId[L.exits[x0 + j]];
+      L.mat[L.matOff[c] + i * nEx + j] = (sc.done[ly] == st) ? sc.dist[ly] : kInf;
     }
   }
 }
@@ -475,20 +582,21 @@ std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov
 {
   threads = std::max(1u, threads);
   std::vector<double> seconds;
-  std::vector<std::unique_ptr<Scratch>> scratch;
-  for (unsigned t = 0; t < threads; ++t)
-    scratch.push_back(std::make_unique<Scratch>(g.n));
+  std::vector<uint32_t> localId(g.n, kNone);
+  std::vector<CellScratch> scratch(threads);
   for (size_t li = 0; li < p.Levels(); ++li)
   {
     auto const t0 = std::chrono::steady_clock::now();
     uint32_t const nc = p.numCells[li];
+    LevelCells const lc = CellVertexLists(g, p, ov, li);
+    std::atomic<uint32_t> next{0};
     std::vector<std::thread> pool;
     for (unsigned t = 0; t < threads; ++t)
     {
       pool.emplace_back([&, t]()
       {
-        for (uint32_t c = t; c < nc; c += threads)
-          ComputeCell(g, p, ov, li, c, *scratch[t]);
+        for (uint32_t c = next.fetch_add(1); c < nc; c = next.fetch_add(1))
+          ComputeCell(g, p, ov, li, c, lc, localId, scratch[t]);
       });
     }
     for (auto & th : pool)
@@ -499,9 +607,11 @@ std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov
 }
 
 uint64_t Recustomize(Graph const & g, Partition const & p, Overlay & ov, std::vector<VertexId> const & touched,
-                     Scratch & sc)
+                     Scratch & /* sc */)
 {
   uint64_t count = 0;
+  std::vector<uint32_t> localId(g.n, kNone);
+  CellScratch scratch;
   for (size_t li = 0; li < p.Levels(); ++li)
   {
     std::vector<uint32_t> cells;
@@ -509,8 +619,9 @@ uint64_t Recustomize(Graph const & g, Partition const & p, Overlay & ov, std::ve
       cells.push_back(p.cell[li][v]);
     std::sort(cells.begin(), cells.end());
     cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+    LevelCells const lc = CellVertexLists(g, p, ov, li);
     for (uint32_t c : cells)
-      ComputeCell(g, p, ov, li, c, sc);
+      ComputeCell(g, p, ov, li, c, lc, localId, scratch);
     count += cells.size();
   }
   return count;
@@ -716,14 +827,14 @@ bool UnpackHop(Graph const & g, Partition const & p, Overlay const & ov, Hop con
     LevelOverlay const & C = ov.levels[li - 1];
     uint32_t const cc = p.cell[li - 1][x];
     uint64_t const cx0 = C.exitOff[cc], cnEx = C.exitOff[cc + 1] - cx0;
-    if (C.entryIdx[x] != kNone)
+    if (C.IsEntry(x))
     {
-      uint64_t const base = C.matOff[cc] + C.entryIdx[x] * cnEx;
+      uint64_t const base = C.matOff[cc] + C.EntryIdx(x, cc) * cnEx;
       for (uint64_t j = 0; j < cnEx; ++j)
         if (C.mat[base + j] < kInf)
           relax(C.exits[cx0 + j], d + C.mat[base + j], x, static_cast<uint8_t>(li));
     }
-    if (C.exitIdx[x] != kNone)
+    if (C.IsExit(x))
     {
       for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
       {
@@ -791,10 +902,10 @@ QueryResult OverlayQueryMulti(Graph const & g, Partition const & p, Overlay cons
     size_t const li = lvl - 1;
     LevelOverlay const & L = ov.levels[li];
     uint32_t const c = p.cell[li][x];
-    if (L.entryIdx[x] != kNone)
+    if (L.IsEntry(x))
     {
       uint64_t const x0 = L.exitOff[c], nEx = L.exitOff[c + 1] - x0;
-      uint64_t const base = L.matOff[c] + L.entryIdx[x] * nEx;
+      uint64_t const base = L.matOff[c] + L.EntryIdx(x, c) * nEx;
       for (uint64_t j = 0; j < nEx; ++j)
         if (L.mat[base + j] < kInf)
           relax(L.exits[x0 + j], d + L.mat[base + j], x, static_cast<uint8_t>(lvl));
@@ -816,11 +927,11 @@ QueryResult OverlayQueryMulti(Graph const & g, Partition const & p, Overlay cons
     size_t const li = lvl - 1;
     LevelOverlay const & L = ov.levels[li];
     uint32_t const c = p.cell[li][x];
-    if (L.exitIdx[x] != kNone)
+    if (L.IsExit(x))
     {
       uint64_t const e0 = L.entryOff[c], nEn = L.entryOff[c + 1] - e0;
       uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
-      uint64_t const col = L.exitIdx[x];
+      uint64_t const col = L.ExitIdx(x, c);
       for (uint64_t i = 0; i < nEn; ++i)
       {
         double const w = L.mat[L.matOff[c] + i * nEx + col];

@@ -514,6 +514,7 @@ int main(int argc, char ** argv)
   PartitionParams pp;
   pp.cellSizes = ParseSizes(FLAGS_cell_sizes);
   pp.minBalance = FLAGS_min_balance;
+  pp.threads = FLAGS_threads;
   Partition part;
   part.cell.assign(pp.cellSizes.size(), std::vector<uint32_t>(g.n, kNone));
   part.numCells.assign(pp.cellSizes.size(), 0);
