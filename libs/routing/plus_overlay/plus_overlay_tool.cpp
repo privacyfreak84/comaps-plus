@@ -45,6 +45,8 @@
 #include "indexer/classificator_loader.hpp"
 #include "indexer/data_source.hpp"
 
+#include "geometry/distance_on_sphere.hpp"
+#include "geometry/latlon.hpp"
 #include "geometry/mercator.hpp"
 
 #include "platform/local_country_file.hpp"
@@ -63,6 +65,7 @@
 #include <set>
 #include <unordered_map>
 #include <memory>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <string>
@@ -83,6 +86,10 @@ DEFINE_uint32(verify, 3, "Named pairs to check against CoMaps' AStarAlgorithm (s
 DEFINE_uint32(point_tests, 12, "Random point-to-point routes (plus 3 named) checked against IndexGraphStarter.");
 DEFINE_bool(router_tests, true,
             "Route through every via-way restriction with CoMaps' real IndexRouter and check it against the overlay.");
+DEFINE_double(router_backoff_m, 60, "Via-way router test: also start/end this far back along the features.");
+DEFINE_int32(router_random, 10, "Random point pairs routed by both the real IndexRouter and the overlay.");
+DEFINE_double(router_random_min_km, 5, "Minimum straight-line distance of random router pairs.");
+DEFINE_double(router_random_max_km, 60, "Maximum straight-line distance of random router pairs.");
 DEFINE_bool(avoid_test, true, "Run the avoid-place recustomization test.");
 DEFINE_double(avoid_radius_m, 1500, "Radius of the avoided area.");
 DEFINE_uint64(seed, 42, "Random seed.");
@@ -1058,7 +1065,7 @@ int main(int argc, char ** argv)
 
 
   // 6c. Arbitrary start and finish points, the way IndexRouter handles them inside one map.
-  if (FLAGS_point_tests > 0 || (FLAGS_router_tests && !cm->viaWay.empty()))
+  if (FLAGS_point_tests > 0 || FLAGS_router_tests)
   {
     if (FLAGS_point_tests > 0)
       std::cout << "\n[6c] Point to point: CoMaps IndexGraphStarter (fake endings) + overlay, vs AStarAlgorithm on the starter\n";
@@ -1376,13 +1383,12 @@ int main(int argc, char ** argv)
     if (FLAGS_point_tests > 0)
       std::cout << "  point tests: " << run << " run, weight matches " << okW << ", identical paths " << okP << "\n";
 
-    // 6d. CoMaps' real router through every via-way restriction.
-    if (FLAGS_router_tests && !cm->viaWay.empty())
+    // 6d. The overlay vs CoMaps' real router, with the router's own snapping on both sides.
+    if (FLAGS_router_tests)
     {
-      std::cout << "\n[6d] Via-way restrictions vs CoMaps' real IndexRouter (the app's router: bidirectional A* over joints)\n"
-                << "     points: middle of the 6b start and end segments. 'router' = weight of the router's own\n"
-                << "     real-segment path; 'best' = overlay from the router's first to its last real segment\n"
-                << "     (same endpoints, so any gap is the search itself); 'points' = overlay point to point.\n";
+      std::cout << "\n[6d] Overlay vs CoMaps' real IndexRouter (the app's router), same start/finish snapping\n"
+                << "     Both use IndexRouter's own fake endings (PlusSnap). Weights are integrated weights in s:\n"
+                << "     the router's route re-scored with CoMaps' edge weights, vs the overlay's exact best.\n";
       std::shared_ptr<storage::CountryInfoGetter> cig = storage::CountryInfoReader::CreateCountryInfoGetter(GetPlatform());
       auto const countryFileGetter = [cig](m2::PointD const & pt) { return cig->GetRegionCountryId(pt); };
       auto const rectGetter = [cig](std::string const & id) { return cig->GetLimitRectForLeaf(id); };
@@ -1392,114 +1398,308 @@ int main(int argc, char ** argv)
                                   trafficCache, cm->dataSource);
       routing::RouterDelegate delegate;
 
-      // Weight of a segment path as CoMaps scores it (integrated weights of the raw edges).
-      auto pathWeight = [&](std::vector<routing::Segment> const & segs, size_t & gaps)
+      // CoMaps' weight between consecutive real segments (any via-way copy of the target counts).
+      auto pairWeight = [&](routing::Segment const & a, routing::Segment const & b)
       {
-        double w = 0;
-        gaps = 0;
-        for (size_t i = 1; i < segs.size(); ++i)
-        {
-          VertexId const u = raw.FromSegment(segs[i - 1]), v = raw.FromSegment(segs[i]);
-          double best = kInf;
-          for (uint64_t e = raw.g.fwdOff[u]; e < raw.g.fwdOff[u + 1]; ++e)
-            if (raw.Orig(raw.g.fwdTo[e]) == v)
-              best = std::min(best, raw.g.fwdW[e]);
-          if (best >= kInf)
-            ++gaps;
-          else
-            w += best;
-        }
-        return w;
+        VertexId const u = raw.FromSegment(a), v = raw.FromSegment(b);
+        double best = kInf;
+        for (uint64_t e = raw.g.fwdOff[u]; e < raw.g.fwdOff[u + 1]; ++e)
+          if (raw.Orig(raw.g.fwdTo[e]) == v)
+            best = std::min(best, raw.g.fwdW[e]);
+        return best;
       };
-      auto midpoint = [&](routing::Segment const & sg)
+      auto featureList = [](std::vector<routing::Segment> const & v)
       {
-        auto const & a = ig.GetPoint(sg, false);
-        auto const & b = ig.GetPoint(sg, true);
-        return std::make_pair((a.m_lat + b.m_lat) / 2, (a.m_lon + b.m_lon) / 2);
+        std::string out;
+        for (uint32_t f : FeatureSequence(v))
+          out += " " + std::to_string(f);
+        return out;
       };
 
-      uint32_t run = 0, optimal = 0, worse = 0, failed = 0, violating = 0;
-      std::string worseList, failedList;
+      struct Outcome
+      {
+        bool routerOk = false, overlayOk = false, same = false, identical = false;
+        double routerW = kInf, overlayW = kInf, routerS = 0, overlayMs = 0, astarW = kInf;
+        size_t astarViol = 0;
+        size_t routerViol = 0, overlayViol = 0;
+        std::vector<routing::Segment> routerSegs, overlaySegs;
+        std::string note;
+      };
+      auto compare = [&](ms::LatLon const & a, ms::LatLon const & b)
+      {
+        Outcome o;
+        m2::PointD const pa = mercator::FromLatLon(a), pb = mercator::FromLatLon(b);
+        routing::FakeEnding se, fe;
+        bool codir = false;
+        if (router.PlusSnap(pa, pb, se, fe, codir) != 0)
+        {
+          o.note = "snap failed";
+          return o;
+        }
+        // The overlay on the router's fake endings.
+        auto const t0 = Clock::now();
+        routing::IndexGraphStarter starter(se, fe, 0 /* fakeNumerationStart */, codir /* strictForward */, world);
+        Parents pf, pb2;
+        starter.SetAStarParents(true, pf);
+        starter.SetAStarParents(false, pb2);
+        std::map<routing::Segment, double> srcReal, tgtReal;
+        double direct = kInf;
+        fakeSearch(starter, true, srcReal, direct);
+        fakeSearch(starter, false, tgtReal, direct);
+        starter.DropAStarParents();
+        auto const ans = solve(srcReal, tgtReal, direct);
+        o.overlayMs = Since(t0) * 1000;
+        o.overlayOk = ans.weight < kInf;
+        o.overlayW = ans.weight;
+        o.overlaySegs = ans.segs;
+        o.overlayViol = CountViolations(ans.segs, cm->viaWay);
+
+        // CoMaps' segment-level bidirectional A* on the same starter (as in 6c): separates
+        // "overlay vs CoMaps' graph model" from "segment search vs the router's joints search".
+        {
+          using Algo = routing::AStarAlgorithm<routing::Segment, routing::SegmentEdge, routing::RouteWeight>;
+          Algo algo;
+          base::Cancellable cancellable;
+          Algo::Params<> params(starter, starter.GetStartSegment(), starter.GetFinishSegment(), cancellable);
+          routing::RoutingResult<routing::Segment, routing::RouteWeight> res;
+          if (algo.FindPathBidirectional(params, res) == Algo::Result::OK)
+          {
+            o.astarW = res.m_distance.GetIntegratedWeight();
+            std::vector<routing::Segment> real;
+            for (auto const & sg : res.m_path)
+              if (!routing::IndexGraphStarter::IsFakeSegment(sg))
+                real.push_back(sg);
+            o.astarViol = CountViolations(real, cm->viaWay);
+          }
+        }
+
+        // The real router.
+        routing::Route route("" /* router */, 0 /* routeId */);
+        delegate.SetTimeout(600);
+        auto const t1 = Clock::now();
+        auto const code = router.CalculateRoute(routing::Checkpoints(pa, pb), m2::PointD::Zero(),
+                                                false /* adjustToPrevRoute */, delegate, route);
+        o.routerS = Since(t1);
+        if (code != routing::RouterResultCode::NoError)
+        {
+          o.note = "router " + routing::DebugPrint(code);
+          return o;
+        }
+        o.routerOk = true;
+        std::vector<routing::Segment> rsegs;
+        for (auto const & rseg : route.GetRouteSegments())
+        {
+          auto const & sg = rseg.GetSegment();
+          if (sg.IsRealSegment() && sg.GetMwmId() == cm->mwmId && (rsegs.empty() || !(rsegs.back() == sg)))
+            rsegs.push_back(sg);
+        }
+        o.routerSegs = rsegs;
+        o.routerViol = CountViolations(rsegs, cm->viaWay);
+        // Router total on the same starter. Its first and last segments are the projected ones (fake parts
+        // turned real), and a segment can appear in srcReal/tgtReal through a costlier fake detour, so take
+        // the cheapest valid split: entry cost of rsegs[i] + edges i..j + exit cost of rsegs[j]. This is a
+        // lower bound on the router's real cost, so "router worse" is never overstated.
+        double bestSplit = kInf;
+        size_t bi = 0, bj = 0;
+        {
+          double runMin = kInf;  // min over i <= k of srcReal[rsegs[i]] + w(i..k)
+          size_t runArg = 0;
+          for (size_t k = 0; k < rsegs.size(); ++k)
+          {
+            if (k > 0 && runMin < kInf)
+            {
+              double const w = pairWeight(rsegs[k - 1], rsegs[k]);
+              runMin = (w < kInf) ? runMin + w : kInf;
+            }
+            if (auto it = srcReal.find(rsegs[k]); it != srcReal.end() && it->second < runMin)
+            {
+              runMin = it->second;
+              runArg = k;
+            }
+            if (auto it = tgtReal.find(rsegs[k]); it != tgtReal.end() && runMin + it->second < bestSplit)
+            {
+              bestSplit = runMin + it->second;
+              bi = runArg;
+              bj = k;
+            }
+          }
+        }
+        bool const fakeOnly = rsegs.size() <= 1 && direct < kInf;
+        if (fakeOnly && direct <= bestSplit)
+        {
+          o.routerW = direct;  // never leaves the fake vertices
+          o.identical = ans.segs.empty();
+        }
+        else if (bestSplit < kInf)
+        {
+          o.routerW = bestSplit;
+          std::vector<routing::Segment> const mid(rsegs.begin() + bi, rsegs.begin() + bj + 1);
+          o.identical = (mid == ans.segs);
+        }
+        else
+        {
+          o.note = "router path not on the starter";
+        }
+        o.same = Same(o.routerW, o.overlayW);
+        return o;
+      };
+      auto printOutcome = [&](Outcome const & o)
+      {
+        if (!o.routerOk)
+        {
+          std::cout << o.note << " | overlay " << o.overlayW << " s" << (o.overlayViol ? " [VIOLATES]" : "") << "\n";
+          return;
+        }
+        std::cout << "router " << o.routerW << " s (" << o.routerS << " s)" << (o.routerViol ? " [VIOLATES]" : "")
+                  << " | overlay " << o.overlayW << " s (" << o.overlayMs << " ms)" << (o.overlayViol ? " [VIOLATES]" : "")
+                  << " | A* on starter " << o.astarW << " s" << (o.astarViol ? " [VIOLATES]" : "") << " | "
+                  << (o.same ? (o.identical ? "MATCH, identical path" : "MATCH, different path of equal weight")
+                             : (o.routerW > o.overlayW ? "ROUTER WORSE by " + std::to_string(o.routerW - o.overlayW) + " s"
+                                                       : "OVERLAY WORSE?! by " + std::to_string(o.overlayW - o.routerW)))
+                  << (o.note.empty() ? "" : " | " + o.note) << "\n";
+      };
+
+      // A point |minM| away from a junction, reached through CoMaps' own edges: backwards (ingoing
+      // edges) from a start segment, forwards from an end segment, cheapest first. Midpoint of the
+      // first segment whose midpoint is at least |minM| (straight line) from |seg|'s midpoint.
+      auto awayFromJunction = [&](routing::Segment const & seg, bool backwards, double minM)
+      {
+        auto mid = [&](routing::Segment const & x)
+        {
+          auto const & p = ig.GetPoint(x, false);
+          auto const & q = ig.GetPoint(x, true);
+          return ms::LatLon((p.m_lat + q.m_lat) / 2, (p.m_lon + q.m_lon) / 2);
+        };
+        ms::LatLon const origin = mid(seg);
+        if (minM <= 0)
+          return origin;
+        using Item = std::pair<double, routing::Segment>;
+        std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;
+        std::map<routing::Segment, double> dist{{seg, 0.0}};
+        pq.push({0.0, seg});
+        routing::IndexGraph::SegmentEdgeListT edges;
+        for (int settled = 0; !pq.empty() && settled < 20000; ++settled)
+        {
+          auto const [d, x] = pq.top();
+          pq.pop();
+          if (d > dist[x])
+            continue;
+          if (ms::DistanceOnEarth(origin, mid(x)) >= minM)
+            return mid(x);
+          edges.clear();
+          ig.GetEdgeList(x, !backwards /* isOutgoing */, true /* useRoutingOptions */, edges);
+          for (auto const & e : edges)
+          {
+            double const nd = d + e.GetWeight().GetIntegratedWeight();
+            auto it = dist.find(e.GetTarget());
+            if (it == dist.end() || nd < it->second)
+            {
+              dist[e.GetTarget()] = nd;
+              pq.push({nd, e.GetTarget()});
+            }
+          }
+        }
+        return origin;
+      };
+
+      // (a) Through every via-way restriction, points at the junction and backed off along the features.
+      uint32_t viaRun = 0, viaThrough = 0, viaMatch = 0, viaWorse = 0, viaFail = 0, viaViol = 0;
+      std::string worseList;
       std::ofstream pts("plus_overlay_viaway_points.txt");
+      pts.precision(7);
       for (size_t i = 0; i < viaTests.size(); ++i)
       {
         auto const [s, t] = viaTests[i];
         if (s == kNone)
           continue;
-        ++run;
-        auto const p1 = midpoint(raw.ToSegment(cm->mwmId, comp.origId[s]));
-        auto const p2 = midpoint(raw.ToSegment(cm->mwmId, comp.origId[t]));
-        pts.precision(7);
-        pts << std::fixed << p1.first << " " << p1.second << " " << p2.first << " " << p2.second << "\n";
-
-        routing::Route route("" /* router */, 0 /* routeId */);
-        delegate.SetTimeout(600);
-        auto const t1 = Clock::now();
-        auto const code = router.CalculateRoute(
-            routing::Checkpoints(mercator::FromLatLon(p1.first, p1.second), mercator::FromLatLon(p2.first, p2.second)),
-            m2::PointD::Zero(), false /* adjustToPrevRoute */, delegate, route);
-        double const secs = Since(t1);
-        auto const pa = pointAnswer(p1.first, p1.second, p2.first, p2.second);
-
-        char head[160];
-        std::snprintf(head, sizeof(head), "  #%zu (%.6f, %.6f -> %.6f, %.6f): ", i + 1, p1.first, p1.second, p2.first,
-                      p2.second);
-        std::cout << head;
-        if (code != routing::RouterResultCode::NoError)
+        auto const segS = raw.ToSegment(cm->mwmId, comp.origId[s]);
+        auto const segT = raw.ToSegment(cm->mwmId, comp.origId[t]);
+        auto const & pattern = cm->viaWay[i];
+        for (double const back : {0.0, FLAGS_router_backoff_m})
         {
-          ++failed;
-          failedList += " #" + std::to_string(i + 1);
-          std::cout << "router FAILED (" << routing::DebugPrint(code) << ") after " << secs << " s | points "
-                    << pa.weight << " s, " << CountViolations(pa.segs, cm->viaWay) << " violations\n";
-          continue;
-        }
-        std::vector<routing::Segment> rsegs;
-        for (auto const & rseg : route.GetRouteSegments())
-        {
-          auto const & sg = rseg.GetSegment();
-          if (!sg.IsRealSegment() || sg.GetMwmId() != cm->mwmId)
+          ms::LatLon const a = awayFromJunction(segS, true, back), b = awayFromJunction(segT, false, back);
+          ++viaRun;
+          pts << std::fixed << "#" << (i + 1) << " " << (back > 0 ? "back" : "junction") << " " << a.m_lat << " "
+              << a.m_lon << " " << b.m_lat << " " << b.m_lon << "\n";
+          auto const o = compare(a, b);
+          // Does the router's route actually go from the restriction's first feature to its last one?
+          auto const fr = FeatureSequence(o.routerSegs);
+          bool through = false;
+          for (size_t x = 0; x < fr.size() && !through; ++x)
+            if (fr[x] == pattern.front())
+              for (size_t y = x + 1; y < fr.size() && !through; ++y)
+                through = (fr[y] == pattern.back());
+          char head[200];
+          std::snprintf(head, sizeof(head), "  #%zu %-8s (%.6f, %.6f -> %.6f, %.6f)%s: ", i + 1,
+                        back > 0 ? "back" : "junction", a.m_lat, a.m_lon, b.m_lat, b.m_lon,
+                        through ? "" : " [route avoids the junction]");
+          std::cout << head;
+          printOutcome(o);
+          std::string pat;
+          for (uint32_t f : pattern)
+            pat += " " + std::to_string(f);
+          std::cout << "      restriction:" << pat << " | router:" << featureList(o.routerSegs)
+                    << " | overlay:" << featureList(o.overlaySegs) << "\n";
+          if (!o.routerOk)
+          {
+            ++viaFail;
             continue;
-          if (rsegs.empty() || !(rsegs.back() == sg))
-            rsegs.push_back(sg);
+          }
+          viaThrough += through;
+          viaViol += (o.routerViol > 0);
+          if (o.same)
+            ++viaMatch;
+          else if (o.routerW > o.overlayW)
+          {
+            ++viaWorse;
+            worseList += " #" + std::to_string(i + 1) + (back > 0 ? "b" : "j");
+          }
         }
-        size_t gaps = 0;
-        double const rw = pathWeight(rsegs, gaps);
-        size_t const viol = CountViolations(rsegs, cm->viaWay);
-        double best = kInf;
-        if (!rsegs.empty())
-          best = solve({{rsegs.front(), 0.0}}, {{rsegs.back(), 0.0}}, rsegs.front() == rsegs.back() ? 0.0 : kInf).weight;
-        bool const same = Same(rw, best);
-        if (viol)
-          ++violating;
-        if (same && !viol && !gaps)
-          ++optimal;
-        else if (!same && rw > best)
-        {
-          ++worse;
-          worseList += " #" + std::to_string(i + 1);
-        }
-        std::cout << "router " << rw << " s (" << rsegs.size() << " segments, ETA " << route.GetTotalTimeSec() << " s, "
-                  << secs << " s)" << (gaps ? " [" + std::to_string(gaps) + " gaps]" : "")
-                  << (viol ? " [VIOLATES]" : "") << " | best " << best << " s | "
-                  << (same ? "OPTIMAL" : (rw > best ? "WORSE by " + std::to_string(rw - best) + " s" : "BETTER?!"))
-                  << " | points " << pa.weight << " s" << (CountViolations(pa.segs, cm->viaWay) ? " [VIOLATES]" : "")
-                  << "\n";
-        auto feats = [](std::vector<routing::Segment> const & v)
-        {
-          std::string out;
-          for (uint32_t f : FeatureSequence(v))
-            out += " " + std::to_string(f);
-          return out;
-        };
-        std::string pat;
-        for (uint32_t f : cm->viaWay[i])
-          pat += " " + std::to_string(f);
-        std::cout << "      restriction:" << pat << " | router features:" << feats(rsegs)
-                  << " | points features:" << feats(pa.segs) << "\n";
       }
-      std::cout << "  router tests: " << run << " run, optimal " << optimal << ", worse " << worse << " (" << worseList
-                << " ), failed " << failed << " (" << failedList << " ), violating " << violating
-                << "; points written to plus_overlay_viaway_points.txt\n";
+      std::cout << "  via-way: " << viaRun << " routes (" << viaThrough << " start on the first feature and reach the last),"
+                << " match " << viaMatch << ", router worse " << viaWorse << " (" << worseList << " ), router failed "
+                << viaFail << ", router violating " << viaViol << "\n";
+
+      // (b) Random pairs: whole-route exactness against the app's router.
+      if (FLAGS_router_random > 0)
+      {
+        std::cout << "\n  random pairs (" << FLAGS_router_random_min_km << "-" << FLAGS_router_random_max_km << " km):\n";
+        std::mt19937_64 rng(12345);
+        std::uniform_int_distribution<VertexId> pick(0, raw.baseN - 1);
+        uint32_t run = 0, match = 0, ident = 0, worse = 0, fail = 0;
+        std::vector<double> rs, os;
+        for (int attempt = 0; run < static_cast<uint32_t>(FLAGS_router_random) && attempt < 100000; ++attempt)
+        {
+          VertexId const u = pick(rng), v = pick(rng);
+          ms::LatLon const a(raw.g.lat[u], raw.g.lon[u]), b(raw.g.lat[v], raw.g.lon[v]);
+          double const km = ms::DistanceOnEarth(a, b) / 1000;
+          if (km < FLAGS_router_random_min_km || km > FLAGS_router_random_max_km)
+            continue;
+          ++run;
+          auto const o = compare(a, b);
+          char head[160];
+          std::snprintf(head, sizeof(head), "  %2u. %5.1f km (%.5f, %.5f -> %.5f, %.5f): ", run, km, a.m_lat, a.m_lon,
+                        b.m_lat, b.m_lon);
+          std::cout << head;
+          printOutcome(o);
+          if (!o.routerOk)
+          {
+            ++fail;
+            continue;
+          }
+          rs.push_back(o.routerS * 1000);
+          os.push_back(o.overlayMs);
+          match += o.same;
+          ident += (o.same && o.identical);
+          worse += (!o.same && o.routerW > o.overlayW);
+        }
+        std::sort(rs.begin(), rs.end());
+        std::sort(os.begin(), os.end());
+        auto med = [](std::vector<double> const & v) { return v.empty() ? 0.0 : v[v.size() / 2]; };
+        std::cout << "  random: " << run << " run, weight match " << match << " (identical path " << ident
+                  << "), router worse " << worse << ", router failed " << fail << "; median router " << med(rs)
+                  << " ms, overlay " << med(os) << " ms\n";
+      }
     }
   }
 

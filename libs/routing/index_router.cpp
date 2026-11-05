@@ -1128,6 +1128,14 @@ unique_ptr<WorldGraph> IndexRouter::MakeWorldGraph()
                                         std::move(transitGraphLoader), m_estimator);
 }
 
+int IndexRouter::PlusSnap(m2::PointD const & start, m2::PointD const & finish, FakeEnding & startEnding,
+                          FakeEnding & finishEnding, bool & startIsCodirectional)
+{
+  unique_ptr<WorldGraph> graph = MakeWorldGraph();
+  PointsOnEdgesSnapping snapping(*this, *graph);
+  return snapping.Snap(start, finish, {} /* direction */, startEnding, finishEnding, startIsCodirectional);
+}
+
 int IndexRouter::PointsOnEdgesSnapping::Snap(m2::PointD const & start, m2::PointD const & finish,
                                              m2::PointD const & direction, FakeEnding & startEnding,
                                              FakeEnding & finishEnding, bool & startIsCodirectional)

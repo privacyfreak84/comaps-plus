@@ -97,6 +97,12 @@ public:
   void ClearState() override;
 
   void SetGuides(GuidesTracks && guides) override;
+  /// Comaps++: the router's own start/finish snapping (no start direction), so an external
+  /// search can use exactly the same fake endings as CalculateRoute.
+  /// @return 0 - ok, 1 - start not found, 2 - finish not found.
+  int PlusSnap(m2::PointD const & start, m2::PointD const & finish, FakeEnding & startEnding,
+               FakeEnding & finishEnding, bool & startIsCodirectional);
+
   RouterResultCode CalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
                                   bool adjustToPrevRoute, RouterDelegate const & delegate, Route & route) override;
 
