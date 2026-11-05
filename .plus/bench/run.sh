@@ -38,7 +38,12 @@ out="$BENCH/out-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$out"
 ulimit -n 4096 2>/dev/null || true
 
-"$BUILD/routes_builder_tool" \
+TIME=()
+if [ -x /usr/bin/time ]; then
+  TIME=(/usr/bin/time -v -o "$out/time.txt")
+fi
+
+"${TIME[@]}" "$BUILD/routes_builder_tool" \
   --routes_file="$ROUTES" \
   --dump_path="$out/dump" \
   --data_path="$BENCH/maps" \
@@ -50,5 +55,8 @@ ulimit -n 4096 2>/dev/null || true
   --verbose 2>&1 | tee "$out/log.txt"
 
 python3 "$REPO/.plus/bench/summary.py" "$out/log.txt" | tee "$out/summary.txt"
+if [ -f "$out/time.txt" ]; then
+  grep -E "Maximum resident|Elapsed" "$out/time.txt" | tee -a "$out/summary.txt"
+fi
 echo "log: $out/log.txt"
 echo "summary: $out/summary.txt"

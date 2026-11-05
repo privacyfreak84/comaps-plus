@@ -2,6 +2,7 @@
 
 #include "routing/city_roads.hpp"
 #include "routing/maxspeeds.hpp"
+#include "routing/plus_timing.hpp"
 
 #include "indexer/altitude_loader.hpp"
 #include "indexer/feature.hpp"
@@ -22,6 +23,7 @@
 
 #include "defines.hpp"
 
+#include <cstdlib>
 #include <string>
 
 namespace routing
@@ -286,8 +288,22 @@ Geometry::Geometry(unique_ptr<GeometryLoader> loader, size_t roadsCacheSize) : m
 {
   CHECK(m_loader, ());
 
-  m_featureIdToRoad = make_unique<RoutingCacheT>(
-      roadsCacheSize, [this](uint32_t featureId, RoadGeometry & road) { m_loader->Load(featureId, road); });
+  // Comaps++: COMAPS_PLUS_ROAD_CACHE=N overrides the per-map road geometry cache size, for benchmarks.
+  if (roadsCacheSize == kRoadsCacheSize)
+  {
+    if (char const * env = std::getenv("COMAPS_PLUS_ROAD_CACHE"))
+    {
+      size_t const n = std::strtoul(env, nullptr, 10);
+      if (n > 0)
+        roadsCacheSize = n;
+    }
+  }
+
+  m_featureIdToRoad = make_unique<RoutingCacheT>(roadsCacheSize, [this](uint32_t featureId, RoadGeometry & road)
+  {
+    plus_timing::OnRoadLoad();
+    m_loader->Load(featureId, road);
+  });
 }
 
 RoadGeometry const & Geometry::GetRoad(uint32_t featureId)

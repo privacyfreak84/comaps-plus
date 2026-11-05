@@ -2,7 +2,7 @@ import os
 import re
 import sys
 
-scope = re.compile(r"\[plus-timing\] (.+?) ms: (\d+) visited: (\d+)")
+scope = re.compile(r"\[plus-timing\] (.+?) ms: (\d+) visited: (\d+)(?: loads: (\d+))?")
 event = re.compile(r"\[plus-timing\] (.+)$")
 cand_score = re.compile(r"\[plus-timing\] candidate (\d+) score ([\d.e+]+)")
 cand_time = re.compile(r"^stage 2 candidate (\d+) ")
@@ -73,7 +73,8 @@ for line in open(log_path, errors="replace"):
             continue
         if name.startswith("stage 3 leg"):
             continue
-        print(f"{ms:>9} ms {visited:>11} visited  {name}")
+        loads = f"{int(m.group(4)):>10} loads" if m.group(4) else ""
+        print(f"{ms:>9} ms {visited:>11} visited {loads}  {name}")
         if name == "route total":
             run += 1
             if state is not None:
