@@ -65,6 +65,7 @@
 #include "defines.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <iterator>
 #include <map>
@@ -932,10 +933,49 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
     double const candidateContribution = kCandidatesStageContribution / (2 * candidates.size());
 
     // Select best candidate by calculating start/end sub-routes and using candidateMidWeights.
-    RouteWeight bestW = GetAStarWeightMax<RouteWeight>();
+    //
+    // Comaps++: a candidate scores r1 + mid + r2. The heuristic never overestimates a leg, so
+    // h1 + mid + h2 is a lower bound on that score. Candidates are scored in order of this bound,
+    // and once the bound exceeds the best score so far the candidate cannot win and is skipped.
+    // The legs are the expensive part, so skipping them is where the time goes.
+    // The 0.95 factor keeps the bound below the leg weight even though the heuristic measures
+    // between segment end points rather than along the exact leg.
+    // COMAPS_PLUS_NO_PRUNE=1 restores the upstream loop for comparisons.
+    double constexpr kLowerBoundFactor = 0.95;
+    bool const prune = std::getenv("COMAPS_PLUS_NO_PRUNE") == nullptr;
+
+    std::vector<RouteWeight> lowerBounds;
+    lowerBounds.reserve(candidates.size());
     for (size_t i = 0; i < candidates.size(); ++i)
     {
+      auto const & path = candidates[i].m_path;
+      size_t const sz = path.size();
+      double const h1 = starter.HeuristicCostEstimate(path[0], path[1]).GetWeight();
+      double const h2 = starter.HeuristicCostEstimate(path[sz - 2], path[sz - 1]).GetWeight();
+      lowerBounds.push_back(RouteWeight(kLowerBoundFactor * h1) + candidateMidWeights[i] +
+                            RouteWeight(kLowerBoundFactor * h2));
+    }
+
+    std::vector<size_t> order(candidates.size());
+    for (size_t i = 0; i < order.size(); ++i)
+      order[i] = i;
+    if (prune)
+      std::stable_sort(order.begin(), order.end(),
+                       [&lowerBounds](size_t l, size_t r) { return lowerBounds[l] < lowerBounds[r]; });
+
+    size_t skipped = 0;
+    RouteWeight bestW = GetAStarWeightMax<RouteWeight>();
+    for (size_t const i : order)
+    {
       auto const & c = candidates[i];
+      if (prune && bestW < lowerBounds[i])
+      {
+        ++skipped;
+        LOG(LINFO, ("[plus-timing] candidate", i, "skipped, bound", lowerBounds[i].GetWeight(), "best",
+                    bestW.GetWeight()));
+        continue;
+      }
+
       LOG(LDEBUG, ("Process leaps:", c.m_distance, c.m_path));
       plus_timing::Scope plusCandidate("stage 2 candidate " + std::to_string(i) + " " +
                                        MwmName(c.m_path[1].GetMwmId()) + " .. " +
@@ -948,6 +988,7 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
       if (r1 && r2)
       {
         RouteWeight const w = r1->m_distance + candidateMidWeights[i] + r2->m_distance;
+        LOG(LINFO, ("[plus-timing] candidate", i, "bound", lowerBounds[i].GetWeight(), "score", w.GetWeight()));
         if (w < bestW)
         {
           bestW = w;
@@ -955,6 +996,7 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
         }
       }
     }
+    LOG(LINFO, ("[plus-timing] candidates skipped:", skipped, "of", candidates.size()));
   }
 
   SCOPE_GUARD(progressGuard, [&progress]() { progress->PushAndDropLastSubProgress(); });

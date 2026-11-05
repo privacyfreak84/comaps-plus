@@ -26,6 +26,10 @@ for n in "${names[@]}"; do
   mv "$maps/$f.part" "$maps/$f"
 done
 
+if [ ! -f data/types.txt ]; then
+  tools/unix/generate_drules.sh
+fi
+
 if [ ! -x "$BUILD/routes_builder_tool" ] || [ -n "${REBUILD:-}" ]; then
   tools/unix/build_omim.sh -r routes_builder_tool
 fi
