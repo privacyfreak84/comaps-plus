@@ -85,9 +85,25 @@ struct OverlayRouter::Impl
     if (!mr.tried)
     {
       mr.tried = true;
-      mr.ovl = MappedOverlay::Open(mr.path, mr.version, paramsHash, &mr.error);
-      if (mr.ovl && mr.avoidMask != 0 && !mr.ovl->AttachAvoidCliques(mr.avoidPath, mr.avoidMask, &mr.error))
+      bool damaged = false;
+      mr.ovl = MappedOverlay::Open(mr.path, mr.version, paramsHash, &mr.error, &damaged);
+      // A damaged file would make every route through this map use the normal search until something
+      // rebuilds it: delete it, so the app's background job does (it builds whatever is missing).
+      if (damaged)
+      {
+        LOG(LWARNING, ("Comaps++ overlay: damaged file deleted:", mr.path, mr.error));
+        std::remove(mr.path.c_str());
+      }
+      if (mr.ovl && mr.avoidMask != 0 &&
+          !mr.ovl->AttachAvoidCliques(mr.avoidPath, mr.avoidMask, &mr.error, &damaged))
+      {
+        if (damaged)
+        {
+          LOG(LWARNING, ("Comaps++ overlay: damaged file deleted:", mr.avoidPath, mr.error));
+          std::remove(mr.avoidPath.c_str());
+        }
         mr.ovl.reset();
+      }
       if (mr.ovl)
       {
         for (uint32_t i = 0; i < mr.ovl->NumTransitions(); ++i)

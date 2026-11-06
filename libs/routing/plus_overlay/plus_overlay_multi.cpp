@@ -18,6 +18,11 @@
 #include "plus_overlay_tool.cpp"
 
 #include "routing/cross_mwm_index_graph.hpp"
+#include "routing/road_access.hpp"
+#include "routing/index_graph_loader.hpp"
+#include "indexer/feature_data.hpp"
+#include "indexer/feature.hpp"
+#include "indexer/ftypes_matcher.hpp"
 #include "routing/plus_overlay/overlay_router.hpp"
 
 #include <cstdlib>
@@ -118,12 +123,15 @@ struct Multi
     pl.SetResourceDir(FLAGS_resources_path + "/");
     pl.SetWritableDirForTests(FLAGS_maps_path + "/");
     classificator::Load();
-    names = mwms;
-    for (auto const & name : names)
+    // "Name" or "Name@version" (maps of different versions side by side, as after updating one state).
+    for (auto const & spec : mwms)
     {
+      auto const at = spec.find('@');
+      std::string const name = spec.substr(0, at);
+      int64_t const version = at == std::string::npos ? FLAGS_mwm_version : std::stoll(spec.substr(at + 1));
+      names.push_back(name);
       platform::CountryFile const countryFile(name);
-      platform::LocalCountryFile localFile(FLAGS_maps_path + "/" + std::to_string(FLAGS_mwm_version), countryFile,
-                                           FLAGS_mwm_version);
+      platform::LocalCountryFile localFile(FLAGS_maps_path + "/" + std::to_string(version), countryFile, version);
       localFile.SyncWithDisk();
       auto const res = dataSource.RegisterMap(localFile);
       CHECK_EQUAL(res.second, MwmSet::RegResult::Success, ("Can't register", localFile));
@@ -797,6 +805,175 @@ int RunReroute(Multi & m)
   return 0;
 }
 
+// Stress routes: real places of each kind in the loaded maps (roundabouts, ramps, bridges/tunnels, one-way
+// and restricted roads, dead ends, small islands, border crossings), each paired with a random road point
+// 1-30 km away; plus random short and long pairs and the farthest pairs. Written as a routes file.
+int RunGenStress(Multi & m)
+{
+  std::mt19937_64 rng(FLAGS_seed);
+  std::map<std::string, std::vector<m2::PointD>> cat;  // category -> points (mercator)
+  std::vector<m2::PointD> roadPts;                      // random car-road points, all maps
+  std::map<std::string, uint64_t> seen;
+  auto reservoir = [&](std::vector<m2::PointD> & v, m2::PointD const & p, std::string const & key, size_t cap)
+  {
+    uint64_t const k = seen[key]++;
+    if (v.size() < cap)
+      v.push_back(p);
+    else if (std::uniform_int_distribution<uint64_t>(0, k)(rng) < cap)
+      v[std::uniform_int_distribution<size_t>(0, cap - 1)(rng)] = p;
+  };
+  for (size_t mi = 0; mi < m.names.size(); ++mi)
+  {
+    auto const id = m.ids[mi];
+    auto const mwmId = m.dataSource.GetMwmIdByCountryFile(platform::CountryFile(m.names[mi]));
+    FeaturesLoaderGuard guard(m.dataSource, mwmId);
+    auto const model = m.factory->GetVehicleModelForCountry(m.names[mi]);
+    auto & ig = m.world->GetIndexGraph(id);
+    routing::RoadAccess ra;
+    routing::ReadRoadAccessFromMwm(m.mwmDataSource->GetMwmValue(id), routing::VehicleType::Car, ra);
+    std::vector<uint32_t> roadFeatures;
+    for (uint32_t f = 0; f < guard.GetNumFeatures(); ++f)
+    {
+      auto ft = guard.GetFeatureByIndex(f);
+      if (!ft || ft->GetGeomType() != feature::GeomType::Line)
+        continue;
+      feature::TypesHolder const th(*ft);
+      if (!model->IsRoad(th))
+        continue;
+      auto const & road = ig.GetRoadGeometry(f);
+      if (!road.IsValid() || road.GetPointsCount() < 2)
+        continue;
+      ft->ParseGeometry(FeatureType::BEST_GEOMETRY);
+      m2::PointD const p = ft->GetPoint(ft->GetPointsCount() / 2);
+      roadFeatures.push_back(f);
+      reservoir(roadPts, p, "road", 20000);
+      if (ftypes::IsRoundAboutChecker::Instance()(th))
+        reservoir(cat["roundabout"], p, "roundabout", 30);
+      if (ftypes::IsLinkChecker::Instance()(th))
+        reservoir(cat["ramp"], p, "ramp", 30);
+      if (ftypes::IsBridgeOrTunnelChecker::Instance()(th))
+        reservoir(cat["bridge_tunnel"], p, "bridge_tunnel", 30);
+      if (road.IsOneWay())
+        reservoir(cat["oneway"], p, "oneway", 30);
+      auto const acc = ra.GetAccessWithoutConditional(f).first;
+      if (acc == routing::RoadAccess::Type::No || acc == routing::RoadAccess::Type::Private ||
+          acc == routing::RoadAccess::Type::Destination)
+        reservoir(cat["restricted"], p, "restricted", 30);
+      // Dead end: nothing continues from the last point of the road.
+      routing::IndexGraph::SegmentEdgeListT edges;
+      routing::Segment const last(id, f, road.GetPointsCount() - 2, true);
+      ig.GetEdgeList(last, true, true, edges);
+      if (edges.empty())
+        reservoir(cat["deadend"], mercator::FromLatLon(road.GetPoint(road.GetPointsCount() - 1)), "deadend", 30);
+    }
+    // Small islands: roads whose connected part (either direction) has fewer than 300 segments.
+    std::shuffle(roadFeatures.begin(), roadFeatures.end(), rng);
+    size_t islands = 0;
+    for (size_t k = 0; k < std::min<size_t>(roadFeatures.size(), 4000) && islands < 30; ++k)
+    {
+      routing::Segment const s0(id, roadFeatures[k], 0, true);
+      std::set<routing::Segment> visited{s0};
+      std::vector<routing::Segment> todo{s0};
+      routing::IndexGraph::SegmentEdgeListT edges;
+      while (!todo.empty() && visited.size() < 300)
+      {
+        auto const s = todo.back();
+        todo.pop_back();
+        for (bool out : {true, false})
+        {
+          edges.clear();
+          ig.GetEdgeList(s, out, true, edges);
+          for (auto const & e : edges)
+            if (visited.insert(e.GetTarget()).second)
+              todo.push_back(e.GetTarget());
+        }
+      }
+      if (visited.size() < 300)
+      {
+        cat["island"].push_back(mercator::FromLatLon(ig.GetPoint(s0, true)));
+        ++islands;
+      }
+    }
+    // Border crossings.
+    routing::CrossMwmIndexGraph<base::GeoObjectId> cross(*m.mwmDataSource, routing::VehicleType::Car);
+    auto const & c = cross.GetCrossMwmConnectorWithTransitions(id);
+    c.ForEachEnter([&](uint32_t, routing::Segment const & sg)
+    {
+      if (ig.GetRoadGeometry(sg.GetFeatureId()).IsValid())
+        reservoir(cat["border"], mercator::FromLatLon(ig.GetPoint(sg, true)), "border", 40);
+    });
+    std::cout << "  " << m.names[mi] << ": " << roadFeatures.size() << " car roads\n";
+  }
+
+  std::ofstream out(FLAGS_routes_out);
+  out.precision(9);
+  auto write = [&](std::string const & name, m2::PointD const & a, m2::PointD const & b)
+  {
+    auto const la = mercator::ToLatLon(a), lb = mercator::ToLatLon(b);
+    out << name << " " << la.m_lat << " " << la.m_lon << " " << lb.m_lat << " " << lb.m_lon << "\n";
+  };
+  auto partner = [&](m2::PointD const & p, double minKm, double maxKm, m2::PointD & q)
+  {
+    for (int t = 0; t < 200000; ++t)
+    {
+      q = roadPts[std::uniform_int_distribution<size_t>(0, roadPts.size() - 1)(rng)];
+      double const km = mercator::DistanceOnEarth(p, q) / 1000;
+      if (km >= minKm && km <= maxKm)
+        return true;
+    }
+    return false;
+  };
+  size_t total = 0;
+  for (auto const & [name, pts] : cat)
+  {
+    size_t i = 0;
+    for (auto const & p : pts)
+    {
+      m2::PointD q;
+      if (!partner(p, 1, 30, q))
+        continue;
+      if (i % 2 == 0)
+        write(name + "-" + std::to_string(i), p, q);
+      else
+        write(name + "-" + std::to_string(i), q, p);
+      ++i, ++total;
+    }
+    std::cout << "  " << name << ": " << i << " routes\n";
+  }
+  // Random pairs: short (0.2-50 km) and long (300+ km).
+  for (int i = 0; i < 30; ++i)
+  {
+    m2::PointD const p = roadPts[std::uniform_int_distribution<size_t>(0, roadPts.size() - 1)(rng)];
+    m2::PointD q;
+    if (partner(p, 0.2, 50, q))
+      write("random_short-" + std::to_string(i), p, q), ++total;
+  }
+  for (int i = 0; i < 15; ++i)
+  {
+    m2::PointD const p = roadPts[std::uniform_int_distribution<size_t>(0, roadPts.size() - 1)(rng)];
+    m2::PointD q;
+    if (partner(p, 300, 5000, q))
+      write("random_long-" + std::to_string(i), p, q), ++total;
+  }
+  // Farthest pairs among a sample.
+  std::vector<std::tuple<double, size_t, size_t>> far;
+  for (size_t i = 0; i < std::min<size_t>(roadPts.size(), 3000); i += 3)
+    for (size_t j = i + 1; j < std::min<size_t>(roadPts.size(), 3000); j += 7)
+      far.emplace_back(mercator::DistanceOnEarth(roadPts[i], roadPts[j]), i, j);
+  std::sort(far.rbegin(), far.rend());
+  std::set<size_t> used;
+  int nf = 0;
+  for (auto const & [d, i, j] : far)
+  {
+    if (nf >= 6 || used.count(i) || used.count(j))
+      continue;
+    used.insert(i), used.insert(j);
+    write("extreme-" + std::to_string(nf++), roadPts[i], roadPts[j]), ++total;
+  }
+  std::cout << "  " << total << " routes written to " << FLAGS_routes_out << "\n";
+  return 0;
+}
+
 struct RouterAnswer
 {
   bool ok = false;
@@ -842,6 +1019,8 @@ int main(int argc, char ** argv)
   Multi m;
   m.Init(mwms);
 
+  if (FLAGS_mode == "gen_stress")
+    return RunGenStress(m);
   if (FLAGS_mode == "reroute")
   {
     if (FLAGS_force_joints)

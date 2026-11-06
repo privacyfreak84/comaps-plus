@@ -77,6 +77,30 @@ struct Header
 };
 #pragma pack(pop)
 
+// Every row's rank equals the values before it, and all values are used: row reads stay in bounds.
+bool CliquesConsistent(MappedOverlay::Level const & L, uint32_t const * rowRank, uint64_t const * bits,
+                       uint64_t nValues)
+{
+  uint64_t seen = 0, row = 0;
+  for (uint32_t c = 0; c < L.numCells; ++c)
+  {
+    uint64_t const nEn = L.entryOff[c + 1] - L.entryOff[c];
+    uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
+    uint64_t const wpr = (nEx + 63) / 64;
+    for (uint64_t i = 0; i < nEn; ++i, ++row)
+    {
+      if (rowRank[row] != seen)
+        return false;
+      uint64_t const w0 = L.wordOff[c] + i * wpr;
+      if (nEx % 64 != 0 && (bits[w0 + wpr - 1] >> (nEx % 64)) != 0)
+        return false;  // bits past the last exit
+      for (uint64_t k = 0; k < wpr; ++k)
+        seen += static_cast<uint64_t>(__builtin_popcountll(bits[w0 + k]));
+    }
+  }
+  return seen == nValues;
+}
+
 bool IsReadableVersion(uint32_t v) { return v >= kMinReadableFormatVersion && v <= kFileFormatVersion; }
 
 uint64_t Fnv(uint64_t h, void const * data, size_t len)
@@ -449,13 +473,26 @@ MappedOverlay::Mapping::~Mapping()
 }
 
 std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int64_t expectMwmVersion,
-                                                   uint64_t expectParamsHash, std::string * error)
+                                                   uint64_t expectParamsHash, std::string * error, bool * damaged)
 {
+  if (damaged)
+    *damaged = false;
   std::unique_ptr<MappedOverlay> m(new MappedOverlay());
   if (!m->m_file.Open(path, error))
+  {
+    if (damaged && m->m_file.fd >= 0)
+      *damaged = true;  // exists but too small or unreadable
     return nullptr;
+  }
   auto const & h = *reinterpret_cast<Header const *>(m->m_file.data);
-  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || !IsReadableVersion(h.formatVersion))
+  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0)
+  {
+    if (damaged)
+      *damaged = true;
+    SetError(error, "not an overlay file");
+    return nullptr;
+  }
+  if (!IsReadableVersion(h.formatVersion))
   {
     SetError(error, "not a v" + std::to_string(kFileFormatVersion) + " overlay file");
     return nullptr;
@@ -476,8 +513,28 @@ std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int
     return nullptr;
   }
   if (!m->Parse(error))
+  {
+    if (damaged)
+      *damaged = true;
     return nullptr;
+  }
   return m;
+}
+
+bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error,
+                                       bool * damaged)
+{
+  if (damaged)
+    *damaged = false;
+  Header h;
+  bool const belongs = ReadHeader(path, h) && (h.flags & kCliquesOnly) && h.baseBuildId == m_buildId &&
+                       h.avoidMask == avoidMask;
+  if (AttachAvoidCliques(path, avoidMask, error))
+    return true;
+  // It names this file and mask but doesn't load: damaged.
+  if (damaged && belongs)
+    *damaged = true;
+  return false;
 }
 
 MappedOverlay::~MappedOverlay() = default;
@@ -563,10 +620,7 @@ bool MappedOverlay::Parse(std::string * error)
       return false;
     }
     // Every row's values must lie inside the values section.
-    uint64_t bitsSet = 0;
-    for (uint64_t w = 0; w < L.wordOff[L.numCells]; ++w)
-      bitsSet += static_cast<uint64_t>(__builtin_popcountll(L.bits[w]));
-    if (bitsSet != nValues || (nEntries > 0 && L.rowRank[nEntries - 1] > nValues))
+    if (!CliquesConsistent(L, L.rowRank, L.bits, nValues))
     {
       SetError(error, "bad clique values");
       return false;
@@ -576,6 +630,46 @@ bool MappedOverlay::Parse(std::string * error)
   {
     SetError(error, "bad parent tables");
     return false;
+  }
+  // Cell ids index the per-cell tables: all must be in range (a damaged file is rejected, not read
+  // out of bounds). Boundary lists must hold vertex ids.
+  for (uint32_t v = 0; v < m_n; ++v)
+  {
+    uint32_t const c = m_cell16 ? reinterpret_cast<uint16_t const *>(m_cell1)[v]
+                                : reinterpret_cast<uint32_t const *>(m_cell1)[v];
+    if (c >= m_levels[0].numCells)
+    {
+      SetError(error, "bad cell ids");
+      return false;
+    }
+  }
+  for (size_t li = 1; li < m_levels.size(); ++li)
+    for (uint32_t c = 0; c < m_levels[li - 1].numCells; ++c)
+      if (m_parents[li][c] >= m_levels[li].numCells)
+      {
+        SetError(error, "bad parent tables");
+        return false;
+      }
+  for (auto const & L : m_levels)
+  {
+    for (uint32_t c = 0; c < L.numCells; ++c)
+      if (L.entryOff[c] > L.entryOff[c + 1] || L.exitOff[c] > L.exitOff[c + 1])
+      {
+        SetError(error, "bad level offsets");
+        return false;
+      }
+    for (uint64_t i = 0; i < L.entryOff[L.numCells]; ++i)
+      if (L.entries[i] >= m_n)
+      {
+        SetError(error, "bad boundary lists");
+        return false;
+      }
+    for (uint64_t i = 0; i < L.exitOff[L.numCells]; ++i)
+      if (L.exits[i] >= m_n)
+      {
+        SetError(error, "bad boundary lists");
+        return false;
+      }
   }
 
   // Via-way automaton and copy lookups (tiny).
@@ -646,10 +740,7 @@ bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidM
     cl[li].rowRank = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kRowRank]);
     cl[li].bits = reinterpret_cast<uint64_t const *>(mp.data + h.offset[base + kBits]);
     cl[li].values = reinterpret_cast<float const *>(mp.data + h.offset[base + kValues]);
-    uint64_t bitsSet = 0;
-    for (uint64_t w = 0; w < nWords; ++w)
-      bitsSet += static_cast<uint64_t>(__builtin_popcountll(cl[li].bits[w]));
-    if (bitsSet != nValues || (nEntries > 0 && cl[li].rowRank[nEntries - 1] > nValues))
+    if (!CliquesConsistent(L, cl[li].rowRank, cl[li].bits, nValues))
     {
       SetError(error, "bad clique values");
       return false;
@@ -748,7 +839,7 @@ float MappedOverlay::Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) co
   for (uint64_t k = 0; k < j / 64; ++k)
     idx += static_cast<uint64_t>(__builtin_popcountll(L.bits[row + k]));
   idx += static_cast<uint64_t>(__builtin_popcountll(word & ((uint64_t(1) << (j % 64)) - 1)));
-  return L.values[idx];
+  return IsUsableWeight(L.values[idx]) ? L.values[idx] : 1e30f;
 }
 
 uint32_t MappedOverlay::ExitIdx(size_t li, uint32_t cell, uint32_t v) const

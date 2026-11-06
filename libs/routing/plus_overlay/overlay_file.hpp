@@ -19,6 +19,7 @@
 #include "routing/plus_overlay/via_way_automaton.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -128,8 +129,12 @@ public:
 
   // Null (and |error| set) if the file is missing, damaged or doesn't match the expected map version
   // or build parameters. expectMwmVersion/expectParamsHash of 0 skip that check.
+  // |damaged| (optional) is set when the file exists but its contents are inconsistent (damaged on
+  // storage); not for a missing file or one built for another map version or parameters.
   static std::unique_ptr<MappedOverlay> Open(std::string const & path, int64_t expectMwmVersion,
-                                             uint64_t expectParamsHash, std::string * error = nullptr);
+                                             uint64_t expectParamsHash, std::string * error = nullptr,
+                                             bool * damaged = nullptr);
+  bool AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error, bool * damaged);
   ~MappedOverlay();
   MappedOverlay(MappedOverlay const &) = delete;
   MappedOverlay & operator=(MappedOverlay const &) = delete;
@@ -200,6 +205,16 @@ public:
   uint32_t EntryIdx(size_t li, uint32_t cell, uint32_t v) const;
   uint32_t ExitIdx(size_t li, uint32_t cell, uint32_t v) const;
 
+  // A stored clique weight is finite and >= 0 unless the file was damaged on storage; a damaged value is
+  // skipped, so it can't make a search loop (a negative cycle) or poison distances. Bit test, because
+  // the build uses -ffast-math (NaN comparisons may be folded away).
+  static bool IsUsableWeight(float w)
+  {
+    uint32_t b;
+    std::memcpy(&b, &w, sizeof(b));
+    return b < 0x7F800000u;  // non-negative and finite
+  }
+
   // Clique weight from entry #i to exit #j of |cell| (>= 1e29 when unreachable).
   float Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) const;
   // f(exit vertex, weight) for every exit of |cell| reachable from its entry |v|.
@@ -210,12 +225,18 @@ public:
     uint64_t const nEx = L.exitOff[cell + 1] - L.exitOff[cell];
     uint64_t const wpr = (nEx + 63) / 64;
     uint32_t const i = EntryIdx(li, cell, v);
+    if (i >= L.entryOff[cell + 1] - L.entryOff[cell] || L.entries[L.entryOff[cell] + i] != v)
+      return;  // not an entry of that cell: damaged file
     uint64_t const row = L.wordOff[cell] + i * wpr;
     uint64_t idx = L.rowRank[L.entryOff[cell] + i];
     uint32_t const * exits = L.exits + L.exitOff[cell];
     for (uint64_t k = 0; k < wpr; ++k)
       for (uint64_t w = L.bits[row + k]; w != 0; w &= w - 1)
-        f(exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], L.values[idx++]);
+      {
+        float const v = L.values[idx++];
+        if (IsUsableWeight(v))
+          f(exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], v);
+      }
   }
   // f(entry vertex, weight) for every entry of |cell| that reaches its exit |v|.
   template <class F>
@@ -226,6 +247,8 @@ public:
     uint64_t const nEx = L.exitOff[cell + 1] - L.exitOff[cell];
     uint64_t const wpr = (nEx + 63) / 64;
     uint32_t const j = ExitIdx(li, cell, v);
+    if (j >= nEx || L.exits[L.exitOff[cell] + j] != v)
+      return;  // not an exit of that cell: damaged file
     uint64_t const k = j / 64, bit = j % 64;
     uint64_t const below = (uint64_t(1) << bit) - 1;
     uint32_t const * entries = L.entries + L.entryOff[cell];
@@ -239,7 +262,8 @@ public:
       for (uint64_t q = 0; q < k; ++q)
         idx += static_cast<uint64_t>(__builtin_popcountll(L.bits[row + q]));
       idx += static_cast<uint64_t>(__builtin_popcountll(word & below));
-      f(entries[i], L.values[idx]);
+      if (IsUsableWeight(L.values[idx]))
+        f(entries[i], L.values[idx]);
     }
   }
 
