@@ -28,6 +28,11 @@ namespace traffic
 class TrafficCache;
 }
 
+namespace plus_overlay
+{
+class OverlayRouter;
+}  // namespace plus_overlay
+
 namespace routing
 {
 class AStarProgress;
@@ -133,6 +138,10 @@ private:
 
   RouterResultCode DoCalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
                                     RouterDelegate const & delegate, Route & route);
+  // Comaps++: answers a car subroute from the per-map overlay files if every downloaded map has one
+  // and no avoid option is set; false means "use the normal search".
+  bool TryPlusOverlay(IndexGraphStarter & starter, std::vector<Segment> & subroute);
+
   RouterResultCode CalculateSubroute(Checkpoints const & checkpoints, size_t subrouteIdx,
                                      RouterDelegate const & delegate, std::shared_ptr<AStarProgress> const & progress,
                                      IndexGraphStarter & graph, std::vector<Segment> & subroute,
@@ -307,6 +316,7 @@ private:
   std::unique_ptr<DirectionsEngine> m_directionsEngine;
   std::unique_ptr<SegmentedRoute> m_lastRoute;
   std::unique_ptr<FakeEdgesContainer> m_lastFakeEdges;
+  std::shared_ptr<plus_overlay::OverlayRouter> m_plusOverlay;
 
   // If a ckeckpoint is near to the guide track we need to build route through this track.
   GuidesConnections m_guides;

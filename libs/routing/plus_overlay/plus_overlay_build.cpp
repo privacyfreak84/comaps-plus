@@ -18,6 +18,7 @@
 #include "plus_overlay_tool.cpp"
 
 #include "routing/cross_mwm_index_graph.hpp"
+#include "routing/plus_overlay/overlay_file.hpp"
 
 #include <tuple>
 
@@ -36,6 +37,7 @@ struct LeanGraph
   std::vector<uint32_t> keptRank;  // kept slots before each 64-slot word
   std::vector<uint32_t> origId;    // compressed vertex -> raw slot (base vertices only)
   std::vector<uint32_t> copyOrig;  // via-way copies: compressed id of the original
+  std::vector<uint32_t> copyState; // and their automaton state
   uint32_t baseN = 0;
   Graph g;                       // forward edges + lat/lon
   std::vector<uint8_t> interior; // per edge: the chain behind it passed at least one non-kept segment
@@ -322,6 +324,7 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
     g.lat.push_back(g.lat[v]);
     g.lon.push_back(g.lon[v]);
     lg.copyOrig.push_back(v);
+    lg.copyState.push_back(st);
   }
   g.n += static_cast<uint32_t>(copies.size());
   std::cout << "  via-way: " << patterns.size() << " patterns, " << ac.Size() << " states, " << copies.size()
@@ -332,67 +335,6 @@ void g_shrink(Graph & g)
 {
   g.fwdTo.shrink_to_fit();
   g.fwdW.shrink_to_fit();
-}
-
-// What a device would load: the file alone (float32 cliques widened back to double).
-struct Loaded
-{
-  std::vector<uint32_t> featBase, origId, copyOrig, numCells;
-  Graph g;
-  Partition part;
-  Overlay ov;
-};
-
-bool LoadOverlayFile(std::string const & path, Loaded & L)
-{
-  std::ifstream in(path, std::ios::binary);
-  uint64_t magic = 0;
-  int64_t version = 0;
-  in.read(reinterpret_cast<char *>(&magic), sizeof(magic));
-  in.read(reinterpret_cast<char *>(&version), sizeof(version));
-  if (!in || magic != 0x31594C5245564F50ULL)
-    return false;
-  ReadVec(in, L.featBase);
-  ReadVec(in, L.origId);
-  ReadVec(in, L.copyOrig);
-  std::vector<uint32_t> off32;
-  ReadVec(in, off32);
-  L.g.fwdOff.assign(off32.begin(), off32.end());
-  L.g.n = static_cast<uint32_t>(off32.size() - 1);
-  ReadVec(in, L.g.fwdTo);
-  ReadVec(in, L.g.fwdW);
-  ReadVec(in, L.part.numCells);
-  L.part.cell.resize(L.part.numCells.size());
-  for (auto & lvl : L.part.cell)
-    ReadVec(in, lvl);
-  L.ov.levels.resize(L.part.numCells.size());
-  for (size_t li = 0; li < L.ov.levels.size(); ++li)
-  {
-    auto & lv = L.ov.levels[li];
-    std::vector<uint32_t> eo, xo;
-    std::vector<float> m32;
-    ReadVec(in, eo);
-    ReadVec(in, xo);
-    ReadVec(in, lv.entries);
-    ReadVec(in, lv.exits);
-    ReadVec(in, m32);
-    lv.entryOff.assign(eo.begin(), eo.end());
-    lv.exitOff.assign(xo.begin(), xo.end());
-    lv.mat.resize(m32.size());
-    for (size_t i = 0; i < m32.size(); ++i)
-      lv.mat[i] = m32[i] >= 1e17f ? kInf : static_cast<double>(m32[i]);
-    uint32_t const nc = L.part.numCells[li];
-    lv.matOff.assign(nc + 1, 0);
-    for (uint32_t c = 0; c < nc; ++c)
-      lv.matOff[c + 1] = lv.matOff[c] + (lv.entryOff[c + 1] - lv.entryOff[c]) * (lv.exitOff[c + 1] - lv.exitOff[c]);
-    lv.role.assign(L.g.n, 0);
-    for (VertexId v : lv.entries)
-      lv.role[v] |= 1;
-    for (VertexId v : lv.exits)
-      lv.role[v] |= 2;
-  }
-  L.g.BuildReverse();
-  return static_cast<bool>(in);
 }
 
 template <typename T>
@@ -416,14 +358,24 @@ int main(int argc, char ** argv)
   cm->Init();
   cm->ReportRestrictionsAndAccess();
   std::cout << "  CoMaps IndexGraph ready, " << Mem() << "\n";
+  auto const viaWay = cm->viaWay;
 
   // Border transitions (both directions): kept, and boundary vertices at every level.
   std::vector<routing::Segment> enters, exits;
+  std::vector<uint64_t> enterOsm, exitOsm;
   {
     routing::CrossMwmIndexGraph<base::GeoObjectId> cross(*cm->mwmDataSource, routing::VehicleType::Car);
     auto const & c = cross.GetCrossMwmConnectorWithTransitions(cm->mwmId);
-    c.ForEachEnter([&](uint32_t, routing::Segment const & s) { enters.push_back(s); });
-    c.ForEachExit([&](uint32_t, routing::Segment const & s) { exits.push_back(s); });
+    c.ForEachEnter([&](uint32_t, routing::Segment const & s)
+    {
+      enters.push_back(s);
+      enterOsm.push_back(c.GetCrossMwmId(s).GetEncodedId());
+    });
+    c.ForEachExit([&](uint32_t, routing::Segment const & s)
+    {
+      exits.push_back(s);
+      exitOsm.push_back(c.GetCrossMwmId(s).GetEncodedId());
+    });
   }
   std::vector<routing::Segment> forced(enters);
   forced.insert(forced.end(), exits.begin(), exits.end());
@@ -515,77 +467,77 @@ int main(int argc, char ** argv)
   if (!FLAGS_out.empty())
   {
     t0 = Clock::now();
-    std::ofstream out(FLAGS_out, std::ios::binary);
-    uint64_t const magic = 0x31594C5245564F50ULL;  // "POVERLY1"
-    out.write(reinterpret_cast<char const *>(&magic), sizeof(magic));
-    int64_t const version = FLAGS_mwm_version;
-    out.write(reinterpret_cast<char const *>(&version), sizeof(version));
-    WriteVec(out, lg.featBase);
-    WriteVec(out, lg.origId);
-    WriteVec(out, lg.copyOrig);
-    std::vector<uint32_t> off32(g.fwdOff.begin(), g.fwdOff.end());
-    WriteVec(out, off32);
-    WriteVec(out, g.fwdTo);
-    WriteVec(out, g.fwdW);
-    WriteVec(out, part.numCells);
-    for (auto const & lvl : part.cell)
-      WriteVec(out, lvl);
-    for (auto const & L : ov.levels)
+    FileContents fc;
+    fc.mwmVersion = FLAGS_mwm_version;
+    fc.paramsHash = BuildParamsHash(pp.cellSizes, pp.minBalance, pp.directions);
+    fc.featBase = lg.featBase;
+    fc.keptBits = lg.keptBits;
+    fc.keptRank = lg.keptRank;
+    fc.numSlots = static_cast<uint32_t>(lg.rawSlots);
+    fc.baseN = lg.baseN;
+    fc.n = g.n;
+    fc.copyOrig = lg.copyOrig;
+    fc.copyState = lg.copyState;
+    fc.patterns = viaWay;
+    auto addTransitions = [&](std::vector<routing::Segment> const & segs, std::vector<uint64_t> const & osm,
+                              bool isEnter)
     {
-      std::vector<uint32_t> eo(L.entryOff.begin(), L.entryOff.end()), xo(L.exitOff.begin(), L.exitOff.end());
-      WriteVec(out, eo);
-      WriteVec(out, xo);
-      WriteVec(out, L.entries);
-      WriteVec(out, L.exits);
-      std::vector<float> m32(L.mat.begin(), L.mat.end());
-      WriteVec(out, m32);
+      for (size_t i = 0; i < segs.size(); ++i)
+      {
+        uint32_t const r = lg.Slot(segs[i]);
+        if (!lg.Kept(r))
+          continue;
+        FileTransition t;
+        t.osmId = osm[i];
+        t.local = lg.Rank(r);
+        t.segIdx = segs[i].GetSegmentIdx();
+        t.isEnter = isEnter ? 1 : 0;
+        fc.transitions.push_back(t);
+      }
+    };
+    addTransitions(enters, enterOsm, true);
+    addTransitions(exits, exitOsm, false);
+    std::string err;
+    CHECK(WriteOverlayFile(FLAGS_out, fc, part, ov, &err), (err));
+    auto const mo = MappedOverlay::Open(FLAGS_out, FLAGS_mwm_version, fc.paramsHash, &err);
+    CHECK(mo, (err));
+    std::cout << "  written " << FLAGS_out << ": " << MB(mo->FileBytes()) << " (format v" << kFileFormatVersion
+              << ", " << fc.transitions.size() << " border transitions) in " << Since(t0) << " s\n";
+    if (FLAGS_check_file > 0)
+    {
+      // Structural round trip: everything a query reads must come back identical (cliques as float32).
+      uint64_t bad = 0;
+      for (uint32_t v = 0; v < g.n; ++v)
+      {
+        if (v < lg.baseN && mo->SlotOf(v) != lg.origId[v])
+          ++bad;
+        for (size_t li = 0; li < part.Levels(); ++li)
+          if (mo->Cell(li, v) != part.cell[li][v] || mo->IsEntry(li, v) != ov.levels[li].IsEntry(v) ||
+              mo->IsExit(li, v) != ov.levels[li].IsExit(v))
+            ++bad;
+      }
+      double maxRel = 0;
+      for (size_t li = 0; li < part.Levels(); ++li)
+      {
+        auto const & L = mo->GetLevel(li);
+        auto const & M = ov.levels[li];
+        for (size_t i = 0; i < M.mat.size(); ++i)
+        {
+          bool const inf0 = M.mat[i] >= kInf, inf1 = L.mat[i] >= 1e29f;
+          if (inf0 != inf1)
+            ++bad;
+          else if (!inf0)
+            maxRel = std::max(maxRel, std::abs(M.mat[i] - L.mat[i]) / std::max(1.0, M.mat[i]));
+        }
+      }
+      std::cout << "  file check: " << bad << " mismatches in ids/cells/roles; cliques max relative float32 error "
+                << maxRel << "\n";
+      CHECK_EQUAL(bad, 0, ());
     }
-    out.close();
-    std::ifstream sz(FLAGS_out, std::ios::binary | std::ios::ate);
-    std::cout << "  written " << FLAGS_out << ": " << MB(static_cast<uint64_t>(sz.tellg()))
-              << " (prototype layout: double graph weights, float32 matrices, uint32 cell ids per level) in "
-              << Since(t0) << " s\n";
   }
 
   std::cout << "\n[5] Build total " << Since(tAll) << " s (extraction " << extractSec << ", partition " << partSec
             << ", boundaries " << boundSec << ", customize " << custSec << "), " << Mem() << "\n";
-
-  if (FLAGS_check_file > 0 && !FLAGS_out.empty())
-  {
-    std::cout << "\n[5b] File round trip: queries from the file alone vs the in-memory overlay\n";
-    Loaded ld;
-    auto const tl = Clock::now();
-    CHECK(LoadOverlayFile(FLAGS_out, ld), (FLAGS_out));
-    std::cout << "  loaded in " << Since(tl) << " s\n";
-    CHECK_EQUAL(ld.g.n, g.n, ());
-    if (g.revOff.empty())
-      g.BuildReverse();
-    Scratch scA(g.n), scB(g.n);
-    std::mt19937_64 rng(FLAGS_seed + 1);
-    std::uniform_int_distribution<uint32_t> pick(0, lg.baseN - 1);
-    uint32_t run = 0, exact = 0, within1 = 0, reach = 0;
-    double maxAbs = 0, maxRel = 0;
-    for (uint32_t i = 0; i < FLAGS_check_file; ++i)
-    {
-      uint32_t const a = pick(rng), b = pick(rng);
-      auto const r0 = OverlayQuery(g, part, ov, a, b, scA);
-      auto const r1 = OverlayQuery(ld.g, ld.part, ld.ov, a, b, scB);
-      ++run;
-      if (r0.weight >= kInf || r1.weight >= kInf)
-      {
-        exact += (r0.weight >= kInf) == (r1.weight >= kInf);
-        continue;
-      }
-      ++reach;
-      double const d = std::abs(r0.weight - r1.weight);
-      exact += Same(r0.weight, r1.weight);
-      within1 += d < 1.0;
-      maxAbs = std::max(maxAbs, d);
-      maxRel = std::max(maxRel, d / std::max(1.0, r0.weight));
-    }
-    std::cout << "  " << run << " random pairs (" << reach << " reachable): identical " << exact << ", within 1 s "
-              << within1 << ", max |diff| " << maxAbs << " s (max relative " << maxRel << ")\n";
-  }
 
   if (!FLAGS_verify_raw)
     return 0;

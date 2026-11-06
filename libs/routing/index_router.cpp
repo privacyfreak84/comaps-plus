@@ -1,5 +1,7 @@
 #include "routing/index_router.hpp"
 
+#include "routing/plus_overlay/overlay_router.hpp"
+
 #include "routing/base/astar_progress.hpp"
 #include "routing/car_directions.hpp"
 #include "routing/checkpoints.hpp"
@@ -682,6 +684,9 @@ RouterResultCode IndexRouter::CalculateSubroute(Checkpoints const & checkpoints,
 {
   subroute.clear();
 
+  if (!guidesActive && TryPlusOverlay(starter, subroute))
+    return RouterResultCode::NoError;
+
   SetupAlgorithmMode(starter, guidesActive);
 
   WorldGraphMode const mode = starter.GetGraph().GetMode();
@@ -698,6 +703,76 @@ RouterResultCode IndexRouter::CalculateSubroute(Checkpoints const & checkpoints,
   default: CHECK(false, ("Wrong WorldGraphMode here:", mode));
   }
   UNREACHABLE();
+}
+
+bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & subroute)
+{
+  if (m_vehicleType != VehicleType::Car)
+    return false;
+  static bool const disabled = []
+  {
+    char const * e = std::getenv("COMAPS_PLUS_OVERLAY");
+    return e && std::string(e) == "0";
+  }();
+  if (disabled)
+    return false;
+  // Overlays are built without avoid options; with any set, the normal search answers.
+  if (RoutingOptions::LoadOptionsFromSettings(m_vehicleType).GetOptions() != 0)
+  {
+    LOG(LINFO, ("Comaps++ overlay: avoid options set, using the normal search"));
+    return false;
+  }
+
+  if (!m_plusOverlay)
+    m_plusOverlay = make_shared<plus_overlay::OverlayRouter>(plus_overlay::DefaultParamsHash());
+  vector<shared_ptr<MwmInfo>> infos;
+  m_dataSource.GetDataSource().GetMwmsInfo(infos);
+  vector<plus_overlay::OverlayMap> maps;
+  for (auto const & info : infos)
+  {
+    if (!info || info->GetType() != MwmInfo::COUNTRY)
+      continue;
+    auto const & localFile = info->GetLocalFile();
+    auto const & countryFile = localFile.GetCountryFile();
+    if (!m_numMwmIds->ContainsFile(countryFile))
+      continue;
+    maps.push_back({m_numMwmIds->GetId(countryFile),
+                    plus_overlay::OverlayPathForMap(localFile.GetPath(MapFileType::Map)), info->GetVersion()});
+  }
+  if (maps.empty())
+    return false;
+  m_plusOverlay->SetMaps(maps);
+  vector<NumMwmId> missing;
+  if (!m_plusOverlay->AllMapsReady(&missing))
+  {
+    LOG(LINFO, ("Comaps++ overlay: not built yet for", missing.size(), "of", maps.size(),
+                "downloaded maps, using the normal search"));
+    return false;
+  }
+
+  // Fake vertices are expanded through the world graph; leaps mode can't do that.
+  auto & graph = starter.GetGraph();
+  auto const prevMode = graph.GetMode();
+  graph.SetMode(WorldGraphMode::NoLeaps);
+  plus_overlay::OverlayRouter::Stats stats;
+  plus_overlay::OverlayRouter::Result result;
+  {
+    plus_timing::Scope plusOverlay("overlay");
+    result = m_plusOverlay->FindPath(starter, subroute, stats);
+  }
+  graph.SetMode(prevMode);
+
+  if (result == plus_overlay::OverlayRouter::Result::Ok)
+  {
+    LOG(LINFO, ("Comaps++ overlay route:", stats.ms, "ms,", stats.settled, "settled,", stats.baseScans,
+                "edge lists,", stats.mapsUsed, "maps, weight", stats.weight));
+    return true;
+  }
+  LOG(LINFO, ("Comaps++ overlay:",
+              result == plus_overlay::OverlayRouter::Result::NoRoute ? std::string("no route") : stats.reason,
+              "- using the normal search"));
+  subroute.clear();
+  return false;
 }
 
 RouterResultCode IndexRouter::CalculateSubrouteJointsMode(IndexGraphStarter & starter, RouterDelegate const & delegate,

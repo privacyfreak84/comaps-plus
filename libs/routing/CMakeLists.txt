@@ -107,6 +107,13 @@ set(SRC
   opening_hours_serdes.hpp
   pedestrian_directions.cpp
   pedestrian_directions.hpp
+  plus_overlay/overlay.cpp
+  plus_overlay/overlay.hpp
+  plus_overlay/overlay_file.cpp
+  plus_overlay/overlay_file.hpp
+  plus_overlay/overlay_router.cpp
+  plus_overlay/overlay_router.hpp
+  plus_overlay/via_way_automaton.hpp
   plus_timing.hpp
   position_accumulator.cpp
   position_accumulator.hpp

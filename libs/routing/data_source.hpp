@@ -57,6 +57,8 @@ public:
   }
 
   bool IsLoaded(platform::CountryFile const & file) const { return m_dataSource.IsLoaded(file); }
+  /// Comaps++: the underlying data source (to list downloaded maps).
+  DataSource & GetDataSource() const { return m_dataSource; }
 
   enum SectionStatus
   {

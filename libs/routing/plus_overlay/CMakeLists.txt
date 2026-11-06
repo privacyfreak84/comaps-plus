@@ -3,8 +3,6 @@ project(plus_overlay_tool)
 # Comaps++ cell-overlay (MLD/CRP) prototype. Desktop only, not linked into the app.
 
 set(SRC
-  overlay.cpp
-  overlay.hpp
   plus_overlay_tool.cpp
 )
 
@@ -25,7 +23,7 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 # Same prototype across several MWMs (states joined at their border transitions).
-omim_add_executable(plus_overlay_multi overlay.cpp overlay.hpp plus_overlay_multi.cpp)
+omim_add_executable(plus_overlay_multi plus_overlay_multi.cpp)
 target_link_libraries(plus_overlay_multi
   PRIVATE
     routing
@@ -41,7 +39,7 @@ target_link_libraries(plus_overlay_multi
 )
 
 # Lean per-map overlay builder (what a phone would run after downloading a map).
-omim_add_executable(plus_overlay_build overlay.cpp overlay.hpp plus_overlay_build.cpp)
+omim_add_executable(plus_overlay_build plus_overlay_build.cpp)
 target_link_libraries(plus_overlay_build
   PRIVATE
     routing

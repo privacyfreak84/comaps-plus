@@ -18,6 +18,7 @@
 #include "plus_overlay_tool.cpp"
 
 #include "routing/cross_mwm_index_graph.hpp"
+#include "routing/plus_overlay/overlay_router.hpp"
 
 #include <cstdlib>
 #include <optional>
@@ -32,6 +33,7 @@ DEFINE_uint32(router_pairs, 4, "How many of the random pairs also go into the ro
 DEFINE_string(routes_out, "", "overlay mode: write the routes used (named + router_random) here.");
 DEFINE_string(router_out, "", "router mode: output file.");
 DEFINE_string(router_in, "", "overlay mode: router results to compare with.");
+DEFINE_string(overlay_dir, "", "runtime mode: directory with <map>.plusovl files.");
 
 namespace
 {
@@ -407,6 +409,135 @@ std::vector<RouteSpec> ReadRoutes(std::string const & path)
 }
 
 // --- Router process ------------------------------------------------------------------------------
+// --- Runtime: only the per-map overlay files + CoMaps' IndexGraph, as in the app ---------------------
+int RunRuntime(Multi & m)
+{
+  auto const routes = FLAGS_routes.empty() ? BuiltinRoutes() : ReadRoutes(FLAGS_routes);
+  traffic::TrafficCache traffic;
+  std::shared_ptr<storage::CountryInfoGetter> cig;
+  auto router = m.MakeRouter(traffic, cig);
+  PartitionParams pp;
+  pp.cellSizes = ParseSizes(FLAGS_cell_sizes);
+  pp.minBalance = FLAGS_min_balance;
+  OverlayRouter ovr(BuildParamsHash(pp.cellSizes, pp.minBalance, pp.directions));
+  std::vector<OverlayMap> maps;
+  for (size_t i = 0; i < m.ids.size(); ++i)
+    maps.push_back({m.ids[i], FLAGS_overlay_dir + "/" + m.names[i] + kFileExtension, FLAGS_mwm_version});
+  ovr.SetMaps(maps);
+  std::vector<routing::NumMwmId> missing;
+  std::cout << "  all maps ready: " << (ovr.AllMapsReady(&missing) ? "yes" : "NO") << ", " << Mem() << "\n";
+  auto & world = *m.world;
+  using Parents = routing::AStarGraph<routing::Segment, routing::SegmentEdge, routing::RouteWeight>::Parents;
+
+  uint32_t ok = 0, consistent = 0;
+  std::vector<double> ms;
+  std::ofstream out(FLAGS_router_out.empty() ? "/dev/null" : FLAGS_router_out);
+  out.precision(9);
+  for (auto const & r : routes)
+  {
+    routing::FakeEnding se, fe;
+    bool codir = false;
+    char head[96];
+    std::snprintf(head, sizeof(head), "  %-18s %6.0f km: ", r.name.c_str(), ms::DistanceOnEarth(r.a, r.b) / 1000);
+    std::cout << head;
+    if (router->PlusSnap(mercator::FromLatLon(r.a), mercator::FromLatLon(r.b), se, fe, codir) != 0)
+    {
+      std::cout << "snap failed\n";
+      continue;
+    }
+    routing::IndexGraphStarter starter(se, fe, 0 /* fakeNumerationStart */, codir /* strictForward */, world);
+    std::vector<routing::Segment> path;
+    OverlayRouter::Stats st;
+    auto const res = ovr.FindPath(starter, path, st);
+    if (res != OverlayRouter::Result::Ok)
+    {
+      std::cout << (res == OverlayRouter::Result::NoRoute ? "no route" : "not applicable: " + st.reason) << " ("
+                << st.ms << " ms)\n";
+      continue;
+    }
+    ++ok;
+    ms.push_back(st.ms);
+    // Re-score the path step by step with CoMaps' edges (starter for fake parts, IndexGraph for real
+    // ones, twin + neighbour edge at a map change).
+    Parents pf;
+    starter.SetAStarParents(true, pf);
+    double w = 0, wSrc = 0, wTgt = 0;
+    size_t bad = 0, firstBad = 0;
+    routing::IndexGraphStarter::EdgeListT es;
+    routing::IndexGraph::SegmentEdgeListT ies;
+    for (size_t k = 1; k < path.size(); ++k)
+    {
+      auto const & a = path[k - 1];
+      auto const & b = path[k];
+      double best = kInf;
+      if (routing::IndexGraphStarter::IsFakeSegment(a) || routing::IndexGraphStarter::IsFakeSegment(b))
+      {
+        es.clear();
+        routing::astar::VertexData<routing::Segment, routing::RouteWeight> const vd(a, routing::RouteWeight(0));
+        starter.GetOutgoingEdgesList(vd, es);
+        for (auto const & e : es)
+          if (e.GetTarget() == b)
+            best = std::min(best, e.GetWeight().GetIntegratedWeight());
+      }
+      else
+      {
+        routing::Segment from = a;
+        if (a.GetMwmId() != b.GetMwmId())
+        {
+          routing::Segment twin;
+          if (ovr.TwinOfExit(a, twin))
+            from = twin;
+        }
+        ies.clear();
+        world.GetIndexGraph(from.GetMwmId()).GetEdgeList(from, true, true, ies);
+        for (auto const & e : ies)
+          if (e.GetTarget() == b)
+            best = std::min(best, e.GetWeight().GetIntegratedWeight());
+      }
+      if (best >= kInf)
+      {
+        if (bad++ == 0)
+          firstBad = k;
+        continue;
+      }
+      w += best;
+      if (k <= st.srcEnd)
+        wSrc += best;
+      if (st.tgtBegin > 0 && k > st.tgtBegin)
+        wTgt += best;
+    }
+    starter.DropAStarParents();
+    size_t viol = 0;
+    for (size_t i = 0; i < m.ids.size(); ++i)
+    {
+      std::vector<routing::Segment> sub;
+      for (auto const & sg : path)
+        if (!routing::IndexGraphStarter::IsFakeSegment(sg) && sg.GetMwmId() == m.ids[i])
+          sub.push_back(sg);
+      viol += CountViolations(sub, m.ViaWay(m.ids[i]));
+    }
+    bool const same = bad == 0 && std::abs(w - st.weight) <= 1e-3 * std::max(1.0, st.weight);
+    consistent += same;
+    std::cout << "overlay " << Hms(st.weight) << " (" << st.weight << " s) in " << st.ms << " ms, " << st.settled
+              << " settled, " << st.baseScans << " edge lists, " << path.size() << " segments, " << st.mapsUsed
+              << " maps | path re-scored " << w << " s"
+              << (bad ? " [" + std::to_string(bad) + " BROKEN steps, first at " + std::to_string(firstBad) + "]"
+                      : (same ? " OK" : " MISMATCH"))
+              << (viol ? " [" + std::to_string(viol) + " via-way VIOLATIONS]" : "")
+              << (std::getenv("PLUS_OVERLAY_DEBUG") ? " | start part " + std::to_string(st.srcCost) + " vs " +
+                                                          std::to_string(wSrc) + ", finish part " +
+                                                          std::to_string(st.tgtCost) + " vs " + std::to_string(wTgt)
+                                                    : std::string())
+              << "\n";
+    out << r.name << " " << st.weight << " " << w << " " << st.ms << "\n";
+  }
+  std::sort(ms.begin(), ms.end());
+  std::cout << "  runtime: " << ok << "/" << routes.size() << " routed, " << consistent
+            << " re-scored consistently; median " << (ms.empty() ? 0 : ms[ms.size() / 2]) << " ms, max "
+            << (ms.empty() ? 0 : ms.back()) << " ms; " << Mem() << "\n";
+  return 0;
+}
+
 int RunRouter(Multi & m)
 {
   setenv("COMAPS_PLUS_FORCE_JOINTS", "1", 1);
@@ -493,6 +624,8 @@ int main(int argc, char ** argv)
 
   if (FLAGS_mode == "router")
     return RunRouter(m);
+  if (FLAGS_mode == "runtime")
+    return RunRuntime(m);
 
   // 1. Combined graph.
   std::cout << "\n[1] Combined segment graph\n";

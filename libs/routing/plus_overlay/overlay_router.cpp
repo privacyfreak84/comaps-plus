@@ -1,0 +1,1031 @@
+#include "routing/plus_overlay/overlay_router.hpp"
+
+#include "routing/base/astar_graph.hpp"
+#include "routing/base/astar_vertex_data.hpp"
+#include "routing/index_graph.hpp"
+#include "routing/index_graph_starter.hpp"
+#include "routing/route_weight.hpp"
+#include "routing/segment.hpp"
+#include "routing/world_graph.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
+#include <functional>
+#include <map>
+#include <queue>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace plus_overlay
+{
+namespace
+{
+using routing::Segment;
+using Key = uint64_t;  // map index << 32 | overlay vertex
+constexpr Key kNoKey = std::numeric_limits<Key>::max();
+constexpr float kFloatInf = 1e29f;
+
+Key MakeKey(uint32_t m, uint32_t v) { return (uint64_t(m) << 32) | v; }
+uint32_t MapOf(Key k) { return static_cast<uint32_t>(k >> 32); }
+uint32_t LocalOf(Key k) { return static_cast<uint32_t>(k); }
+
+struct BaseEdge
+{
+  Key to;
+  double w;
+  bool twin;
+};
+
+struct Label
+{
+  double d = kInf;
+  Key parent = kNoKey;
+  uint8_t level = 0;
+  bool done = false;
+};
+
+using Heap = std::priority_queue<std::pair<double, Key>, std::vector<std::pair<double, Key>>, std::greater<>>;
+
+struct MapRt
+{
+  routing::NumMwmId id = 0;
+  std::string path;
+  int64_t version = 0;
+  bool tried = false;
+  std::unique_ptr<MappedOverlay> ovl;
+  std::string error;
+};
+}  // namespace
+
+struct OverlayRouter::Impl
+{
+  uint64_t paramsHash = 0;
+  std::vector<MapRt> maps;
+  std::unordered_map<routing::NumMwmId, uint32_t> mapIdx;
+  bool twinsBuilt = false;
+  std::unordered_map<Key, std::vector<Key>> twinOut;  // exit -> enters of other maps
+  std::unordered_map<Key, std::vector<Key>> twinIn;   // enter -> exits of other maps
+
+  // Per query.
+  routing::IndexGraphStarter * starter = nullptr;
+  std::vector<routing::IndexGraph *> graphs;
+  uint64_t baseScans = 0;
+  routing::IndexGraph::SegmentEdgeListT edges, chainEdges;
+
+  MappedOverlay const * Ovl(uint32_t m)
+  {
+    auto & mr = maps[m];
+    if (!mr.tried)
+    {
+      mr.tried = true;
+      mr.ovl = MappedOverlay::Open(mr.path, mr.version, paramsHash, &mr.error);
+    }
+    return mr.ovl.get();
+  }
+
+  routing::IndexGraph & Graph(uint32_t m)
+  {
+    if (!graphs[m])
+      graphs[m] = &starter->GetGraph().GetIndexGraph(maps[m].id);
+    return *graphs[m];
+  }
+
+  Segment SegOf(uint32_t m, uint32_t local)
+  {
+    auto const & o = *maps[m].ovl;
+    uint32_t f, s;
+    bool fwd;
+    o.Decode(o.SlotOf(local), f, s, fwd);
+    return Segment(maps[m].id, f, s, fwd);
+  }
+
+  // Overlay map index of a real segment, or kNone if its map has no usable overlay.
+  uint32_t MapOfSegment(Segment const & s)
+  {
+    auto it = mapIdx.find(s.GetMwmId());
+    if (it == mapIdx.end() || !Ovl(it->second))
+      return kNone;
+    return it->second;
+  }
+
+  void BuildTwins()
+  {
+    if (twinsBuilt)
+      return;
+    twinsBuilt = true;
+    // (osm way, segment index) -> enter / exit vertices of every map.
+    std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, Key>>> enters, exits;
+    auto tkey = [](FileTransition const & t) { return t.osmId * 1000003ULL + t.segIdx; };
+    for (uint32_t m = 0; m < maps.size(); ++m)
+    {
+      auto const * o = Ovl(m);
+      if (!o)
+        continue;
+      for (uint32_t i = 0; i < o->NumTransitions(); ++i)
+      {
+        auto const & t = o->Transition(i);
+        (t.isEnter ? enters : exits)[tkey(t)].emplace_back(m, MakeKey(m, t.local));
+      }
+    }
+    for (auto const & [k, ex] : exits)
+    {
+      auto it = enters.find(k);
+      if (it == enters.end())
+        continue;
+      for (auto const & [mx, kx] : ex)
+        for (auto const & [me, ke] : it->second)
+          if (mx != me)
+          {
+            twinOut[kx].push_back(ke);
+            twinIn[ke].push_back(kx);
+          }
+    }
+  }
+
+  uint32_t StartState(MappedOverlay const & o, uint32_t local)
+  {
+    auto const * ac = o.Automaton();
+    if (!ac)
+      return 0;
+    if (o.IsCopy(local))
+      return o.CopyState(local);
+    return ac->Start(o.FeatureOfLocal(local));
+  }
+
+  // The overlay target of stepping from (state, feature) onto overlay vertex |base| of |feature t|.
+  // kNone if the step is forbidden by a via-way restriction.
+  uint32_t StepTarget(MappedOverlay const & o, uint32_t state, uint32_t fromFeature, uint32_t base, uint32_t toFeature,
+                      bool inner)
+  {
+    auto const * ac = o.Automaton();
+    if (!ac)
+      return base;
+    uint32_t next = state;
+    if (inner)
+      next = ac->Start(toFeature);
+    else if (toFeature != fromFeature)
+      next = ac->Step(state, toFeature);
+    if (ac->Terminal(next))
+      return kNone;
+    if (ac->Depth(next) >= 2)
+      return o.CopyId(next, base);
+    return base;
+  }
+
+  // Forward chain from real segment |s| in map |m| to the next overlay vertex. |segs| (optional)
+  // receives the segments after |s| up to and including the overlay vertex's segment.
+  // false if the chain dead-ends.
+  bool WalkForward(uint32_t m, Segment s, double & w, uint32_t & kept, bool & inner, std::vector<Segment> * segs)
+  {
+    auto const & o = *maps[m].ovl;
+    inner = false;
+    for (int guard = 0; guard < 1000000; ++guard)
+    {
+      if (!o.HasSegment(s.GetFeatureId(), s.GetSegmentIdx()))
+        return false;
+      uint32_t const slot = o.Slot(s.GetFeatureId(), s.GetSegmentIdx(), s.IsForward());
+      if (o.Kept(slot))
+      {
+        kept = o.Rank(slot);
+        return true;
+      }
+      chainEdges.clear();
+      ++baseScans;
+      Graph(m).GetEdgeList(s, true /* isOutgoing */, true /* useRoutingOptions */, chainEdges);
+      if (chainEdges.size() != 1)
+        return false;
+      inner = true;
+      w += chainEdges[0].GetWeight().GetIntegratedWeight();
+      s = chainEdges[0].GetTarget();
+      if (segs)
+        segs->push_back(s);
+    }
+    return false;
+  }
+
+  // Backward chain: from real segment |s| to the previous overlay vertex. |segs| (optional) receives
+  // the segments from just after that vertex up to |s|, in travel order.
+  bool WalkBackward(uint32_t m, Segment s, double & w, uint32_t & kept, bool & inner, std::vector<Segment> * segs)
+  {
+    auto const & o = *maps[m].ovl;
+    inner = false;
+    std::vector<Segment> rev;
+    for (int guard = 0; guard < 1000000; ++guard)
+    {
+      if (!o.HasSegment(s.GetFeatureId(), s.GetSegmentIdx()))
+        return false;
+      uint32_t const slot = o.Slot(s.GetFeatureId(), s.GetSegmentIdx(), s.IsForward());
+      if (o.Kept(slot))
+      {
+        kept = o.Rank(slot);
+        if (segs)
+          segs->assign(rev.rbegin(), rev.rend());
+        return true;
+      }
+      rev.push_back(s);
+      chainEdges.clear();
+      ++baseScans;
+      Graph(m).GetEdgeList(s, false /* isOutgoing */, true /* useRoutingOptions */, chainEdges);
+      if (chainEdges.size() != 1)
+        return false;
+      inner = true;
+      w += chainEdges[0].GetWeight().GetIntegratedWeight();
+      s = chainEdges[0].GetTarget();
+    }
+    return false;
+  }
+
+  // Overlay out-edges of |x|. |chains| (optional) gets each edge's segments after x's segment.
+  void OutEdges(Key x, std::vector<BaseEdge> & out, std::vector<std::vector<Segment>> * chains)
+  {
+    out.clear();
+    if (chains)
+      chains->clear();
+    uint32_t const m = MapOf(x), v = LocalOf(x);
+    auto const & o = *maps[m].ovl;
+    uint32_t const base = o.IsCopy(v) ? o.CopyOrig(v) : v;
+    Segment const s = SegOf(m, base);
+    uint32_t const fx = s.GetFeatureId();
+    uint32_t const state = StartState(o, v);
+    edges.clear();
+    ++baseScans;
+    Graph(m).GetEdgeList(s, true /* isOutgoing */, true /* useRoutingOptions */, edges);
+    auto const list = edges;  // WalkForward reuses the scratch lists
+    std::vector<Segment> segs;
+    for (auto const & e : list)
+    {
+      Segment t = e.GetTarget();
+      double w = e.GetWeight().GetIntegratedWeight();
+      segs.assign(1, t);
+      uint32_t kept;
+      bool inner;
+      if (!WalkForward(m, t, w, kept, inner, chains ? &segs : nullptr))
+        continue;
+      if (kept == base && !inner && t == s)
+        continue;
+      Segment const kseg = chains ? segs.back() : SegOf(m, kept);
+      if (kseg == s)
+        continue;  // chain back to itself
+      uint32_t const target = StepTarget(o, state, fx, kept, kseg.GetFeatureId(), inner);
+      if (target == kNone)
+        continue;
+      out.push_back({MakeKey(m, target), w, false});
+      if (chains)
+        chains->push_back(segs);
+    }
+    if (!o.IsCopy(v))
+    {
+      auto it = twinOut.find(x);
+      if (it != twinOut.end())
+        for (Key k : it->second)
+          if (Ovl(MapOf(k)))
+          {
+            out.push_back({k, 0.0, true});
+            if (chains)
+              chains->emplace_back();
+          }
+    }
+  }
+
+  // Overlay in-edges of |x| (each as the edge from the predecessor to x).
+  void InEdges(Key x, std::vector<BaseEdge> & out)
+  {
+    out.clear();
+    uint32_t const m = MapOf(x), v = LocalOf(x);
+    auto const & o = *maps[m].ovl;
+    uint32_t const base = o.IsCopy(v) ? o.CopyOrig(v) : v;
+    Segment const s = SegOf(m, base);
+    uint32_t const fx = s.GetFeatureId();
+    edges.clear();
+    ++baseScans;
+    Graph(m).GetEdgeList(s, false /* isOutgoing */, true /* useRoutingOptions */, edges);
+    auto const list = edges;
+    for (auto const & e : list)
+    {
+      Segment p = e.GetTarget();
+      double w = e.GetWeight().GetIntegratedWeight();
+      uint32_t kept;
+      bool inner;
+      if (!WalkBackward(m, p, w, kept, inner, nullptr))
+        continue;
+      Segment const pseg = SegOf(m, kept);
+      if (pseg == s)
+        continue;
+      uint32_t const fp = pseg.GetFeatureId();
+      auto consider = [&](uint32_t cand)
+      {
+        uint32_t const st = StartState(o, cand);
+        if (StepTarget(o, st, fp, base, fx, inner) == v)
+          out.push_back({MakeKey(m, cand), w, false});
+      };
+      consider(kept);
+      if (auto const * copies = o.CopiesOf(kept))
+        for (uint32_t c : *copies)
+          consider(c);
+    }
+    if (!o.IsCopy(v))
+    {
+      auto it = twinIn.find(x);
+      if (it != twinIn.end())
+        for (Key k : it->second)
+          if (Ovl(MapOf(k)))
+            out.push_back({k, 0.0, true});
+    }
+  }
+
+  // Search state of one query.
+  std::vector<std::vector<std::vector<uint32_t>>> endCells;  // [map][level] sorted cells holding an end
+  std::vector<uint8_t> mapHasEnd;
+
+  size_t QueryLevel(Key x)
+  {
+    uint32_t const m = MapOf(x), v = LocalOf(x);
+    auto const & o = *maps[m].ovl;
+    size_t const levels = o.Levels();
+    if (!mapHasEnd[m])
+      return levels;
+    for (size_t li = levels; li-- > 0;)
+    {
+      auto const & ec = endCells[m][li];
+      if (!std::binary_search(ec.begin(), ec.end(), o.Cell(li, v)))
+        return li + 1;
+    }
+    return 0;
+  }
+
+  template <class Relax>
+  void ScanF(Key x, double d, Relax && relax, std::vector<BaseEdge> & tmp)
+  {
+    size_t const lvl = QueryLevel(x);
+    OutEdges(x, tmp, nullptr);
+    if (lvl == 0)
+    {
+      for (auto const & e : tmp)
+        relax(e.to, d + e.w, x, 0);
+      return;
+    }
+    size_t const li = lvl - 1;
+    uint32_t const m = MapOf(x), v = LocalOf(x);
+    auto const & o = *maps[m].ovl;
+    auto const & L = o.GetLevel(li);
+    uint32_t const c = o.Cell(li, v);
+    if (o.IsEntry(li, v))
+    {
+      uint64_t const x0 = L.exitOff[c], nEx = L.exitOff[c + 1] - x0;
+      uint64_t const base = L.matOff[c] + uint64_t(o.EntryIdx(li, c, v)) * nEx;
+      for (uint64_t j = 0; j < nEx; ++j)
+      {
+        float const w = L.mat[base + j];
+        if (w < kFloatInf)
+          relax(MakeKey(m, L.exits[x0 + j]), d + w, x, static_cast<uint8_t>(lvl));
+      }
+    }
+    for (auto const & e : tmp)
+      if (MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
+        relax(e.to, d + e.w, x, 0);
+  }
+
+  template <class Relax>
+  void ScanB(Key x, double d, Relax && relax, std::vector<BaseEdge> & tmp)
+  {
+    size_t const lvl = QueryLevel(x);
+    InEdges(x, tmp);
+    if (lvl == 0)
+    {
+      for (auto const & e : tmp)
+        relax(e.to, d + e.w, x, 0);
+      return;
+    }
+    size_t const li = lvl - 1;
+    uint32_t const m = MapOf(x), v = LocalOf(x);
+    auto const & o = *maps[m].ovl;
+    auto const & L = o.GetLevel(li);
+    uint32_t const c = o.Cell(li, v);
+    if (o.IsExit(li, v))
+    {
+      uint64_t const e0 = L.entryOff[c], nEn = L.entryOff[c + 1] - e0;
+      uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
+      uint64_t const col = o.ExitIdx(li, c, v);
+      for (uint64_t i = 0; i < nEn; ++i)
+      {
+        float const w = L.mat[L.matOff[c] + i * nEx + col];
+        if (w < kFloatInf)
+          relax(MakeKey(m, L.entries[e0 + i]), d + w, x, static_cast<uint8_t>(lvl));
+      }
+    }
+    for (auto const & e : tmp)
+      if (MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
+        relax(e.to, d + e.w, x, 0);
+  }
+
+  // Unpacks hop u -> v found at |level| into segments after u's segment (appended to |out|).
+  bool UnpackHop(Key u, Key v, uint8_t level, std::vector<Segment> & out)
+  {
+    if (level == 0)
+    {
+      std::vector<BaseEdge> es;
+      std::vector<std::vector<Segment>> chains;
+      OutEdges(u, es, &chains);
+      int best = -1;
+      for (size_t i = 0; i < es.size(); ++i)
+        if (es[i].to == v && (best < 0 || es[i].w < es[best].w))
+          best = static_cast<int>(i);
+      if (best < 0)
+        return false;
+      // A twin link is the same physical segment in the next map: CoMaps lists it once.
+      if (!es[best].twin)
+        out.insert(out.end(), chains[best].begin(), chains[best].end());
+      return true;
+    }
+    size_t const li = level - 1;
+    uint32_t const m = MapOf(u);
+    if (MapOf(v) != m)
+      return false;
+    auto const & o = *maps[m].ovl;
+    uint32_t const c = o.Cell(li, LocalOf(u));
+    std::unordered_map<Key, Label> lab;
+    Heap heap;
+    lab[u].d = 0;
+    heap.push({0.0, u});
+    std::vector<BaseEdge> tmp;
+    auto relax = [&](Key y, double d, Key par, uint8_t lvl)
+    {
+      auto & L = lab[y];
+      if (d < L.d)
+      {
+        L.d = d;
+        L.parent = par;
+        L.level = lvl;
+        heap.push({d, y});
+      }
+    };
+    bool found = false;
+    while (!heap.empty())
+    {
+      auto const [d, x] = heap.top();
+      heap.pop();
+      auto & lx = lab[x];
+      if (lx.done)
+        continue;
+      lx.done = true;
+      if (x == v)
+      {
+        found = true;
+        break;
+      }
+      uint32_t const xv = LocalOf(x);
+      OutEdges(x, tmp, nullptr);
+      if (li == 0)
+      {
+        for (auto const & e : tmp)
+          if (MapOf(e.to) == m && o.Cell(0, LocalOf(e.to)) == c)
+            relax(e.to, d + e.w, x, 0);
+        continue;
+      }
+      auto const & C = o.GetLevel(li - 1);
+      uint32_t const cc = o.Cell(li - 1, xv);
+      if (o.IsEntry(li - 1, xv))
+      {
+        uint64_t const cx0 = C.exitOff[cc], cnEx = C.exitOff[cc + 1] - cx0;
+        uint64_t const base = C.matOff[cc] + uint64_t(o.EntryIdx(li - 1, cc, xv)) * cnEx;
+        for (uint64_t j = 0; j < cnEx; ++j)
+        {
+          float const w = C.mat[base + j];
+          if (w < kFloatInf)
+            relax(MakeKey(m, C.exits[cx0 + j]), d + w, x, static_cast<uint8_t>(li));
+        }
+      }
+      if (o.IsExit(li - 1, xv))
+        for (auto const & e : tmp)
+          if (MapOf(e.to) == m && o.Cell(li, LocalOf(e.to)) == c && o.Cell(li - 1, LocalOf(e.to)) != cc)
+            relax(e.to, d + e.w, x, 0);
+    }
+    if (!found)
+      return false;
+    std::vector<std::tuple<Key, Key, uint8_t>> sub;
+    for (Key y = v; y != u; y = lab[y].parent)
+      sub.emplace_back(lab[y].parent, y, lab[y].level);
+    std::reverse(sub.begin(), sub.end());
+    for (auto const & [a, b, l] : sub)
+      if (!UnpackHop(a, b, l, out))
+        return false;
+    return true;
+  }
+
+  // Dijkstra over the starter's fake vertices from the start (forward) or the finish (backward).
+  // |real| gets the first real segments reached with their costs; |parent| the fake predecessors.
+  void FakeSearch(bool forward, std::map<Segment, double> & real, std::map<Segment, Segment> & parent,
+                  double & direct, Segment & directLast)
+  {
+    auto & st = *starter;
+    auto const src = forward ? st.GetStartSegment() : st.GetFinishSegment();
+    auto const dst = forward ? st.GetFinishSegment() : st.GetStartSegment();
+    std::map<Segment, double> dist{{src, 0.0}};
+    std::set<std::pair<double, Segment>> pq{{0.0, src}};
+    std::set<Segment> done;
+    routing::IndexGraphStarter::EdgeListT es;
+    while (!pq.empty())
+    {
+      auto const [d, x] = *pq.begin();
+      pq.erase(pq.begin());
+      if (!done.insert(x).second)
+        continue;
+      if (x == dst)
+      {
+        if (d < direct)
+        {
+          direct = d;
+          directLast = x;
+        }
+        continue;
+      }
+      if (!routing::IndexGraphStarter::IsFakeSegment(x))
+      {
+        auto it = real.find(x);
+        if (it == real.end() || d < it->second)
+          real[x] = d;
+        continue;
+      }
+      es.clear();
+      routing::astar::VertexData<Segment, routing::RouteWeight> const vd(x, routing::RouteWeight(d));
+      if (forward)
+        st.GetOutgoingEdgesList(vd, es);
+      else
+        st.GetIngoingEdgesList(vd, es);
+      for (auto const & e : es)
+      {
+        double const nd = d + e.GetWeight().GetIntegratedWeight();
+        auto it = dist.find(e.GetTarget());
+        if (it == dist.end() || nd < it->second)
+        {
+          dist[e.GetTarget()] = nd;
+          parent[e.GetTarget()] = x;
+          pq.insert({nd, e.GetTarget()});
+        }
+      }
+    }
+  }
+};
+
+OverlayRouter::OverlayRouter(uint64_t paramsHash) : m_impl(std::make_unique<Impl>())
+{
+  m_impl->paramsHash = paramsHash;
+}
+
+OverlayRouter::~OverlayRouter() = default;
+
+void OverlayRouter::SetMaps(std::vector<OverlayMap> const & maps)
+{
+  // Keep already opened files of maps that are unchanged.
+  std::vector<MapRt> next;
+  for (auto const & om : maps)
+  {
+    MapRt mr;
+    mr.id = om.id;
+    mr.path = om.path;
+    mr.version = om.mwmVersion;
+    auto it = m_impl->mapIdx.find(om.id);
+    if (it != m_impl->mapIdx.end())
+    {
+      auto & old = m_impl->maps[it->second];
+      if (old.path == om.path && old.version == om.mwmVersion)
+        mr = std::move(old);
+    }
+    next.push_back(std::move(mr));
+  }
+  m_impl->maps = std::move(next);
+  m_impl->mapIdx.clear();
+  for (uint32_t i = 0; i < m_impl->maps.size(); ++i)
+    m_impl->mapIdx[m_impl->maps[i].id] = i;
+  m_impl->twinsBuilt = false;
+  m_impl->twinOut.clear();
+  m_impl->twinIn.clear();
+}
+
+bool OverlayRouter::AllMapsReady(std::vector<routing::NumMwmId> * missing)
+{
+  bool all = true;
+  for (uint32_t m = 0; m < m_impl->maps.size(); ++m)
+  {
+    if (!m_impl->Ovl(m))
+    {
+      all = false;
+      if (missing)
+        missing->push_back(m_impl->maps[m].id);
+    }
+  }
+  return all;
+}
+
+bool OverlayRouter::TwinOfExit(routing::Segment const & exitSegment, routing::Segment & twin)
+{
+  auto & I = *m_impl;
+  I.BuildTwins();
+  uint32_t const m = I.MapOfSegment(exitSegment);
+  if (m == kNone)
+    return false;
+  auto const & o = *I.maps[m].ovl;
+  if (!o.HasSegment(exitSegment.GetFeatureId(), exitSegment.GetSegmentIdx()))
+    return false;
+  uint32_t const slot = o.Slot(exitSegment.GetFeatureId(), exitSegment.GetSegmentIdx(), exitSegment.IsForward());
+  if (!o.Kept(slot))
+    return false;
+  auto it = I.twinOut.find(MakeKey(m, o.Rank(slot)));
+  if (it == I.twinOut.end() || it->second.empty())
+    return false;
+  twin = I.SegOf(MapOf(it->second[0]), LocalOf(it->second[0]));
+  return true;
+}
+
+OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & starter,
+                                              std::vector<routing::Segment> & path, Stats & stats)
+{
+  auto const t0 = std::chrono::steady_clock::now();
+  auto & I = *m_impl;
+  path.clear();
+  stats = {};
+  I.starter = &starter;
+  I.graphs.assign(I.maps.size(), nullptr);
+  I.baseScans = 0;
+  I.BuildTwins();
+  auto finish = [&](Result r, std::string const & why)
+  {
+    stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    stats.baseScans = I.baseScans;
+    stats.reason = why;
+    I.starter = nullptr;
+    return r;
+  };
+
+  // 1. Fake parts of the starter.
+  using Parents = routing::AStarGraph<Segment, routing::SegmentEdge, routing::RouteWeight>::Parents;
+  Parents pf, pb;
+  starter.SetAStarParents(true, pf);
+  starter.SetAStarParents(false, pb);
+  std::map<Segment, double> srcReal, tgtReal;
+  std::map<Segment, Segment> parF, parB;
+  double direct = kInf;
+  Segment dummy;
+  I.FakeSearch(true, srcReal, parF, direct, dummy);
+  double directB = kInf;
+  I.FakeSearch(false, tgtReal, parB, directB, dummy);
+  // The backward search ran on ingoing weights, which for fake segments differ slightly from the
+  // forward weights CoMaps scores a route with: re-cost every finish part forward.
+  {
+    routing::IndexGraphStarter::EdgeListT es;
+    for (auto & [y, cost] : tgtReal)
+    {
+      double fw = 0;
+      bool ok = true;
+      Segment x = y;
+      for (int guard = 0; guard < 100000 && x != starter.GetFinishSegment(); ++guard)
+      {
+        auto it = parB.find(x);
+        if (it == parB.end())
+        {
+          ok = false;
+          break;
+        }
+        es.clear();
+        routing::astar::VertexData<Segment, routing::RouteWeight> const vd(x, routing::RouteWeight(0));
+        starter.GetOutgoingEdgesList(vd, es);
+        double w = kInf;
+        for (auto const & e : es)
+          if (e.GetTarget() == it->second)
+            w = std::min(w, e.GetWeight().GetIntegratedWeight());
+        if (w >= kInf)
+        {
+          ok = false;
+          break;
+        }
+        fw += w;
+        x = it->second;
+      }
+      if (ok)
+        cost = fw;
+    }
+  }
+  starter.DropAStarParents();
+  if (srcReal.empty() && tgtReal.empty() && direct >= kInf)
+    return finish(Result::NoRoute, "");
+
+  // 2. Seeds: walk chains from the real segments to overlay vertices.
+  struct Seed
+  {
+    Segment real;
+    double cost;
+    std::vector<Segment> chain;  // real segments from |real| to the overlay vertex (both included)
+  };
+  std::unordered_map<Key, Seed> src, tgt;
+  for (auto const & [s, c] : srcReal)
+  {
+    uint32_t const m = I.MapOfSegment(s);
+    if (m == kNone)
+      return finish(Result::NotApplicable, "start map has no overlay");
+    double w = c;
+    uint32_t kept;
+    bool inner;
+    std::vector<Segment> chain{s};
+    if (!I.WalkForward(m, s, w, kept, inner, &chain))
+      continue;
+    Key const k = MakeKey(m, kept);
+    auto it = src.find(k);
+    if (it == src.end() || w < it->second.cost)
+      src[k] = {s, w, chain};
+  }
+  for (auto const & [s, c] : tgtReal)
+  {
+    uint32_t const m = I.MapOfSegment(s);
+    if (m == kNone)
+      return finish(Result::NotApplicable, "finish map has no overlay");
+    double w = c;
+    uint32_t kept;
+    bool inner;
+    std::vector<Segment> chain;  // segments after the overlay vertex up to and including |s| (empty if |s| is it)
+    if (!I.WalkBackward(m, s, w, kept, inner, &chain))
+      continue;
+    auto const & o = *I.maps[m].ovl;
+    auto add = [&](uint32_t local)
+    {
+      Key const k = MakeKey(m, local);
+      auto it = tgt.find(k);
+      if (it == tgt.end() || w < it->second.cost)
+        tgt[k] = {s, w, chain};
+    };
+    add(kept);
+    if (auto const * copies = o.CopiesOf(kept))
+      for (uint32_t cpy : *copies)
+        add(cpy);
+  }
+
+  // A target real segment on a source chain: a route that never reaches an overlay vertex.
+  double bestDirect = direct;
+  std::vector<Segment> directReal;
+  Segment directSrc, directTgt;
+  for (auto const & [k, sd] : src)
+  {
+    double acc = srcReal.at(sd.real);
+    for (size_t i = 0; i < sd.chain.size(); ++i)
+    {
+      if (i > 0)
+      {
+        // Weight of chain[i-1] -> chain[i].
+        I.edges.clear();
+        I.Graph(I.MapOfSegment(sd.chain[i - 1])).GetEdgeList(sd.chain[i - 1], true, true, I.edges);
+        double w = kInf;
+        for (auto const & e : I.edges)
+          if (e.GetTarget() == sd.chain[i])
+            w = std::min(w, e.GetWeight().GetIntegratedWeight());
+        acc += w;
+      }
+      auto it = tgtReal.find(sd.chain[i]);
+      if (it != tgtReal.end() && acc + it->second < bestDirect)
+      {
+        bestDirect = acc + it->second;
+        directReal.assign(sd.chain.begin(), sd.chain.begin() + i + 1);
+        directSrc = sd.real;
+        directTgt = sd.chain[i];
+      }
+    }
+  }
+
+  // 3. Overlay search.
+  I.endCells.assign(I.maps.size(), {});
+  I.mapHasEnd.assign(I.maps.size(), 0);
+  auto noteEnd = [&](Key k)
+  {
+    uint32_t const m = MapOf(k);
+    auto const & o = *I.maps[m].ovl;
+    if (I.endCells[m].empty())
+      I.endCells[m].resize(o.Levels());
+    I.mapHasEnd[m] = 1;
+    for (size_t li = 0; li < o.Levels(); ++li)
+      I.endCells[m][li].push_back(o.Cell(li, LocalOf(k)));
+  };
+  for (auto const & [k, sd] : src)
+    noteEnd(k);
+  for (auto const & [k, sd] : tgt)
+    noteEnd(k);
+  for (auto & per : I.endCells)
+    for (auto & v : per)
+    {
+      std::sort(v.begin(), v.end());
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+    }
+
+  std::unordered_map<Key, Label> F, B;
+  Heap hf, hb;
+  for (auto const & [k, sd] : src)
+  {
+    F[k].d = sd.cost;
+    hf.push({sd.cost, k});
+  }
+  for (auto const & [k, sd] : tgt)
+  {
+    B[k].d = sd.cost;
+    hb.push({sd.cost, k});
+  }
+  double mu = kInf;
+  Key meet = kNoKey;
+  for (auto const & [k, sd] : tgt)
+  {
+    auto it = F.find(k);
+    if (it != F.end() && it->second.d + sd.cost < mu)
+    {
+      mu = it->second.d + sd.cost;
+      meet = k;
+    }
+  }
+  auto relaxF = [&](Key y, double d, Key par, uint8_t lvl)
+  {
+    auto & L = F[y];
+    if (d < L.d)
+    {
+      L.d = d;
+      L.parent = par;
+      L.level = lvl;
+      hf.push({d, y});
+      auto it = B.find(y);
+      if (it != B.end() && d + it->second.d < mu)
+      {
+        mu = d + it->second.d;
+        meet = y;
+      }
+    }
+  };
+  auto relaxB = [&](Key y, double d, Key par, uint8_t lvl)
+  {
+    auto & L = B[y];
+    if (d < L.d)
+    {
+      L.d = d;
+      L.parent = par;
+      L.level = lvl;
+      hb.push({d, y});
+      auto it = F.find(y);
+      if (it != F.end() && d + it->second.d < mu)
+      {
+        mu = d + it->second.d;
+        meet = y;
+      }
+    }
+  };
+  std::vector<BaseEdge> tmp;
+  auto top = [](Heap const & h) { return h.empty() ? kInf : h.top().first; };
+  while (!hf.empty() || !hb.empty())
+  {
+    double const tf = top(hf), tb = top(hb);
+    if (tf + tb >= mu || std::min(tf, tb) >= kInf)
+      break;
+    if (tf <= tb)
+    {
+      auto const [d, x] = hf.top();
+      hf.pop();
+      auto & lx = F[x];
+      if (lx.done || d > lx.d)
+        continue;
+      lx.done = true;
+      ++stats.settled;
+      I.ScanF(x, d, relaxF, tmp);
+    }
+    else
+    {
+      auto const [d, x] = hb.top();
+      hb.pop();
+      auto & lx = B[x];
+      if (lx.done || d > lx.d)
+        continue;
+      lx.done = true;
+      ++stats.settled;
+      I.ScanB(x, d, relaxB, tmp);
+    }
+  }
+
+  // 4. Assemble the starter path.
+  auto fakePrefix = [&](Segment const & firstReal)
+  {
+    std::vector<Segment> pre;
+    for (Segment x = parF.at(firstReal);; x = parF.at(x))
+    {
+      pre.push_back(x);
+      if (x == starter.GetStartSegment())
+        break;
+    }
+    std::reverse(pre.begin(), pre.end());
+    return pre;
+  };
+  auto fakeSuffix = [&](Segment const & lastReal)
+  {
+    std::vector<Segment> suf;
+    for (Segment x = parB.at(lastReal);; x = parB.at(x))
+    {
+      suf.push_back(x);
+      if (x == starter.GetFinishSegment())
+        break;
+    }
+    return suf;
+  };
+
+  if (mu >= kInf && bestDirect >= kInf)
+    return finish(Result::NoRoute, "");
+
+  std::set<routing::NumMwmId> used;
+  if (bestDirect <= mu)
+  {
+    stats.weight = bestDirect;
+    if (directReal.empty())
+    {
+      // Fake vertices only: rebuild from the forward fake parents.
+      std::vector<Segment> pre;
+      for (Segment x = starter.GetFinishSegment();; x = parF.at(x))
+      {
+        pre.push_back(x);
+        if (x == starter.GetStartSegment())
+          break;
+      }
+      path.assign(pre.rbegin(), pre.rend());
+    }
+    else
+    {
+      path = fakePrefix(directSrc);
+      path.insert(path.end(), directReal.begin(), directReal.end());
+      auto const suf = fakeSuffix(directTgt);
+      path.insert(path.end(), suf.begin(), suf.end());
+    }
+  }
+  else
+  {
+    stats.weight = mu;
+    // Hops from the source seed to the meeting vertex and on to the target seed.
+    std::vector<std::tuple<Key, Key, uint8_t>> hops;
+    Key first = meet;
+    for (Key y = meet; F[y].parent != kNoKey; y = F[y].parent)
+    {
+      hops.emplace_back(F[y].parent, y, F[y].level);
+      first = F[y].parent;
+    }
+    std::reverse(hops.begin(), hops.end());
+    Key last = meet;
+    for (Key y = meet; B[y].parent != kNoKey; y = B[y].parent)
+    {
+      hops.emplace_back(y, B[y].parent, B[y].level);
+      last = B[y].parent;
+    }
+    auto const & s0 = src.at(first);
+    auto const & t0 = tgt.at(last);
+    path = fakePrefix(s0.real);
+    path.insert(path.end(), s0.chain.begin(), s0.chain.end());
+    stats.srcCost = s0.cost;
+    stats.srcEnd = path.size() - 1;
+    static bool const debug = [] {
+      char const * e = std::getenv("PLUS_OVERLAY_DEBUG");
+      return e && std::string(e) == "1";
+    }();
+    double claimed[8] = {}, actual[8] = {};
+    size_t count[8] = {};
+    for (auto const & [a, b, l] : hops)
+    {
+      size_t const before = path.size();
+      if (!I.UnpackHop(a, b, l, path))
+        return finish(Result::NotApplicable, "unpacking failed");
+      if (!debug)
+        continue;
+      bool const fwdHop = F.count(b) && F[b].parent == a;
+      double const claim = fwdHop ? F[b].d - F[a].d : B[a].d - B[b].d;
+      double act = 0;
+      for (size_t k = before; k < path.size(); ++k)
+      {
+        Segment const & from = path[k - 1];
+        I.edges.clear();
+        I.Graph(I.mapIdx.at(from.GetMwmId())).GetEdgeList(from, true, true, I.edges);
+        double w = kInf;
+        for (auto const & e : I.edges)
+          if (e.GetTarget() == path[k])
+            w = std::min(w, e.GetWeight().GetIntegratedWeight());
+        act += w;
+      }
+      claimed[l] += claim;
+      actual[l] += act;
+      ++count[l];
+    }
+    if (debug)
+      for (int l = 0; l < 8; ++l)
+        if (count[l])
+          fprintf(stderr, "plus_overlay hops level %d: %zu, claimed %.3f s, unpacked %.3f s, excess %.3f s\n", l,
+                  count[l], claimed[l], actual[l], claimed[l] - actual[l]);
+    stats.tgtCost = t0.cost;
+    stats.tgtBegin = path.size() - 1;
+    path.insert(path.end(), t0.chain.begin(), t0.chain.end());
+    auto const suf = fakeSuffix(t0.real);
+    path.insert(path.end(), suf.begin(), suf.end());
+  }
+  for (auto const & s : path)
+    if (!routing::IndexGraphStarter::IsFakeSegment(s))
+      used.insert(s.GetMwmId());
+  stats.mapsUsed = used.size();
+  return finish(Result::Ok, "");
+}
+}  // namespace plus_overlay
