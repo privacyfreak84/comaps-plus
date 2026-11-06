@@ -18,10 +18,12 @@
 #include "routing/plus_overlay/overlay.hpp"
 #include "routing/plus_overlay/via_way_automaton.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -35,9 +37,9 @@ namespace plus_overlay
 //   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
 //   cliques wrong; that is the only code change that makes the app rebuild every file.
 // - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
-constexpr uint32_t kFileFormatVersion = 3;
+constexpr uint32_t kFileFormatVersion = 4;  // 4: special vertices section
 constexpr uint32_t kMinReadableFormatVersion = 3;
-constexpr uint32_t kRoutingDataVersion = 1;
+constexpr uint32_t kRoutingDataVersion = 2;  // 2: time-dependent edges, penalty units in cliques
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
 
@@ -67,6 +69,8 @@ struct FileContents
   std::vector<uint32_t> copyOrig, copyState;
   std::vector<std::vector<uint32_t>> patterns;
   std::vector<FileTransition> transitions;
+  std::vector<uint32_t> special;  // sorted (overlay.hpp)
+  bool timeDependent = false;     // the map has time-dependent edges (dynamic_edges.hpp)
 };
 
 // Hash of what makes two builds comparable (format version, cell sizes, balance, directions).
@@ -100,6 +104,42 @@ bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t p
                         uint64_t * buildId = nullptr);
 // Header only: |path| is an avoid-option file for the base file with |baseBuildId| and |avoidMask|.
 bool AvoidCliquesFileMatches(std::string const & path, uint64_t baseBuildId, uint32_t avoidMask);
+
+// A clique value carries, in its 3 lowest mantissa bits, the penalty units (dynamic_edges.hpp) of the
+// path it stands for, saturated at 7, so a search can tell travel time from penalties. Costs at most
+// 7 ulp of precision (0.06 s at a day's worth of seconds).
+inline float EncodeCliqueValue(double w, uint32_t penaltyUnits)
+{
+  float f = static_cast<float>(w);
+  uint32_t b;
+  std::memcpy(&b, &f, sizeof(b));
+  b = (b & ~7u) | std::min<uint32_t>(penaltyUnits, 7);
+  std::memcpy(&f, &b, sizeof(b));
+  return f;
+}
+inline float CliqueWeight(float v)
+{
+  uint32_t b;
+  std::memcpy(&b, &v, sizeof(b));
+  b &= ~7u;
+  std::memcpy(&v, &b, sizeof(b));
+  return v;
+}
+inline uint32_t CliquePenaltyUnits(float v)
+{
+  uint32_t b;
+  std::memcpy(&b, &v, sizeof(b));
+  return b & 7u;
+}
+// Calls f(vertex, weight) or f(vertex, weight, penalty units), whichever |f| takes.
+template <class F>
+void CallClique(F && f, uint32_t vertex, float stored)
+{
+  if constexpr (std::is_invocable_v<F, uint32_t, float, uint32_t>)
+    f(vertex, CliqueWeight(stored), CliquePenaltyUnits(stored));
+  else
+    f(vertex, CliqueWeight(stored));
+}
 
 class MappedOverlay;
 // Cliques computed with avoid options (|avoidMask|, RoutingOptions bits) for the vertices, partition and
@@ -235,7 +275,7 @@ public:
       {
         float const v = L.values[idx++];
         if (IsUsableWeight(v))
-          f(exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], v);
+          CallClique(f, exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], v);
       }
   }
   // f(entry vertex, weight) for every entry of |cell| that reaches its exit |v|.
@@ -263,9 +303,16 @@ public:
         idx += static_cast<uint64_t>(__builtin_popcountll(L.bits[row + q]));
       idx += static_cast<uint64_t>(__builtin_popcountll(word & below));
       if (IsUsableWeight(L.values[idx]))
-        f(entries[i], L.values[idx]);
+        CallClique(f, entries[i], L.values[idx]);
     }
   }
+
+  // Special vertices (overlay.hpp), sorted; open cells per level (OpenCells), computed once the levels are
+  // parsed.
+  std::vector<uint32_t> const & Special() const { return m_special; }
+  bool IsSpecial(uint32_t v) const { return std::binary_search(m_special.begin(), m_special.end(), v); }
+  bool IsOpen(size_t li, uint32_t cell) const { return !m_open[li].empty() && m_open[li][cell]; }
+  bool HasTimeDependentEdges() const { return m_timeDependent; }
 
   uint32_t NumTransitions() const { return m_numTransitions; }
   FileTransition const & Transition(uint32_t i) const { return m_transitions[i]; }
@@ -304,6 +351,9 @@ private:
   std::vector<uint32_t const *> m_parents;  // [li] for li >= 1: level-(li-1) cell -> level-li cell
   uint8_t const * m_roles = nullptr;
   FileTransition const * m_transitions = nullptr;
+  std::vector<uint32_t> m_special;
+  bool m_timeDependent = false;
+  std::vector<std::vector<uint8_t>> m_open;
   std::vector<Level> m_levels;
   std::unique_ptr<ViaWayAutomaton> m_automaton;
   std::unordered_map<uint64_t, uint32_t> m_copyId;                    // (state << 32 | base) -> copy

@@ -1,5 +1,6 @@
 #include "routing/plus_overlay/overlay_builder.hpp"
 
+#include "routing/plus_overlay/dynamic_edges.hpp"
 #include "routing/plus_overlay/overlay.hpp"
 #include "routing/plus_overlay/overlay_file.hpp"
 #include "routing/plus_overlay/via_way_automaton.hpp"
@@ -34,6 +35,7 @@
 #include <map>
 #include <sstream>
 #include <tuple>
+#include <unordered_map>
 
 namespace
 {
@@ -123,7 +125,9 @@ struct LeanGraph
   uint32_t baseN = 0;
   Graph g;                       // forward edges + lat/lon
   std::vector<uint8_t> interior; // per edge: the chain behind it passed at least one non-kept segment
-  uint64_t rawSlots = 0, rawValid = 0, rawEdges = 0;
+  // Base vertices the search must be able to stand on at any level: ends of time-dependent edges.
+  std::vector<uint32_t> allLevels;
+  uint64_t rawSlots = 0, rawValid = 0, rawEdges = 0, dynamicEdges = 0;
 
   bool Kept(uint32_t v) const { return (keptBits[v >> 6] >> (v & 63)) & 1; }
   uint32_t Rank(uint32_t v) const
@@ -146,9 +150,69 @@ struct LeanGraph
   }
 };
 
+// What LeanExtract treats specially besides the border transitions.
+struct Special
+{
+  // Time-dependent edges (conditional access) stay out of the graph: the router evaluates them per route.
+  routing::RoadAccess const * access = nullptr;
+
+  bool Dynamic(routing::Segment const & u, routing::Segment const & v) const
+  {
+    return access && IsTimeDependentEdge(*access, u, v);
+  }
+};
+
+// The partition needs only the graph's shape, not its weights: they wait in a file meanwhile, which lowers
+// the build's peak memory (the partition stage is the largest). The file is deleted in any case.
+class ParkedWeights
+{
+public:
+  explicit ParkedWeights(std::string path) : m_path(std::move(path)) {}
+  ~ParkedWeights() { std::remove(m_path.c_str()); }
+
+  bool Park(Graph & g)
+  {
+    std::ofstream out(m_path, std::ios::binary | std::ios::trunc);
+    m_edges = g.fwdW.size();
+    m_hasK = !g.fwdK.empty();
+    out.write(reinterpret_cast<char const *>(g.fwdW.data()), static_cast<std::streamsize>(m_edges * sizeof(double)));
+    if (m_hasK)
+      out.write(reinterpret_cast<char const *>(g.fwdK.data()), static_cast<std::streamsize>(m_edges));
+    if (!out.good())
+      return false;  // keep them in memory
+    std::vector<double>().swap(g.fwdW);
+    std::vector<uint8_t>().swap(g.fwdK);
+    m_parked = true;
+    return true;
+  }
+
+  bool Restore(Graph & g)
+  {
+    if (!m_parked)
+      return true;
+    std::ifstream in(m_path, std::ios::binary);
+    g.fwdW.resize(m_edges);
+    in.read(reinterpret_cast<char *>(g.fwdW.data()), static_cast<std::streamsize>(m_edges * sizeof(double)));
+    if (m_hasK)
+    {
+      g.fwdK.resize(m_edges);
+      in.read(reinterpret_cast<char *>(g.fwdK.data()), static_cast<std::streamsize>(m_edges));
+    }
+    m_parked = false;
+    return in.good();
+  }
+
+private:
+  std::string m_path;
+  uint64_t m_edges = 0;
+  bool m_hasK = false;
+  bool m_parked = false;
+};
+
 // Two walks over CoMaps' IndexGraph: degrees, then chains between kept segments.
 void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<routing::Segment> const & forced,
-                 std::vector<std::vector<uint32_t>> const & viaWay, LeanGraph & lg, Reporter const & rep)
+                 std::vector<std::vector<uint32_t>> const & viaWay, Special const & sp, LeanGraph & lg,
+                 Reporter const & rep)
 {
   auto const t0 = Clock::now();
   std::vector<uint32_t> roads;
@@ -196,6 +260,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
 
   // Pass 1: degrees.
   std::vector<uint8_t> indeg(n, 0), outdeg(n, 0), valid(n, 0);
+  std::vector<uint8_t> special(n, 0);  // kept, and a boundary at every level
   routing::IndexGraph::SegmentEdgeListT edges;
   forEachValid(0.0, 0.12, "reading roads", [&](routing::Segment const & s)
   {
@@ -211,6 +276,11 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
       uint32_t const t = lg.Slot(e.GetTarget());
       if (indeg[t] < 2)
         ++indeg[t];
+      if (sp.Dynamic(s, e.GetTarget()))
+      {
+        special[v] = special[t] = 1;
+        ++lg.dynamicEdges;
+      }
     }
   });
   {
@@ -229,7 +299,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
       continue;
     bool const isolated = indeg[v] == 0 && outdeg[v] == 0;
     bool const interiorV = indeg[v] == 1 && outdeg[v] == 1;
-    if (!isolated && !interiorV)
+    if ((!isolated && !interiorV) || special[v])
       keep(v);
   }
   for (auto const & s : forced)
@@ -268,11 +338,13 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   g.fwdTo.reserve(guess);
   g.fwdW.reserve(guess);
   lg.interior.reserve(guess);
+  g.fwdK.reserve(guess);
   struct Out
   {
     uint32_t to;
     uint8_t interior;
     double w;
+    uint32_t k;
     bool operator<(Out const & o) const { return std::tie(to, interior, w) < std::tie(o.to, o.interior, o.w); }
   };
   std::vector<Out> tmp;
@@ -285,6 +357,8 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
       return;
     uint32_t const cu = static_cast<uint32_t>(lg.origId.size());
     lg.origId.push_back(v);
+    if (special[v])
+      lg.allLevels.push_back(cu);
     auto const & pt = ig.GetPoint(s, true /* front */);
     g.lat.push_back(static_cast<float>(pt.m_lat));
     g.lon.push_back(static_cast<float>(pt.m_lon));
@@ -294,7 +368,10 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
     for (auto const & e : edges)
     {
       routing::Segment x = e.GetTarget();
+      if (sp.Dynamic(s, x))
+        continue;  // evaluated by the router at the time the route gets there
       double w = e.GetWeight().GetIntegratedWeight();
+      uint32_t k = PenaltyUnits(e.GetWeight());
       uint8_t inner = 0;
       uint32_t xs = lg.Slot(x);
       bool ok = true;
@@ -310,6 +387,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         CHECK_EQUAL(chainEdges.size(), 1u, (x));
         inner = 1;
         w += chainEdges[0].GetWeight().GetIntegratedWeight();
+        k += PenaltyUnits(chainEdges[0].GetWeight());
         x = chainEdges[0].GetTarget();
         xs = lg.Slot(x);
       }
@@ -318,7 +396,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         ++dropped;
         continue;
       }
-      tmp.push_back({lg.Rank(xs), inner, w});
+      tmp.push_back({lg.Rank(xs), inner, w, k});
     }
     std::sort(tmp.begin(), tmp.end());
     for (size_t i = 0; i < tmp.size(); ++i)
@@ -327,15 +405,18 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         continue;  // cheapest parallel edge
       g.fwdTo.push_back(tmp[i].to);
       g.fwdW.push_back(tmp[i].w);
+      g.fwdK.push_back(static_cast<uint8_t>(std::min<uint32_t>(tmp[i].k, 255)));
       lg.interior.push_back(tmp[i].interior);
     }
     g.fwdOff[cu + 1] = g.fwdTo.size();
   });
   CHECK_EQUAL(lg.origId.size(), kn, ());
   std::vector<uint8_t>().swap(outdeg);
+  std::vector<uint8_t>().swap(special);
   std::ostringstream os;
   os << "pass 2 (chains): " << kn << " kept, " << g.NumEdges() << " compressed edges, " << dropped
-     << " dead-end chains in " << Since(t1) << " s, " << Mem();
+     << " dead-end chains, " << lg.dynamicEdges << " time-dependent steps (" << lg.allLevels.size()
+     << " special vertices) in " << Since(t1) << " s, " << Mem();
   rep.Log(os.str());
 }
 
@@ -387,6 +468,7 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
   std::vector<uint64_t> copyOff{0};
   std::vector<VertexId> copyTo;
   std::vector<double> copyW;
+  std::vector<uint8_t> copyK;
   std::vector<uint8_t> copyInterior;
   for (auto const & [state, v] : copies)
   {
@@ -401,6 +483,7 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
       redirected += target >= g.n;
       copyTo.push_back(target);
       copyW.push_back(g.fwdW[e]);
+      copyK.push_back(static_cast<uint8_t>(g.FwdK(e)));
       copyInterior.push_back(lg.interior[e]);
     }
     copyOff.push_back(copyTo.size());
@@ -426,6 +509,8 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
     g.fwdOff.push_back(base + copyOff[i + 1]);
   g.fwdTo.insert(g.fwdTo.end(), copyTo.begin(), copyTo.end());
   g.fwdW.insert(g.fwdW.end(), copyW.begin(), copyW.end());
+  if (!g.fwdK.empty())
+    g.fwdK.insert(g.fwdK.end(), copyK.begin(), copyK.end());
   lg.interior.insert(lg.interior.end(), copyInterior.begin(), copyInterior.end());
   for (auto const & [st, v] : copies)
   {
@@ -502,6 +587,7 @@ bool ExtractForBase(routing::IndexGraph & ig, routing::NumMwmId mwmId, MappedOve
                     std::vector<std::vector<uint32_t>> const & viaWay, LeanGraph & lg, Reporter const & rep,
                     std::string & error)
 {
+  routing::RoadAccess const & access = ig.GetRoadAccess();
   auto const t0 = Clock::now();
   uint32_t const nf = base.NumFeatures();
   lg.featBase.resize(nf + 1);
@@ -519,12 +605,14 @@ bool ExtractForBase(routing::IndexGraph & ig, routing::NumMwmId mwmId, MappedOve
   uint64_t const guess = static_cast<uint64_t>(kn * 2.3) + 1024;
   g.fwdTo.reserve(guess);
   g.fwdW.reserve(guess);
+  g.fwdK.reserve(guess);
   lg.interior.reserve(guess);
   struct Out
   {
     uint32_t to;
     uint8_t interior;
     double w;
+    uint32_t k;
     bool operator<(Out const & o) const { return std::tie(to, interior, w) < std::tie(o.to, o.interior, o.w); }
   };
   std::vector<Out> tmp;
@@ -554,9 +642,10 @@ bool ExtractForBase(routing::IndexGraph & ig, routing::NumMwmId mwmId, MappedOve
       for (auto const & e : edges)
       {
         routing::Segment x = e.GetTarget();
-        if (!lg.Has(x))
+        if (!lg.Has(x) || IsTimeDependentEdge(access, s, x))
           continue;
         double w = e.GetWeight().GetIntegratedWeight();
+        uint32_t k = PenaltyUnits(e.GetWeight());
         uint8_t inner = 0;
         uint32_t xs = lg.Slot(x);
         bool ok = true;
@@ -571,12 +660,13 @@ bool ExtractForBase(routing::IndexGraph & ig, routing::NumMwmId mwmId, MappedOve
           }
           inner = 1;
           w += chainEdges[0].GetWeight().GetIntegratedWeight();
+          k += PenaltyUnits(chainEdges[0].GetWeight());
           x = chainEdges[0].GetTarget();
           xs = lg.Slot(x);
         }
         if (!ok || xs == slot)
           continue;
-        tmp.push_back({lg.Rank(xs), inner, w});
+        tmp.push_back({lg.Rank(xs), inner, w, k});
       }
       std::sort(tmp.begin(), tmp.end());
       for (size_t i = 0; i < tmp.size(); ++i)
@@ -585,6 +675,7 @@ bool ExtractForBase(routing::IndexGraph & ig, routing::NumMwmId mwmId, MappedOve
           continue;
         g.fwdTo.push_back(tmp[i].to);
         g.fwdW.push_back(tmp[i].w);
+        g.fwdK.push_back(static_cast<uint8_t>(std::min<uint32_t>(tmp[i].k, 255)));
         lg.interior.push_back(tmp[i].interior);
       }
       g.fwdOff[cu + 1] = g.fwdTo.size();
@@ -641,7 +732,8 @@ void PartitionFromFile(MappedOverlay const & base, Partition & p, Overlay & ov)
     L.matOff.assign(F.numCells + 1, 0);
     for (uint32_t c = 0; c < F.numCells; ++c)
       L.matOff[c + 1] = L.matOff[c] + (L.entryOff[c + 1] - L.entryOff[c]) * (L.exitOff[c + 1] - L.exitOff[c]);
-    L.mat.assign(L.matOff[F.numCells], kInf);
+    L.mat.assign(L.matOff[F.numCells], kUnreachable);
+    L.matK.assign(L.matOff[F.numCells], 0);
   }
 }
 }  // namespace
@@ -807,14 +899,17 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     }
     std::vector<routing::Segment> forced(enters);
     forced.insert(forced.end(), exits.begin(), exits.end());
+    Special sp;
+    sp.access = &mg->graph->GetRoadAccess();
 
     auto t0 = Clock::now();
     LeanGraph lg;
-    LeanExtract(*mg->graph, mg->mwmId, forced, viaWay, lg, rep);
+    LeanExtract(*mg->graph, mg->mwmId, forced, viaWay, sp, lg, rep);
     rep.CheckCancelled();
+    mg.reset();  // the router keeps its own IndexGraph; this one was only needed for extraction
+    ReleaseFreedMemory();
     LeanExpandViaWay(lg, viaWay, rep);
     std::vector<uint8_t>().swap(lg.interior);
-    mg.reset();  // the router keeps its own IndexGraph; this one was only needed for extraction
     ReleaseFreedMemory();
     Graph & g = lg.g;
     double const extractSec = Since(t0);
@@ -826,6 +921,19 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     }
     rep.CheckCancelled();
 
+    // Special vertices (overlay.hpp), with their via-way copies.
+    std::vector<uint32_t> special = lg.allLevels;
+    {
+      std::vector<uint8_t> isSpecial(g.n, 0);
+      for (uint32_t v : special)
+        isSpecial[v] = 1;
+      for (uint32_t v = lg.baseN; v < g.n; ++v)
+        if (isSpecial[lg.copyOrig[v - lg.baseN]])
+          special.push_back(v);
+      std::sort(special.begin(), special.end());
+      special.erase(std::unique(special.begin(), special.end()), special.end());
+    }
+    std::vector<uint32_t>().swap(lg.allLevels);
     std::vector<uint8_t> extra(g.n, 0);
     for (auto const & s : enters)
       if (lg.Has(s))
@@ -836,6 +944,9 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
         if (uint32_t const r = lg.Slot(s); lg.Kept(r))
           extra[lg.Rank(r)] |= 2;
 
+    ParkedWeights parked(result.path + ".weights.tmp");
+    if (parked.Park(g))
+      ReleaseFreedMemory();
     rep.Progress(0.30, "dividing the map into cells");
     PartitionParams pp;
     pp.cellSizes = DefaultCellSizes();
@@ -881,8 +992,20 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     rep.Progress(0.85, "computing shortcuts");
     Overlay ov;
     t0 = Clock::now();
-    BuildBoundaries(g, part, ov, &extra);
+    BuildBoundaries(g, part, ov, &extra, &special);
     std::vector<uint8_t>().swap(extra);
+    if (!parked.Restore(g))
+    {
+      result.error = "can't read the parked edge weights back";
+      return result;
+    }
+    {
+      std::ostringstream os;
+      os << "boundaries per level (entries/exits/clique entries):";
+      for (auto const & L : ov.levels)
+        os << " " << L.entries.size() << "/" << L.exits.size() << "/" << L.matOff.back();
+      rep.Log(os.str());
+    }
     Customize(g, part, ov, threads, options.cancelled,
               [&rep](double f) { rep.Progress(0.85 + 0.14 * f, "computing shortcuts"); });
     rep.CheckCancelled();
@@ -893,6 +1016,15 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       rep.Log(os.str());
     }
 
+    if (!options.checkFile)
+    {
+      // Only the cliques and the vertex tables go into the file.
+      std::vector<uint64_t>().swap(g.fwdOff);
+      std::vector<VertexId>().swap(g.fwdTo);
+      std::vector<double>().swap(g.fwdW);
+      std::vector<uint8_t>().swap(g.fwdK);
+      ReleaseFreedMemory();
+    }
     rep.Progress(0.99, "writing");
     FileContents fc;
     fc.mwmVersion = result.mwmVersion;
@@ -924,6 +1056,8 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
         fc.transitions.push_back(t);
       }
     };
+    fc.special = special;
+    fc.timeDependent = lg.dynamicEdges > 0;
     addTransitions(enters, enterOsm, true);
     addTransitions(exits, exitOsm, false);
     if (!WriteOverlayFile(result.path, fc, part, ov, &result.error))

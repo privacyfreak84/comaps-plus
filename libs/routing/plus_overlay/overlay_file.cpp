@@ -33,6 +33,7 @@ enum Section : uint32_t
   kRoles,
   kTransitions,
   kFeatLow,        // u16 per feature (+1): first segment relative to its block
+  kSpecial,        // u32, ascending: special vertices (overlay.hpp); format 4 on, absent means none
   kLevelBase = 16,  // + kLevelSections * level + LevelSection
 };
 
@@ -52,6 +53,7 @@ enum HeaderFlags : uint32_t
 {
   kCell1Is16Bit = 1,
   kCliquesOnly = 2,  // an avoid-option file: only the per-level clique sections, for one base file
+  kTimeDependent = 4,  // the map has time-dependent edges (conditional access): routes search forward only
 };
 
 #pragma pack(push, 1)
@@ -169,7 +171,7 @@ bool EncodeCliques(LevelOverlay const & L, uint32_t numCells, std::vector<uint32
         if (w >= kInf)
           continue;
         bits[w0 + j / 64] |= uint64_t(1) << (j % 64);
-        values.push_back(static_cast<float>(w));
+        values.push_back(EncodeCliqueValue(w, L.matK.empty() ? 0 : L.matK[L.matOff[c] + i * nEx + j]));
       }
     }
   }
@@ -309,6 +311,8 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
     pat.insert(pat.end(), pt.begin(), pt.end());
   }
   putVec(kPatterns, pat);
+  if (fc.timeDependent)
+    h.flags |= kTimeDependent;
   if (p.numCells[0] <= 0x10000)
   {
     h.flags |= kCell1Is16Bit;
@@ -335,6 +339,7 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
       roles[v] |= static_cast<uint8_t>((ov.levels[li].role[v] & 3) << (2 * li));
   putVec(kRoles, roles);
   putVec(kTransitions, fc.transitions);
+  putVec(kSpecial, fc.special);
   for (size_t li = 0; li < levels; ++li)
   {
     auto const & L = ov.levels[li];
@@ -561,6 +566,7 @@ bool MappedOverlay::Parse(std::string * error)
   m_numSlots = h.numSlots;
   m_numFeatures = h.numFeatures;
   m_cell16 = (h.flags & kCell1Is16Bit) != 0;
+  m_timeDependent = (h.flags & kTimeDependent) != 0;
   if (h.numLevels == 0 || h.numLevels > kMaxLevels || count(kFeatLow, 2) != m_numFeatures + 1ULL ||
       count(kFeatBlock, 4) != (m_numFeatures + 1ULL + 63) / 64 || count(kCell1, m_cell16 ? 2 : 4) != m_n ||
       count(kRoles, 1) != m_n || count(kCopyOrig, 4) != m_n - m_baseN || count(kCopyState, 4) != m_n - m_baseN)
@@ -579,6 +585,19 @@ bool MappedOverlay::Parse(std::string * error)
   m_roles = sec(kRoles);
   m_transitions = reinterpret_cast<FileTransition const *>(sec(kTransitions));
   m_numTransitions = static_cast<uint32_t>(count(kTransitions, sizeof(FileTransition)));
+  {
+    auto const * sp = reinterpret_cast<uint32_t const *>(sec(kSpecial));
+    size_t const ns = count(kSpecial, 4);
+    m_special.assign(sp, sp + ns);
+    for (size_t i = 0; i < ns; ++i)
+    {
+      if (m_special[i] >= m_n || (i > 0 && m_special[i] <= m_special[i - 1]))
+      {
+        SetError(error, "bad special vertices");
+        return false;
+      }
+    }
+  }
 
   m_levels.resize(h.numLevels);
   m_parents.assign(h.numLevels, nullptr);
@@ -694,6 +713,10 @@ bool MappedOverlay::Parse(std::string * error)
     m_copyId[(uint64_t(m_copyState[i]) << 32) | m_copyOrig[i]] = local;
     m_copiesOf[m_copyOrig[i]].push_back(local);
   }
+  std::vector<uint32_t> numCells;
+  for (auto const & L : m_levels)
+    numCells.push_back(L.numCells);
+  m_open = OpenCells(numCells, m_special, [this](size_t li, uint32_t v) { return Cell(li, v); });
   return true;
 }
 
@@ -839,7 +862,7 @@ float MappedOverlay::Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) co
   for (uint64_t k = 0; k < j / 64; ++k)
     idx += static_cast<uint64_t>(__builtin_popcountll(L.bits[row + k]));
   idx += static_cast<uint64_t>(__builtin_popcountll(word & ((uint64_t(1) << (j % 64)) - 1)));
-  return IsUsableWeight(L.values[idx]) ? L.values[idx] : 1e30f;
+  return IsUsableWeight(L.values[idx]) ? CliqueWeight(L.values[idx]) : 1e30f;
 }
 
 uint32_t MappedOverlay::ExitIdx(size_t li, uint32_t cell, uint32_t v) const

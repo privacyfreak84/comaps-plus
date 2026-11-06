@@ -69,15 +69,19 @@ struct BaseEdge
   Key to;
   double w;
   uint8_t kind;
+  double pen = 0;    // penalty part of w (seconds), see dynamic_edges.hpp
+  bool dyn = false;  // time-dependent: not in any clique, relaxed even inside the cell
 };
 
 struct Label
 {
   double d = kInf;
+  double pen = 0;  // penalty part of d: d - pen is the travel time, which conditional access is checked at
   Key parent = kNoKey;
   uint8_t level = 0;
   bool done = false;
 };
+
 
 using Heap = std::priority_queue<std::pair<double, Key>, std::vector<std::pair<double, Key>>, std::greater<>>;
 
@@ -103,6 +107,9 @@ struct OverlayRouter::Impl
   bool twinsBuilt = false;
   std::unordered_map<Key, std::vector<Key>> twinOut;  // exit -> enters of other maps
   std::unordered_map<Key, std::vector<Key>> twinIn;   // enter -> exits of other maps
+
+  // Per query: search forward only (arrival times known), because a map has time-dependent edges.
+  bool forwardOnly = false;
 
   // Per query.
   routing::IndexGraphStarter * starter = nullptr;
@@ -425,7 +432,8 @@ struct OverlayRouter::Impl
   // Forward chain from real segment |s| in map |m| to the next overlay vertex. |segs| (optional)
   // receives the segments after |s| up to and including the overlay vertex's segment.
   // false if the chain dead-ends.
-  bool WalkForward(uint32_t m, Segment s, double & w, uint32_t & kept, bool & inner, std::vector<Segment> * segs)
+  bool WalkForward(uint32_t m, Segment s, double & w, uint32_t & kept, bool & inner, std::vector<Segment> * segs,
+                   double * pen = nullptr)
   {
     auto const & o = *maps[m].ovl;
     inner = false;
@@ -446,6 +454,8 @@ struct OverlayRouter::Impl
         return false;
       inner = true;
       w += chainEdges[0].GetWeight().GetIntegratedWeight();
+      if (pen)
+        *pen += PenaltyUnits(chainEdges[0].GetWeight()) * kPenaltyUnitS;
       s = chainEdges[0].GetTarget();
       if (segs)
         segs->push_back(s);
@@ -486,7 +496,10 @@ struct OverlayRouter::Impl
   }
 
   // Overlay out-edges of |x|. |chains| (optional) gets each edge's segments after x's segment.
-  void OutEdges(Key x, std::vector<BaseEdge> & out, std::vector<std::vector<Segment>> * chains)
+  // |search|: also the edges no clique holds (time-dependent steps, checked at |travelTime| when given).
+  // Without it, exactly the edges the cliques were computed from.
+  void OutEdges(Key x, std::vector<BaseEdge> & out, std::vector<std::vector<Segment>> * chains,
+                bool search = false, double const * travelTime = nullptr)
   {
     out.clear();
     if (chains)
@@ -502,19 +515,30 @@ struct OverlayRouter::Impl
     Segment const s = SegOf(m, base);
     uint32_t const fx = s.GetFeatureId();
     uint32_t const state = StartState(o, v);
+    bool const special = o.IsSpecial(base);
+    bool const timeDep = special && o.HasTimeDependentEdges();
+    auto const & access = Graph(m).GetRoadAccess();
     edges.clear();
     ++baseScans;
-    Graph(m).GetEdgeList(s, true /* isOutgoing */, true /* useRoutingOptions */, edges);
+    if (timeDep && search && travelTime)
+      Graph(m).GetEdgeList(routing::astar::VertexData<Segment, routing::RouteWeight>(s, routing::RouteWeight(*travelTime)),
+                           true /* isOutgoing */, true /* useRoutingOptions */, edges);
+    else
+      Graph(m).GetEdgeList(s, true /* isOutgoing */, true /* useRoutingOptions */, edges);
     auto const list = edges;  // WalkForward reuses the scratch lists
     std::vector<Segment> segs;
     for (auto const & e : list)
     {
       Segment t = e.GetTarget();
+      bool const dyn = timeDep && IsTimeDependentEdge(access, s, t);
+      if (dyn && !search)
+        continue;
       double w = e.GetWeight().GetIntegratedWeight();
+      double pen = PenaltyUnits(e.GetWeight()) * kPenaltyUnitS;
       segs.assign(1, t);
       uint32_t kept;
       bool inner;
-      if (!WalkForward(m, t, w, kept, inner, chains ? &segs : nullptr))
+      if (!WalkForward(m, t, w, kept, inner, chains ? &segs : nullptr, &pen))
         continue;
       if (kept == base && !inner && t == s)
         continue;
@@ -524,7 +548,7 @@ struct OverlayRouter::Impl
       uint32_t const target = StepTarget(o, state, fx, kept, kseg.GetFeatureId(), inner);
       if (target == kNone)
         continue;
-      out.push_back({MakeKey(m, target), w, false});
+      out.push_back({MakeKey(m, target), w, kBaseEdge, pen, dyn});
       if (chains)
         chains->push_back(segs);
     }
@@ -532,7 +556,8 @@ struct OverlayRouter::Impl
       Twins(m, v, s, true /* outgoing */, out, chains);
   }
 
-  // Overlay in-edges of |x| (each as the edge from the predecessor to x).
+  // Overlay in-edges of |x| (each as the edge from the predecessor to x), as OutEdges with |search| and no
+  // time: the bidirectional search runs only when no map has time-dependent edges.
   void InEdges(Key x, std::vector<BaseEdge> & out)
   {
     out.clear();
@@ -553,6 +578,8 @@ struct OverlayRouter::Impl
     for (auto const & e : list)
     {
       Segment p = e.GetTarget();
+      if (o.HasTimeDependentEdges() && IsTimeDependentEdge(Graph(m).GetRoadAccess(), p, s))
+        continue;
       double w = e.GetWeight().GetIntegratedWeight();
       uint32_t kept;
       bool inner;
@@ -586,33 +613,40 @@ struct OverlayRouter::Impl
     uint32_t const m = MapOf(x), v = LocalOf(x);
     auto const & o = *maps[m].ovl;
     size_t const levels = o.Levels();
-    if (!mapHasEnd[m])
-      return levels;
+    // The highest level whose cell holds no end and isn't open (both hold for the cell's parents too).
     for (size_t li = levels; li-- > 0;)
     {
-      auto const & ec = endCells[m][li];
-      if (!std::binary_search(ec.begin(), ec.end(), o.Cell(li, v)))
-        return li + 1;
+      uint32_t const c = o.Cell(li, v);
+      if (o.IsOpen(li, c))
+        continue;
+      if (mapHasEnd[m])
+      {
+        auto const & ec = endCells[m][li];
+        if (std::binary_search(ec.begin(), ec.end(), c))
+          continue;
+      }
+      return li + 1;
     }
     return 0;
   }
 
   template <class Relax>
-  void ScanF(Key x, double d, Relax && relax, std::vector<BaseEdge> & tmp)
+  void ScanF(Key x, double d, double pen, Relax && relax, std::vector<BaseEdge> & tmp)
   {
+    double const travelTime = d - pen;
     if (IsRaw(x))
     {
       OutEdges(x, tmp, nullptr);
       for (auto const & e : tmp)
-        relax(e.to, d + e.w, x, 0);
+        relax(e.to, d + e.w, pen + e.pen, x, 0);
       return;
     }
     size_t const lvl = QueryLevel(x);
-    OutEdges(x, tmp, nullptr);
+    OutEdges(x, tmp, nullptr, true /* search */, &travelTime);
     if (lvl == 0)
     {
       for (auto const & e : tmp)
-        relax(e.to, d + e.w, x, 0);
+        relax(e.to, d + e.w, pen + e.pen, x, 0);
       return;
     }
     size_t const li = lvl - 1;
@@ -620,11 +654,11 @@ struct OverlayRouter::Impl
     auto const & o = *maps[m].ovl;
     uint32_t const c = o.Cell(li, v);
     if (o.IsEntry(li, v))
-      o.ForEachFromEntry(li, c, v, [&](uint32_t exit, float w)
-                         { relax(MakeKey(m, exit), d + w, x, static_cast<uint8_t>(lvl)); });
+      o.ForEachFromEntry(li, c, v, [&](uint32_t exit, float w, uint32_t k)
+                         { relax(MakeKey(m, exit), d + w, pen + k * kPenaltyUnitS, x, static_cast<uint8_t>(lvl)); });
     for (auto const & e : tmp)
-      if (MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
-        relax(e.to, d + e.w, x, 0);
+      if (e.dyn || MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
+        relax(e.to, d + e.w, pen + e.pen, x, 0);
   }
 
   template <class Relax>
@@ -664,7 +698,7 @@ struct OverlayRouter::Impl
     {
       std::vector<BaseEdge> es;
       std::vector<std::vector<Segment>> chains;
-      OutEdges(u, es, &chains);
+      OutEdges(u, es, &chains, true /* search: the hop may be a time-dependent step */);
       int best = -1;
       for (size_t i = 0; i < es.size(); ++i)
         if (es[i].to == v && (best < 0 || es[i].w < es[best].w))
@@ -746,9 +780,11 @@ struct OverlayRouter::Impl
 
   // Dijkstra over the starter's fake vertices from the start (forward) or the finish (backward).
   // |real| gets the first real segments reached with their costs; |parent| the fake predecessors.
+  // |realPen| (optional) gets the penalty part of each real segment's cost (dynamic_edges.hpp).
   void FakeSearch(bool forward, std::map<Segment, double> & real, std::map<Segment, Segment> & parent,
-                  double & direct, Segment & directLast)
+                  double & direct, Segment & directLast, std::map<Segment, double> * realPen = nullptr)
   {
+    std::map<Segment, double> pen;
     auto & st = *starter;
     auto const src = forward ? st.GetStartSegment() : st.GetFinishSegment();
     auto const dst = forward ? st.GetFinishSegment() : st.GetStartSegment();
@@ -775,7 +811,11 @@ struct OverlayRouter::Impl
       {
         auto it = real.find(x);
         if (it == real.end() || d < it->second)
+        {
           real[x] = d;
+          if (realPen)
+            (*realPen)[x] = pen[x];
+        }
         continue;
       }
       es.clear();
@@ -791,6 +831,7 @@ struct OverlayRouter::Impl
         if (it == dist.end() || nd < it->second)
         {
           dist[e.GetTarget()] = nd;
+          pen[e.GetTarget()] = pen[x] + PenaltyUnits(e.GetWeight()) * kPenaltyUnitS;
           parent[e.GetTarget()] = x;
           pq.insert({nd, e.GetTarget()});
         }
@@ -892,6 +933,12 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   I.rawIdx.clear();
   I.approxTouched.clear();
   I.needsMissingMap = false;
+  // Conditional access is checked at the time the route gets there, which only a forward search knows.
+  I.forwardOnly = false;
+  for (uint32_t m = 0; m < I.maps.size(); ++m)
+    if (auto const * o = I.Ovl(m); o && o->HasTimeDependentEdges())
+      I.forwardOnly = true;
+  stats.forwardOnly = I.forwardOnly;
   auto finish = [&](Result r, std::string const & why)
   {
     stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -910,7 +957,8 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   std::map<Segment, Segment> parF, parB;
   double direct = kInf;
   Segment dummy;
-  I.FakeSearch(true, srcReal, parF, direct, dummy);
+  std::map<Segment, double> srcPen;
+  I.FakeSearch(true, srcReal, parF, direct, dummy, &srcPen);
   double directB = kInf;
   I.FakeSearch(false, tgtReal, parB, directB, dummy);
   // The backward search ran on ingoing weights, which for fake segments differ slightly from the
@@ -967,6 +1015,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     double cost;
     std::vector<Segment> chain;  // real segments from |real| to the overlay vertex (both included)
     bool leap = false;           // a border transition of an end's map without overlay (cost estimated)
+    double pen = 0;              // penalty part of cost (start seeds; dynamic_edges.hpp)
   };
   std::unordered_map<Key, Seed> src, tgt;
   // Ends in maps without a usable overlay: like CoMaps' long-route mode, the end connects to that map's
@@ -1035,15 +1084,16 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     if (m == kNone)
       continue;
     double w = c;
+    double pen = srcPen[s];
     uint32_t kept;
     bool inner;
     std::vector<Segment> chain{s};
-    if (!I.WalkForward(m, s, w, kept, inner, &chain))
+    if (!I.WalkForward(m, s, w, kept, inner, &chain, &pen))
       continue;
     Key const k = MakeKey(m, kept);
     auto it = src.find(k);
     if (it == src.end() || w < it->second.cost)
-      src[k] = {s, w, chain, false};
+      src[k] = {s, w, chain, false, pen};
   }
   for (auto const & [s, c] : tgtReal)
   {
@@ -1135,6 +1185,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   for (auto const & [k, sd] : src)
   {
     F[k].d = sd.cost;
+    F[k].pen = sd.pen;
     hf.push({sd.cost, k});
   }
   for (auto const & [k, sd] : tgt)
@@ -1153,12 +1204,13 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       meet = k;
     }
   }
-  auto relaxF = [&](Key y, double d, Key par, uint8_t lvl)
+  auto relaxF = [&](Key y, double d, double pen, Key par, uint8_t lvl)
   {
     auto & L = F[y];
     if (d < L.d)
     {
       L.d = d;
+      L.pen = pen;
       L.parent = par;
       L.level = lvl;
       hf.push({d, y});
@@ -1189,12 +1241,15 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   };
   std::vector<BaseEdge> tmp;
   auto top = [](Heap const & h) { return h.empty() ? kInf : h.top().first; };
-  while (!hf.empty() || !hb.empty())
+  // Forward only: the targets' finish costs stay the only backward labels, so mu is checked as the forward
+  // search reaches a target, and min(target cost) bounds what any target still adds.
+  double const minTarget = top(hb);
+  while (!hf.empty() || (!I.forwardOnly && !hb.empty()))
   {
-    double const tf = top(hf), tb = top(hb);
-    if (tf + tb >= mu || std::min(tf, tb) >= kInf)
+    double const tf = top(hf), tb = I.forwardOnly ? minTarget : top(hb);
+    if (tf + tb >= mu || tf >= kInf || (!I.forwardOnly && tb >= kInf))
       break;
-    if (tf <= tb)
+    if (I.forwardOnly || tf <= tb)
     {
       auto const [d, x] = hf.top();
       hf.pop();
@@ -1203,13 +1258,13 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
         continue;
       lx.done = true;
       ++stats.settled;
-      I.ScanF(x, d, relaxF, tmp);
-    }
-    if (I.needsMissingMap)
-    {
-      stats.hasMissingMap = true;
-      stats.missingMap = I.missingMap;
-      return finish(Result::NotApplicable, "the route may pass through a map without an overlay");
+      I.ScanF(x, d, lx.pen, relaxF, tmp);
+      if (I.needsMissingMap)
+      {
+        stats.hasMissingMap = true;
+        stats.missingMap = I.missingMap;
+        return finish(Result::NotApplicable, "the route may pass through a map without an overlay");
+      }
     }
     else
     {

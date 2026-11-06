@@ -50,6 +50,10 @@ void Graph::BuildReverse()
     revOff[v + 1] += revOff[v];
   revFrom.assign(fwdTo.size(), 0);
   revW.assign(fwdTo.size(), 0.0);
+  if (!fwdK.empty())
+    revK.assign(fwdTo.size(), 0);
+  else
+    revK.clear();
   std::vector<uint64_t> pos(revOff.begin(), revOff.end() - 1);
   for (uint32_t u = 0; u < n; ++u)
   {
@@ -58,6 +62,8 @@ void Graph::BuildReverse()
       uint64_t const r = pos[fwdTo[e]]++;
       revFrom[r] = u;
       revW[r] = fwdW[e];
+      if (!fwdK.empty())
+        revK[r] = fwdK[e];
     }
   }
 }
@@ -522,9 +528,13 @@ Scratch::Scratch(uint32_t n)
   m_done[1].assign(n, 0);
 }
 
-void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov, std::vector<uint8_t> const * extraRole)
+void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov, std::vector<uint8_t> const * extraRole,
+                     std::vector<uint32_t> const * special)
 {
   ov.levels.assign(p.Levels(), {});
+  std::vector<std::vector<uint8_t>> open;
+  if (special)
+    open = OpenCells(p.numCells, *special, [&p](size_t li, uint32_t v) { return p.cell[li][v]; });
   for (size_t li = 0; li < p.Levels(); ++li)
   {
     auto const & cell = p.cell[li];
@@ -540,6 +550,14 @@ void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov, std::ve
           role[v] |= 2;
           role[g.fwdTo[e]] |= 1;
         }
+    if (special)
+    {
+      for (uint32_t v : *special)
+        role[v] |= 3;
+      for (uint32_t v = 0; v < g.n; ++v)
+        if (open[li][cell[v]])
+          role[v] = 0;
+    }
     L.entryOff.assign(nc + 1, 0);
     L.exitOff.assign(nc + 1, 0);
     for (uint32_t v = 0; v < g.n; ++v)
@@ -570,7 +588,8 @@ void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov, std::ve
     L.matOff.assign(nc + 1, 0);
     for (uint32_t c = 0; c < nc; ++c)
       L.matOff[c + 1] = L.matOff[c] + (L.entryOff[c + 1] - L.entryOff[c]) * (L.exitOff[c + 1] - L.exitOff[c]);
-    L.mat.assign(L.matOff[nc], kInf);
+    L.mat.assign(L.matOff[nc], kUnreachable);
+    L.matK.assign(L.matOff[nc], 0);
   }
 }
 
@@ -580,6 +599,7 @@ namespace
 struct CellScratch
 {
   std::vector<double> dist;
+  std::vector<uint8_t> k;  // penalty units of the path to each vertex
   std::vector<uint32_t> stamp, done;
   std::vector<std::pair<double, uint32_t>> heap;
   uint32_t cur = 0;
@@ -589,6 +609,7 @@ struct CellScratch
     if (dist.size() < n)
     {
       dist.resize(n);
+      k.resize(n);
       stamp.resize(n, 0);
       done.resize(n, 0);
     }
@@ -675,16 +696,18 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
     uint32_t const ls = localId[src];
     sc.stamp[ls] = st;
     sc.dist[ls] = 0;
+    sc.k[ls] = 0;
     push(0, ls);
     uint64_t remaining = nEx;
 
-    auto relax = [&](VertexId y, double d)
+    auto relax = [&](VertexId y, double d, uint32_t k)
     {
       uint32_t const ly = localId[y];
       if (sc.stamp[ly] != st || d < sc.dist[ly])
       {
         sc.stamp[ly] = st;
         sc.dist[ly] = d;
+        sc.k[ly] = static_cast<uint8_t>(std::min<uint32_t>(k, 255));
         push(d, ly);
       }
     };
@@ -700,11 +723,12 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
       VertexId const x = lc.verts[v0 + lx];
       if (L.IsExit(x) && --remaining == 0)
         break;
+      uint32_t const kx = sc.k[lx];
       if (li == 0)
       {
         for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
           if (cellOf[g.fwdTo[e]] == c && g.fwdW[e] < kInf)
-            relax(g.fwdTo[e], d + g.fwdW[e]);
+            relax(g.fwdTo[e], d + g.fwdW[e], kx + g.FwdK(e));
         continue;
       }
       LevelOverlay const & C = ov.levels[li - 1];
@@ -715,7 +739,7 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
         uint64_t const base = C.matOff[cc] + C.EntryIdx(x, cc) * cnEx;
         for (uint64_t j = 0; j < cnEx; ++j)
           if (C.mat[base + j] < kInf)
-            relax(C.exits[cx0 + j], d + C.mat[base + j]);
+            relax(C.exits[cx0 + j], d + C.mat[base + j], kx + (C.matK.empty() ? 0 : C.matK[base + j]));
       }
       if (C.IsExit(x))
       {
@@ -723,14 +747,17 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
         {
           VertexId const y = g.fwdTo[e];
           if (cellOf[y] == c && p.cell[li - 1][y] != cc && g.fwdW[e] < kInf)
-            relax(y, d + g.fwdW[e]);
+            relax(y, d + g.fwdW[e], kx + g.FwdK(e));
         }
       }
     }
     for (uint64_t j = 0; j < nEx; ++j)
     {
       uint32_t const ly = localId[L.exits[x0 + j]];
-      L.mat[L.matOff[c] + i * nEx + j] = (sc.done[ly] == st) ? sc.dist[ly] : kInf;
+      bool const reached = sc.done[ly] == st;
+      L.mat[L.matOff[c] + i * nEx + j] = reached ? static_cast<float>(sc.dist[ly]) : kUnreachable;
+      if (!L.matK.empty())
+        L.matK[L.matOff[c] + i * nEx + j] = reached ? sc.k[ly] : 0;
     }
   }
 }
@@ -1149,7 +1176,7 @@ OverlayStorage MeasureStorage(Graph const & g, Partition const & p, Overlay cons
   for (auto const & L : ov.levels)
   {
     s.matrixEntries += L.mat.size();
-    for (double w : L.mat)
+    for (float w : L.mat)
       s.finiteEntries += (w < kInf);
     s.boundaryIds += L.entries.size() + L.exits.size();
   }

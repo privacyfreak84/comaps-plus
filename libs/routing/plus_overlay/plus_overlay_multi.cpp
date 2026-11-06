@@ -1018,6 +1018,16 @@ int RunGenStress(Multi & m)
         ++islands;
       }
     }
+    // Roads whose access depends on the time (access:conditional): routes start or end on them.
+    for (auto const & [f, cond] : ig.GetRoadAccess().GetWayToAccessConditional())
+    {
+      if (!ig.IsRoad(f))
+        continue;
+      auto const & road = ig.GetRoadGeometry(f);
+      if (road.IsValid() && road.GetPointsCount() >= 2)
+        reservoir(cat["conditional"], mercator::FromLatLon(road.GetPoint(road.GetPointsCount() / 2)), "conditional",
+                  40);
+    }
     // Border crossings.
     routing::CrossMwmIndexGraph<base::GeoObjectId> cross(*m.mwmDataSource, routing::VehicleType::Car);
     auto const & c = cross.GetCrossMwmConnectorWithTransitions(id);

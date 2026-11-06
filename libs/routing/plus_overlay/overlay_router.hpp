@@ -82,6 +82,7 @@ public:
     double ms = 0;
     double weight = 0;       // integrated weight of the path (fake parts included)
     uint64_t settled = 0;    // vertices settled by the overlay search
+    bool forwardOnly = false;  // searched forward only (a map has time-dependent edges)
     uint64_t baseScans = 0;  // CoMaps edge lists read for base edges
     size_t mapsUsed = 0;
     // Diagnostics: cost the search assigned to the start part (fake + chain up to the first overlay

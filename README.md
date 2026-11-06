@@ -8,7 +8,7 @@ This is a test-stage project. There is no release yet, and the app still install
 
 On a phone, CoMaps could take several minutes to calculate a car route from Lucknow to Pune. Comaps++ prepares extra route data on the phone for each downloaded map, once, and then answers the same route in about two seconds.
 
-The extra data is a cell overlay (the method behind OSRM's MLD and Microsoft's CRP). Each map's road network is split into nested cells, and the travel time between the entry and exit points of every cell is stored. A route then only searches inside the cells at its two ends and jumps across everything in between. The overlay is built from CoMaps' own road graph and travel-time model, including turn costs, U-turns, turn restrictions and access rules, so the routes it returns are CoMaps' routes. Turn-by-turn directions, street names and arrival times still come from CoMaps' normal route builder.
+The extra data is a cell overlay (the method behind OSRM's MLD and Microsoft's CRP). Each map's road network is split into nested cells, and the travel time between the entry and exit points of every cell is stored. A route then only searches inside the cells at its two ends and jumps across everything in between. The overlay is built from CoMaps' own road graph and travel-time model, including turn costs, U-turns, turn restrictions and access rules, so the routes it returns are CoMaps' routes. Roads that are open only at certain times are left out of the stored times and checked for the moment the route gets there, as CoMaps does. Turn-by-turn directions, street names and arrival times still come from CoMaps' normal route builder.
 
 Measured on a 2-core Linux VM with India maps (version 261004), against CoMaps' router in its exact search mode on the same machine:
 
@@ -19,7 +19,7 @@ Measured on a 2-core Linux VM with India maps (version 261004), against CoMaps' 
 | 6 routes of 1,500 to 2,000 km (median) | 95.2 s | 2.58 s |
 | 30 random routes of 0.2 to 50 km (median) | 0.82 s | 0.70 s |
 
-Short trips were already quick, so the gain is in long ones.
+Short trips were already quick, so the gain is in long ones. In maps with time-restricted roads (all the tested German and Austrian maps; none of the Indian ones) the search runs in one direction so it knows the arrival time at each road: the longest Austrian test routes (the farthest pairs across Tyrol, Salzburg and Vorarlberg) took 0.5 s against 5.7 s for CoMaps, and short routes 0.1 to 0.5 s (medians).
 
 ### What happens on the phone
 
@@ -40,11 +40,12 @@ Storage, per map:
 
 | Map | Map file | Route data | Extra for one avoid mix (tolls) |
 |---|---|---|---|
-| Uttar Pradesh | 201 MB | 108.7 MB | 68.2 MB |
-| Maharashtra | 165 MB | 56.8 MB | 31.7 MB |
-| Madhya Pradesh | 134 MB | 36.0 MB | 19.0 MB |
+| Uttar Pradesh | 201 MB | 108.8 MB | 68.2 MB |
+| Maharashtra | 165 MB | 57.1 MB | 31.7 MB |
+| Madhya Pradesh | 134 MB | 36.1 MB | 19.0 MB |
+| Berlin | 107 MB | 8.3 MB | 3.3 MB (motorways) |
 
-Preparation time and memory on the 2-core test VM: Uttar Pradesh 2 to 3 minutes with up to about 1 GB of memory, Maharashtra 1 to 1.5 minutes, Madhya Pradesh 41 s. On a test phone, preparation ran in the background without Android closing the app and without the app lagging.
+Preparation time and peak memory on the 2-core test VM: Uttar Pradesh about 1.5 minutes and 800 MB, Maharashtra 1 minute and 550 MB, Madhya Pradesh 35 s and 375 MB, Berlin 6 s and about 120 MB. On a test phone, preparation ran in the background without Android closing the app and without the app lagging.
 
 ### How the routes were checked
 
@@ -54,15 +55,16 @@ The point of the overlay is speed without different routes, so every change was 
 - 327 generated routes in 12 groups (state borders, bridges and tunnels, dead ends, small islands, one-way streets, ramps, restricted access, roundabouts, random pairs, the longest possible pairs, and 20 hand-picked routes such as the Mumbai to Pune expressway ghats and the Bandra-Worli sea link): the same outcome in all 327 (routed or not), no crash or hang. Where both routed, arrival times matched within a minute except on two routes. On one, Comaps++ found a route more than a minute quicker. On the other, CoMaps' route arrives 64 s sooner but scores worse by CoMaps' own measure, which adds penalties for roads with restricted access.
 - 24 routes with avoid settings, 6 routes with 1 to 3 stops, 110 reroutes: same arrival times.
 - Inside one map, 100 random routes against a plain shortest-path search: no differences.
+- Outside India, 776 generated routes in Berlin with Brandenburg (386) and in Tyrol, Salzburg and Vorarlberg (390), with the clock set to Monday 08:30, including 40 routes per region that start on a time-restricted road: the same outcome in all 776, and arrival times within a minute except on 5 routes. The 40 time-restricted routes in Germany were also run at Sunday 03:00 and Friday 17:30. Avoiding motorways, 39 German border routes: all within a minute.
 
-One finding along the way: on 2 of 20 test routes in Uttar Pradesh, CoMaps' router returns a slower route than the best legal one (17% and 32% slower), because of how it checks turn restrictions that span several roads. Comaps++ returns the best one.
+Two findings along the way. On 2 of 20 test routes in Uttar Pradesh, CoMaps' router returns a slower route than the best legal one (17% and 32% slower), because of how it checks turn restrictions that span several roads; Comaps++ returns the best one. And on one German route at 03:00, CoMaps' route crosses a road signed closed from 22:00 to 05:00 and reaches it at about 03:40; Comaps++ takes a legal route, 49 minutes longer. At noon both routers return the same route.
 
 ### Known limits
 
-- Tested only with India maps (Uttar Pradesh, Madhya Pradesh, Maharashtra).
-- Roads whose access depends on the time of day get a fixed one-hour penalty in the prepared data, where CoMaps checks the time when routing. None exist in the tested maps, so this is untested.
-- Near state borders a few routes differ slightly: 3 of 24 border-area test routes were 30 s to 2 minutes off. Comaps++ switches between maps only where a road crosses the border; CoMaps can switch at any junction of a road present in both maps. Fixing this would change the file format and force everyone to prepare all maps again, so it stays for now.
-- Preparing a large map needs close to 1 GB of memory at its peak. If Android stops a preparation, it is retried with one thread, up to 3 times.
+- Tested with India, Germany (Berlin, Brandenburg) and Austria (Tyrol, Salzburg, Vorarlberg) maps.
+- Near map borders a few routes differ slightly: in India 1 of 40 border test routes is more than a minute off (78 s). Comaps++ switches between maps only where a road crosses the border; CoMaps can switch at any junction of a road present in both maps. Doing the same was tried: it made long routes about twice as slow and improved 2 of 40 border routes, so it was left out.
+- A route that starts on a road closed at that moment starts on it and leaves it at the nearest junction; CoMaps starts from a neighbouring road instead. In tests this changed 1 of 40 such routes (5 minutes shorter).
+- Preparing a large map needs about 800 MB of memory at its peak (Uttar Pradesh). If Android stops a preparation, it is retried with one thread, up to 3 times.
 - Only the Android app prepares route data. The iOS and desktop apps from CoMaps are still in this repository but haven't been changed or tested.
 - The new messages and settings are in English only.
 
@@ -83,7 +85,7 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 ## Roadmap
 
 1. Avoid specific roads and places, not only types of road.
-2. Faster navigation. Almost done; time-dependent road access is the main gap left.
+2. Faster navigation. Done.
 3. An update checker and downloader in the app's settings.
 4. Full OpenStreetMap editing, added over time.
 5. Remove links to CoMaps (website, donations and so on), keeping it in the credits.

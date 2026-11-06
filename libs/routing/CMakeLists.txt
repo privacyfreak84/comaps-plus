@@ -107,6 +107,7 @@ set(SRC
   opening_hours_serdes.hpp
   pedestrian_directions.cpp
   pedestrian_directions.hpp
+  plus_overlay/dynamic_edges.hpp
   plus_overlay/overlay.cpp
   plus_overlay/overlay.hpp
   plus_overlay/overlay_file.cpp

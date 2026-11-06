@@ -27,6 +27,9 @@ using VertexId = uint32_t;
 // Sums of a few kInf stay finite and compare >= kInf.
 constexpr double kInf = 1e18;
 constexpr uint32_t kNone = std::numeric_limits<uint32_t>::max();
+// Unreachable clique entry (cliques are float32, like in the file). Above kInf, so `w < kInf` tests and
+// `w >= kInf` tests read it as unreachable either way.
+constexpr float kUnreachable = 1e30f;
 
 struct Graph
 {
@@ -37,7 +40,11 @@ struct Graph
   std::vector<uint64_t> revOff;  // n + 1
   std::vector<VertexId> revFrom;
   std::vector<double> revW;
+  // Optional, per edge: penalty units (kPenaltyUnitS each) inside the edge's integrated weight.
+  std::vector<uint8_t> fwdK, revK;
   std::vector<float> lat, lon;
+
+  uint32_t FwdK(uint64_t e) const { return fwdK.empty() ? 0 : fwdK[e]; }
 
   uint64_t NumEdges() const { return fwdTo.size(); }
   void BuildReverse();
@@ -111,8 +118,9 @@ struct LevelOverlay
 {
   std::vector<uint64_t> entryOff, exitOff, matOff;  // per cell, numCells + 1
   std::vector<VertexId> entries, exits;             // per cell, ascending vertex ids
-  std::vector<double> mat;                          // per cell: row-major entry x exit
-  std::vector<uint8_t> role;                        // per vertex: bit 1 entry, bit 2 exit (of its cell)
+  std::vector<float> mat;                           // per cell: row-major entry x exit (float32 as in the file)
+  std::vector<uint8_t> matK;                        // penalty units of each mat entry's path (saturated)
+  std::vector<uint8_t> role;                       // per vertex: bit 1 entry, bit 2 exit (of its cell)
 
   bool IsEntry(VertexId v) const { return role[v] & 1; }
   bool IsExit(VertexId v) const { return role[v] & 2; }
@@ -134,10 +142,42 @@ struct Overlay
   std::vector<LevelOverlay> levels;
 };
 
+// Special vertices: the ends of time-dependent edges (dynamic_edges.hpp), which no clique holds. The search
+// has to stand on them, so they are cell boundaries. A coarse cell
+// crowded with them would get huge cliques, so such a cell is "open": it gets no boundaries (and no
+// clique) at its level, and the search crosses it one level down. A cell is open when it holds more special
+// vertices than this (level 1 first; level 1 is never open), or when one of its child cells is open.
+constexpr uint32_t kOpenCellThreshold[] = {std::numeric_limits<uint32_t>::max(), 64, 128, 256};
+
+// open[level][cell], from the sorted special vertices and their cells (cellOf(level, vertex)).
+template <class CellOf>
+std::vector<std::vector<uint8_t>> OpenCells(std::vector<uint32_t> const & numCells,
+                                            std::vector<uint32_t> const & special, CellOf && cellOf)
+{
+  size_t const levels = numCells.size();
+  std::vector<std::vector<uint8_t>> open(levels);
+  for (size_t li = 0; li < levels; ++li)
+  {
+    open[li].assign(numCells[li], 0);
+    uint32_t const cap = kOpenCellThreshold[std::min<size_t>(li, std::size(kOpenCellThreshold) - 1)];
+    std::vector<uint32_t> count(numCells[li], 0);
+    for (uint32_t v : special)
+    {
+      uint32_t const c = cellOf(li, v);
+      if (++count[c] > cap || (li > 0 && open[li - 1][cellOf(li - 1, v)]))
+        open[li][c] = 1;
+    }
+  }
+  return open;
+}
+
 // Entries/exits of every cell at every level. |extraRole| (optional, per vertex: bit 1 entry, bit 2 exit)
 // marks vertices that are boundary at every level, e.g. map border transitions joined to another map.
+// |special| (optional, sorted): vertices that are entry and exit of their cell at every level where the
+// cell isn't open (see OpenCells); open cells get no boundaries at all.
 void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov,
-                     std::vector<uint8_t> const * extraRole = nullptr);
+                     std::vector<uint8_t> const * extraRole = nullptr,
+                     std::vector<uint32_t> const * special = nullptr);
 // Computes all clique matrices bottom-up. Returns seconds per level.
 // |cancelled| (optional) is polled between cells; once true the remaining cells are skipped.
 // |progress| (optional) gets the done share in [0, 1], from worker threads.

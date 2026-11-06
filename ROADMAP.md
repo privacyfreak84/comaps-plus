@@ -24,7 +24,7 @@ Still needed:
 
 ## 2. Faster navigation
 
-Status: almost done.
+Status: done.
 
 Done:
 
@@ -34,16 +34,13 @@ Done:
 - Avoid settings, with data prepared only for the maps your routes go through, and a choice to keep data for one mix or every mix.
 - Rerouting, routes with stops, start direction, app updates and map updates, damaged files.
 - Once every map on a route is prepared, the route doesn't use CoMaps' old car search.
-
-Left:
-
-- Time-dependent road access. Some roads are open only at certain hours or on certain days. The prepared data gives these a fixed one-hour penalty, while CoMaps checks the time when routing. Plan: keep such roads out of the prepared cells and check them when the route is calculated. None exist in the tested maps, so this needs a region that has them.
-- Memory while preparing large maps: close to 1 GB at the peak for Uttar Pradesh. Reducing it needs a smaller representation of the cell layout during preparation.
-- Testing outside India. Everything so far was tested with Uttar Pradesh, Madhya Pradesh and Maharashtra.
+- Roads open only at certain times (access:conditional) are checked for the time the route gets there, not frozen when the map is prepared.
+- Preparation memory down by about 17% (Uttar Pradesh 960 MB to 800 MB at the peak).
+- Tested outside India: Berlin with Brandenburg, and Tyrol, Salzburg and Vorarlberg.
 
 Decided to leave as is:
 
-- Near state borders, 3 of 24 border-area test routes were 30 s to 2 minutes off, because Comaps++ switches between maps only where a road crosses the border. Fixing it changes the file format and makes every user prepare all maps again.
+- Near map borders, Comaps++ switches between maps only where a road crosses the border, while CoMaps can switch at any junction of a road present in both maps. Matching CoMaps was built and measured: long routes became about twice as slow, and 2 of 40 border test routes improved. It was removed again.
 - A cycling overlay. Cycling routes are slow only for multi-day trips.
 
 ## 3. Update checker and downloader in settings
@@ -120,7 +117,7 @@ Maps take a lot of space on the phone, and the fast routes add to it. Measured w
 | Maharashtra | 165 MB | 56.8 MB | 31.7 MB |
 | Madhya Pradesh | 134 MB | 36.0 MB | 19.0 MB |
 
-Preparing the route data for Uttar Pradesh needs close to 1 GB of memory at its peak.
+Preparing the route data for Uttar Pradesh needs about 800 MB of memory at its peak.
 
 Still needed:
 

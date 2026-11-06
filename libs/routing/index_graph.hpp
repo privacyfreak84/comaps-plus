@@ -92,6 +92,9 @@ public:
 
   Geometry & GetGeometry() const { return *m_geometry; }
 
+  // Comaps++: the overlay needs the conditional-access tables (time-dependent edges).
+  RoadAccess const & GetRoadAccess() const { return m_roadAccess; }
+
   RoadAccess::Type GetAccessType(Segment const & segment) const
   {
     return m_roadAccess.GetAccessWithoutConditional(segment.GetFeatureId()).first;
