@@ -43,8 +43,8 @@ void ReleaseFreedMemory()
 {
 #if defined(__GLIBC__)
   malloc_trim(0);
-#elif defined(M_PURGE)
-  mallopt(M_PURGE, 0);
+#elif defined(__ANDROID__) && defined(M_PURGE) && __ANDROID_API__ >= 28
+  mallopt(M_PURGE, 0);  // older Android builds: the allocator releases freed pages on its own schedule
 #endif
 }
 }  // namespace
