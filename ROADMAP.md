@@ -81,17 +81,20 @@ Still needed:
 
 ## 6. New package name, app name and icon
 
-Status: not started.
+Status: started.
 
 The app still uses CoMaps' app ID (`app.comaps`), name and icon. Test builds install as `app.comaps.test`.
 
+Done:
+
+- A release workflow ([plus-release.yml](.github/workflows/plus-release.yml)) that builds a signed arm64 APK and publishes it as a GitHub release, which Obtainium and the update checker (item 3) can follow. It refuses to run until the app ID is changed.
+
 Still needed:
 
+- The signing key, created by the project owner and stored as GitHub secrets.
 - The new app name and an icon, both still to be chosen by the project owner.
-- A new app ID, so Comaps++ installs next to CoMaps and can be updated on its own.
+- A new app ID, so Comaps++ installs next to CoMaps and can be updated on its own. Only the app ID changes; the code's package names (`app.organicmaps`) stay, so upstream merges keep working.
 - The name changed throughout the app and its texts.
-- A signing key of its own, kept as a GitHub secret.
-- A release workflow that builds signed APKs and publishes them as GitHub releases, so they work with Obtainium and with the update checker (item 3).
 
 ## 7. Several route options, as in Google Maps
 

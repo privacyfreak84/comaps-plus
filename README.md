@@ -98,7 +98,11 @@ Details, status and what each item needs: [ROADMAP.md](ROADMAP.md).
 
 - `main`: Comaps++.
 - `upstream`: an untouched mirror of CoMaps from Codeberg. Its release tags are mirrored as `upstream/<tag>`.
-- The Sync upstream workflow ([.github/workflows/plus-sync-upstream.yml](.github/workflows/plus-sync-upstream.yml), script [.plus/sync-upstream.sh](.plus/sync-upstream.sh)) checks Codeberg every 6 hours. It opens a pull request with the new upstream commits, an issue if they conflict, and an issue for each new upstream release. It never merges by itself.
+- The Sync upstream workflow ([.github/workflows/plus-sync-upstream.yml](.github/workflows/plus-sync-upstream.yml), script [.plus/sync-upstream.sh](.plus/sync-upstream.sh)) checks Codeberg every 6 hours. If the new upstream commits merge without conflicts, it merges them into `main` and starts the Android Check build as a compile check. If they conflict, it opens an issue and leaves `main` alone. It also opens an issue when upstream changes routing code (prepared route files may need `kRoutingDataVersion` raised) and one for each new upstream release.
+
+### Releases
+
+The Release workflow ([.github/workflows/plus-release.yml](.github/workflows/plus-release.yml)) builds a signed arm64 APK from `main` and publishes it as a GitHub release tagged `v<date>-<n>`, with the commit list, the signing certificate's SHA-256 and the APK's SHA-256 in the notes. Start it with `gh workflow run plus-release.yml` or from the Actions tab. It needs the secrets `PLUS_KEYSTORE` (base64 of the keystore), `PLUS_KEYSTORE_PASSWORD` and `PLUS_KEY_ALIAS`, and it refuses to run while the app ID is still CoMaps' `app.comaps`.
 
 ### Where the routing code is
 

@@ -1,0 +1,156 @@
+name: Release
+
+# Builds a signed APK from main and publishes it as a GitHub release.
+# Start it from the Actions tab or with: gh workflow run plus-release.yml
+# Needs the secrets PLUS_KEYSTORE (base64 of the keystore), PLUS_KEYSTORE_PASSWORD
+# and PLUS_KEY_ALIAS. The tag is v<date>-<n>, from tools/unix/version.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 'Release notes (optional; the commit list is added below)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      PLUS_KEYSTORE_PASSWORD: ${{ secrets.PLUS_KEYSTORE_PASSWORD }}
+      PLUS_KEY_ALIAS: ${{ secrets.PLUS_KEY_ALIAS }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0  # version.sh counts today's commits; notes list commits since the last release
+
+      - name: Check release prerequisites
+        shell: bash
+        env:
+          PLUS_KEYSTORE: ${{ secrets.PLUS_KEYSTORE }}
+        run: |
+          missing=0
+          for v in PLUS_KEYSTORE PLUS_KEYSTORE_PASSWORD PLUS_KEY_ALIAS; do
+            if [ -z "${!v}" ]; then echo "::error::secret $v is not set"; missing=1; fi
+          done
+          if grep -q '^val appId = "app.comaps"$' android/app/build.gradle.kts; then
+            echo "::error::the app ID is still app.comaps; a release would clash with CoMaps installs. Rebrand first."
+            missing=1
+          fi
+          exit $missing
+
+      - name: Install build tools and dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build \
+          qt6-base-dev \
+          qt6-declarative-dev \
+          qt6-positioning-dev \
+          libqt6svg6-dev \
+          optipng \
+          libfreetype-dev \
+          libharfbuzz-dev \
+          libxrandr-dev \
+          libxinerama-dev \
+          libxcursor-dev \
+          libxi-dev \
+          python3-pip \
+          zlib1g-dev
+          pip install "protobuf<3.21" --break-system-packages
+
+      - name: Parallel submodules checkout
+        shell: bash
+        run: git submodule update --depth 1 --init --recursive --jobs=$(($(nproc) * 20))
+
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.workflow }}-release
+
+      - name: Restore signing key
+        shell: bash
+        env:
+          PLUS_KEYSTORE: ${{ secrets.PLUS_KEYSTORE }}
+        run: |
+          printf '%s' "$PLUS_KEYSTORE" | base64 -d > android/app/plus-release.keystore
+          # Read by android/app/build.gradle.kts (a Groovy script); passwords stay in the environment.
+          cat > android/app/secure.properties.release <<'GROOVY'
+          project.ext.secretReleaseStoreFile = 'plus-release.keystore'
+          project.ext.secretReleaseStorePassword = System.getenv('PLUS_KEYSTORE_PASSWORD')
+          project.ext.secretReleaseKeyAlias = System.getenv('PLUS_KEY_ALIAS')
+          project.ext.secretReleaseKeyPassword = System.getenv('PLUS_KEYSTORE_PASSWORD')
+          GROOVY
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          name=$(tools/unix/version.sh android_name)
+          tag="v$name"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::$tag already exists; commit something or wait for the next day"
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Compile signed APK (arm64)
+        shell: bash
+        working-directory: android
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: ./gradlew -Parm64 assembleWebRelease 2>&1 | tee "$RUNNER_TEMP/gradle.log"; test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Verify signature
+        id: sign
+        shell: bash
+        run: |
+          grep -q 'Using RELEASE signing keys' "$RUNNER_TEMP/gradle.log" || { echo "::error::the release key was not used"; exit 1; }
+          apk=$(ls android/app/build/outputs/apk/web/release/*.apk | head -n1)
+          out="$RUNNER_TEMP/ComapsPlus-${{ steps.version.outputs.name }}-arm64.apk"
+          cp "$apk" "$out"
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          "$apksigner" verify --print-certs "$out" | tee "$RUNNER_TEMP/certs.txt"
+          cert=$(sed -n 's/.*certificate SHA-256 digest: //p' "$RUNNER_TEMP/certs.txt" | head -n1)
+          test -n "$cert"
+          (cd "$RUNNER_TEMP" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256")
+          echo "apk=$out" >> "$GITHUB_OUTPUT"
+          echo "cert=$cert" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        shell: bash
+        env:
+          NOTES: ${{ github.event.inputs.notes }}
+        run: |
+          tag=${{ steps.version.outputs.tag }}
+          prev=$(git tag --list 'v*' --sort=-creatordate | head -n1)
+          range=HEAD; [ -n "$prev" ] && range="$prev..HEAD"
+          {
+            if [ -n "$NOTES" ]; then printf '%s\n\n' "$NOTES"; fi
+            echo "Changes${prev:+ since $prev}:"
+            echo
+            git log --no-merges --format='- %s' -n 60 "$range"
+            echo
+            echo "For 64-bit ARM phones (arm64-v8a)."
+            echo
+            echo "Signing certificate SHA-256: \`${{ steps.sign.outputs.cert }}\`"
+            echo
+            echo "APK SHA-256: \`$(cut -d' ' -f1 "${{ steps.sign.outputs.apk }}.sha256")\`"
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" \
+            "${{ steps.sign.outputs.apk }}" "${{ steps.sign.outputs.apk }}.sha256" \
+            --target "$(git rev-parse HEAD)" \
+            --title "Comaps++ ${{ steps.version.outputs.name }}" \
+            --notes-file "$RUNNER_TEMP/notes.md"

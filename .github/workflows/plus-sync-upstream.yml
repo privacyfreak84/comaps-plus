@@ -9,6 +9,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  actions: write
 
 concurrency:
   group: sync-upstream
@@ -19,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+      DISPATCH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
         with:
