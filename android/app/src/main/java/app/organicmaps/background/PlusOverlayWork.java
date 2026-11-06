@@ -163,12 +163,6 @@ public class PlusOverlayWork extends Worker
     super.onStopped();
   }
 
-  private boolean canNotify()
-  {
-    return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
-        || ContextCompat.checkSelfPermission(mContext, POST_NOTIFICATIONS) == PERMISSION_GRANTED;
-  }
-
   @NonNull
   private Notification progressNotification(@NonNull String name, double progress, @NonNull String stage)
   {
@@ -200,7 +194,8 @@ public class PlusOverlayWork extends Worker
 
   private void updateProgress(@NonNull String name, double progress, @NonNull String stage)
   {
-    if (!canNotify())
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        && ContextCompat.checkSelfPermission(mContext, POST_NOTIFICATIONS) != PERMISSION_GRANTED)
       return;
     NotificationManagerCompat.from(mContext).notify(PROGRESS_NOTIFICATION_ID,
                                                     progressNotification(name, progress, stage));
@@ -208,7 +203,8 @@ public class PlusOverlayWork extends Worker
 
   private void notifyResult(int built, int failed)
   {
-    if (!canNotify())
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        && ContextCompat.checkSelfPermission(mContext, POST_NOTIFICATIONS) != PERMISSION_GRANTED)
       return;
     final String text = failed == 0 ? mContext.getString(R.string.plus_overlay_done, built)
                                     : mContext.getString(R.string.plus_overlay_failed, failed);
