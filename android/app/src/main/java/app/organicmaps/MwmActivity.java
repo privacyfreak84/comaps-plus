@@ -1226,6 +1226,9 @@ public class MwmActivity extends BaseMwmFragmentActivity
     refreshLightStatusBar();
 
     MwmApplication.from(this).getSensorHelper().addListener(this);
+    // Comaps++: ask once how much fast-route data to keep for avoid settings.
+    if (mAlertDialog == null)
+      app.organicmaps.background.PlusOverlaySettings.maybeAskAtStartup(this);
   }
 
   @Override

@@ -65,6 +65,19 @@ std::vector<DownloadedMap> DownloadedMaps(uint32_t avoidMask)
   return maps;
 }
 
+// The writable directory and its map version subdirectories.
+std::set<std::string> MapDirs()
+{
+  std::string const root = GetPlatform().WritableDir();
+  std::set<std::string> dirs{root};
+  Platform::TFilesWithType subdirs;
+  Platform::GetFilesByType(root, Platform::EFileType::Directory, subdirs);
+  for (auto const & [d, type] : subdirs)
+    if (!d.empty() && d.find_first_not_of("0123456789") == std::string::npos)
+      dirs.insert(base::JoinPath(root, d));
+  return dirs;
+}
+
 bool NeedsBaseBuild(DownloadedMap const & m)
 {
   return !plus_overlay::OverlayFileMatches(m.overlayPath, m.version, plus_overlay::DefaultParamsHash());
@@ -190,23 +203,35 @@ JNIEXPORT jstring JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeSta
   return jni::ToJavaString(env, g_stage);
 }
 
-// Deletes overlay files whose map was deleted or replaced by an update, and interrupted builds.
-JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDeleteOrphans(JNIEnv *, jclass)
+// Deletes overlay files whose map was deleted or replaced by an update, and interrupted builds; unless
+// |keepAllAvoid|, also avoid-option files for other options than the current ones.
+JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDeleteOrphans(JNIEnv *, jclass,
+                                                                                        jboolean keepAllAvoid)
 {
-  std::string const root = GetPlatform().WritableDir();
-  std::set<std::string> dirs{root};
-  Platform::TFilesWithType subdirs;
-  Platform::GetFilesByType(root, Platform::EFileType::Directory, subdirs);
-  for (auto const & [d, type] : subdirs)
-    if (!d.empty() && d.find_first_not_of("0123456789") == std::string::npos)
-      dirs.insert(base::JoinPath(root, d));
   // Avoid-option files: keep those of the current options; with none set, keep the last ones used.
   uint32_t const mask = CurrentAvoidMask();
+  int64_t const keepMask = (keepAllAvoid || mask == 0) ? -1 : static_cast<int64_t>(mask);
   size_t deleted = 0;
-  for (auto const & d : dirs)
-    deleted += plus_overlay::DeleteOrphanedOverlayFiles(d, mask != 0 ? static_cast<int64_t>(mask) : -1);
+  for (auto const & d : MapDirs())
+    deleted += plus_overlay::DeleteOrphanedOverlayFiles(d, keepMask);
   if (deleted)
     LOG(LINFO, ("Comaps++ overlay: deleted", deleted, "files of removed or updated maps"));
   return static_cast<jint>(deleted);
+}
+JNIEXPORT jlong JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeStorageBytes(JNIEnv *, jclass)
+{
+  uint64_t bytes = 0;
+  for (auto const & d : MapDirs())
+  {
+    Platform::FilesList files;
+    Platform::GetFilesByExt(d, plus_overlay::kFileExtension, files);
+    for (auto const & f : files)
+    {
+      uint64_t size = 0;
+      if (Platform::GetFileSizeByFullPath(base::JoinPath(d, f), size))
+        bytes += size;
+    }
+  }
+  return static_cast<jlong>(bytes);
 }
 }  // extern "C"

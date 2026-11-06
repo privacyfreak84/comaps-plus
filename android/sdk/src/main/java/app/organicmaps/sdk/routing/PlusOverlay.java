@@ -45,6 +45,13 @@ public final class PlusOverlay
   @NonNull
   public static native String nativeStage();
 
-  /** Deletes overlay files of maps that were deleted or updated, and leftovers of interrupted builds. */
-  public static native int nativeDeleteOrphans();
+  /**
+   * Deletes overlay files of maps that were deleted or updated, and leftovers of interrupted builds. Unless
+   * {@code keepAllAvoid}, also the files for avoid settings other than the current ones (with no avoid
+   * settings on, the last ones are kept).
+   */
+  public static native int nativeDeleteOrphans(boolean keepAllAvoid);
+
+  /** Bytes used by all overlay files. */
+  public static native long nativeStorageBytes();
 }

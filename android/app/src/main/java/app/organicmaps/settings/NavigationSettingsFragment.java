@@ -9,6 +9,7 @@ import androidx.preference.ListPreference;
 import androidx.preference.Preference;
 import androidx.preference.TwoStatePreference;
 import app.organicmaps.R;
+import app.organicmaps.background.PlusOverlaySettings;
 import app.organicmaps.sdk.Framework;
 import app.organicmaps.sdk.routing.RoutingController;
 import app.organicmaps.sdk.routing.RoutingOptions;
@@ -43,6 +44,13 @@ public class NavigationSettingsFragment extends BaseXmlSettingsFragment
     super.onResume();
     updateVoiceInstructionsPrefsSummary();
     updateRoutingSettingsPrefsSummary();
+    updatePlusOverlayStorageSummary();
+  }
+
+  private void updatePlusOverlayStorageSummary()
+  {
+    final Preference pref = getPreference("pref_plus_overlay_storage");
+    pref.setSummary(PlusOverlaySettings.summary(requireContext()));
   }
 
   @Override
@@ -52,6 +60,11 @@ public class NavigationSettingsFragment extends BaseXmlSettingsFragment
     if (key == null)
       return super.onPreferenceTreeClick(preference);
 
+    if (key.equals("pref_plus_overlay_storage"))
+    {
+      PlusOverlaySettings.showDialog(requireContext(), this::updatePlusOverlayStorageSummary);
+      return true;
+    }
     if (key.equals(getString(R.string.pref_tts_screen)))
     {
       getSettingsActivity().stackFragment(VoiceInstructionsSettingsFragment.class,

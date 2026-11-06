@@ -92,7 +92,7 @@ public class PlusOverlayWork extends Worker
       return Result.success();
     }
 
-    PlusOverlay.nativeDeleteOrphans();
+    PlusOverlay.nativeDeleteOrphans(PlusOverlaySettings.isKeepAll(mContext));
     if (PlusOverlay.nativeMapsToBuild().length == 0)
       return Result.success();
 
