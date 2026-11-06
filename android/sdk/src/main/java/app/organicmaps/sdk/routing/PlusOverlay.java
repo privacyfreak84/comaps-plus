@@ -16,15 +16,27 @@ public final class PlusOverlay
 
   private PlusOverlay() {}
 
-  /** Downloaded maps whose overlay file is missing or stale (map updated, or built by another version). */
+  /**
+   * Downloaded maps whose overlay file is missing or stale (map updated, or built by another version), or
+   * that lack the overlay for the current avoid options.
+   */
   @NonNull
   public static native String[] nativeMapsToBuild();
 
-  /** Builds one map's overlay file; blocks for minutes. Returns one of the BUILD_* codes. */
+  /**
+   * Builds what one map lacks (base overlay file, then the one for the current avoid options); blocks for
+   * minutes. Returns one of the BUILD_* codes.
+   */
   public static native int nativeBuild(@NonNull String countryId, int threads);
 
   /** Stops a running build soon (it then returns BUILD_CANCELLED and writes nothing). */
   public static native void nativeCancel();
+
+  /** Avoid options (bit mask) of the file being built now; 0 while building a base file or idle. */
+  public static native int nativeBuildingAvoidMask();
+
+  /** Current car avoid options as a bit mask. */
+  public static native int nativeCurrentAvoidMask();
 
   /** Progress of the running build, 0..1. */
   public static native double nativeProgress();

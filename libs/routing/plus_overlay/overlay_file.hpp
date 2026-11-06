@@ -26,7 +26,7 @@
 
 namespace plus_overlay
 {
-constexpr uint32_t kFileFormatVersion = 2;
+constexpr uint32_t kFileFormatVersion = 3;
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
 
@@ -75,10 +75,26 @@ inline std::string OverlayPathForMap(std::string const & mwmPath)
   auto const dot = mwmPath.rfind('.');
   return (dot == std::string::npos ? mwmPath : mwmPath.substr(0, dot)) + kFileExtension;
 }
+// <dir>/<map>.mwm -> <dir>/<map>.avoid<mask>.plusovl (cliques for routes with avoid options)
+inline std::string AvoidOverlayPathForMap(std::string const & mwmPath, uint32_t avoidMask)
+{
+  auto const dot = mwmPath.rfind('.');
+  return (dot == std::string::npos ? mwmPath : mwmPath.substr(0, dot)) + ".avoid" + std::to_string(avoidMask) +
+         kFileExtension;
+}
 
 // Cheap check (header only): |path| is an overlay file of this format, built for map version
 // |mwmVersion| with the build parameters |paramsHash|.
-bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t paramsHash);
+bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t paramsHash,
+                        uint64_t * buildId = nullptr);
+// Header only: |path| is an avoid-option file for the base file with |baseBuildId| and |avoidMask|.
+bool AvoidCliquesFileMatches(std::string const & path, uint64_t baseBuildId, uint32_t avoidMask);
+
+class MappedOverlay;
+// Cliques computed with avoid options (|avoidMask|, RoutingOptions bits) for the vertices, partition and
+// boundaries of |base|. Everything else is shared with the base file.
+bool WriteAvoidCliquesFile(std::string const & path, MappedOverlay const & base, uint32_t avoidMask,
+                           Overlay const & ov, std::string * error = nullptr);
 
 bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partition const & p, Overlay const & ov,
                       std::string * error = nullptr);
@@ -109,7 +125,20 @@ public:
   MappedOverlay & operator=(MappedOverlay const &) = delete;
 
   int64_t MwmVersion() const { return m_mwmVersion; }
-  uint64_t FileBytes() const { return m_size; }
+  uint64_t FileBytes() const { return m_file.size; }
+  uint64_t AvoidFileBytes() const { return m_avoidFile.size; }
+  uint64_t ParamsHash() const { return m_paramsHash; }
+  uint64_t BuildId() const { return m_buildId; }
+  uint32_t AvoidMask() const { return m_avoidMask; }
+
+  // Replaces the cliques with those of an avoid-option file built for this file and |avoidMask|
+  // (WriteAvoidCliquesFile). False (and nothing changed) if it is missing or doesn't match.
+  bool AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error = nullptr);
+
+  // Raw tables (for rebuilding cliques with other edge weights).
+  uint64_t const * KeptBitsData() const { return m_keptBits; }
+  uint32_t const * KeptRankData() const { return m_keptRank; }
+  uint32_t NumKeptWords() const { return m_numWords; }
   uint32_t NumVertices() const { return m_n; }
   uint32_t BaseN() const { return m_baseN; }
   size_t Levels() const { return m_levels.size(); }
@@ -211,11 +240,21 @@ private:
   MappedOverlay() = default;
   bool Parse(std::string * error);
 
-  int m_fd = -1;
-  uint8_t const * m_data = nullptr;
-  uint64_t m_size = 0;
-  bool m_mapped = false;
-  std::vector<uint8_t> m_buffer;  // fallback when mmap is unavailable
+  struct Mapping
+  {
+    int fd = -1;
+    uint8_t const * data = nullptr;
+    uint64_t size = 0;
+    bool mapped = false;
+    std::vector<uint8_t> buffer;  // fallback when mmap is unavailable
+    bool Open(std::string const & path, std::string * error);
+    ~Mapping();
+  };
+  Mapping m_file;
+  Mapping m_avoidFile;  // AttachAvoidCliques
+  uint64_t m_paramsHash = 0;
+  uint64_t m_buildId = 0;
+  uint32_t m_avoidMask = 0;
 
   int64_t m_mwmVersion = 0;
   uint32_t m_n = 0, m_baseN = 0, m_numSlots = 0, m_numFeatures = 0, m_numTransitions = 0;

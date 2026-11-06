@@ -153,8 +153,10 @@ public class MwmApplication extends Application implements Application.ActivityL
       ThemeSwitcher.INSTANCE.initialize(this);
       ThemeSwitcher.INSTANCE.restart(false);
       ProcessLifecycleOwner.get().getLifecycle().addObserver(mProcessLifecycleObserver);
-      // Comaps++: build overlay files for maps that don't have a current one (missed or interrupted runs).
+      // Comaps++: build overlay files for maps that don't have a current one (missed or interrupted runs),
+      // and for the avoid options whenever they change.
       PlusOverlayWork.enqueue(this);
+      app.organicmaps.sdk.routing.RoutingOptions.setOnChangedListener(() -> PlusOverlayWork.enqueue(this));
       onComplete.run();
     });
   }

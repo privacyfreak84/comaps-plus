@@ -30,6 +30,10 @@ struct OverlayMap
   routing::NumMwmId id = 0;
   std::string path;        // the map's overlay file
   int64_t mwmVersion = 0;  // the downloaded map's version; the file must have been built for it
+  // With avoid options (avoidMask != 0): the map's avoid-option cliques for that mask, which must
+  // belong to |path| (AvoidOverlayPathForMap). Without that file the map counts as having no overlay.
+  uint32_t avoidMask = 0;
+  std::string avoidPath;
 };
 
 class OverlayRouter
@@ -64,6 +68,7 @@ public:
     // vertex, path[0 .. srcEnd]) and the finish part (path[tgtBegin .. end]).
     double srcCost = 0, tgtCost = 0;
     size_t srcEnd = 0, tgtBegin = 0;
+    double fakeMs = 0, seedMs = 0, searchMs = 0, unpackMs = 0;  // phases
     std::string reason;  // why NotApplicable
     bool hasMissingMap = false;        // NotApplicable because the route may pass through a map
     routing::NumMwmId missingMap = 0;  // without a usable overlay file: this one

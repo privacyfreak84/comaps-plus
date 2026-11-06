@@ -3,6 +3,7 @@
 <resources>
     <string name="plus_overlay_channel" translatable="false">Fast routes</string>
     <string name="plus_overlay_building" translatable="false">Preparing fast routes: %s</string>
+    <string name="plus_overlay_building_avoid" translatable="false">Preparing fast routes for your avoid options: %s</string>
     <string name="plus_overlay_building_text" translatable="false">Starting…</string>
     <string name="plus_overlay_done" translatable="false">Fast car routes ready for %d new or updated maps</string>
     <string name="plus_overlay_failed" translatable="false">Fast routes couldn\'t be prepared for %d maps; routing uses the normal search for them</string>

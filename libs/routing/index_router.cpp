@@ -716,12 +716,9 @@ bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & 
   }();
   if (disabled)
     return false;
-  // Overlays are built without avoid options; with any set, the normal search answers.
-  if (RoutingOptions::LoadOptionsFromSettings(m_vehicleType).GetOptions() != 0)
-  {
-    LOG(LINFO, ("Comaps++ overlay: avoid options set, using the normal search"));
-    return false;
-  }
+  // With avoid options each map also needs its cliques for exactly those options (built in the
+  // background next to the base file); a map without them counts as having no overlay.
+  auto const avoidMask = static_cast<uint32_t>(RoutingOptions::LoadOptionsFromSettings(m_vehicleType).GetOptions());
 
   if (!m_plusOverlay)
     m_plusOverlay = make_shared<plus_overlay::OverlayRouter>(plus_overlay::DefaultParamsHash());
@@ -736,8 +733,9 @@ bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & 
     auto const & countryFile = localFile.GetCountryFile();
     if (!m_numMwmIds->ContainsFile(countryFile))
       continue;
-    maps.push_back({m_numMwmIds->GetId(countryFile),
-                    plus_overlay::OverlayPathForMap(localFile.GetPath(MapFileType::Map)), info->GetVersion()});
+    auto const mwmPath = localFile.GetPath(MapFileType::Map);
+    maps.push_back({m_numMwmIds->GetId(countryFile), plus_overlay::OverlayPathForMap(mwmPath), info->GetVersion(),
+                    avoidMask, avoidMask ? plus_overlay::AvoidOverlayPathForMap(mwmPath, avoidMask) : std::string()});
   }
   if (maps.empty())
     return false;
@@ -759,8 +757,9 @@ bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & 
 
   if (result == plus_overlay::OverlayRouter::Result::Ok)
   {
-    LOG(LINFO, ("Comaps++ overlay route:", stats.ms, "ms,", stats.settled, "settled,", stats.baseScans,
-                "edge lists,", stats.mapsUsed, "maps, weight", stats.weight));
+    LOG(LINFO, ("Comaps++ overlay route (avoid options", avoidMask, "):", stats.ms, "ms,", stats.settled, "settled,", stats.baseScans,
+                "edge lists,", stats.mapsUsed, "maps, weight", stats.weight, "; phases ms: ends", stats.fakeMs, "seeds",
+                stats.seedMs, "search", stats.searchMs, "unpack", stats.unpackMs));
     return true;
   }
   std::string why = result == plus_overlay::OverlayRouter::Result::NoRoute ? std::string("no route") : stats.reason;

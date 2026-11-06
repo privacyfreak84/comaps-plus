@@ -7,6 +7,8 @@
 #include "routing/plus_overlay/overlay_builder.hpp"
 #include "routing/plus_overlay/overlay_file.hpp"
 
+#include "routing/routing_options.hpp"
+
 #include "indexer/data_source.hpp"
 #include "indexer/mwm_set.hpp"
 
@@ -26,6 +28,7 @@
 namespace
 {
 std::atomic<bool> g_cancel{false};
+std::atomic<uint32_t> g_buildingAvoidMask{0};  // avoid mask of the file being built (0: base file)
 std::atomic<double> g_progress{0};
 std::mutex g_stageMutex;
 std::string g_stage;
@@ -36,9 +39,16 @@ struct DownloadedMap
   platform::LocalCountryFile localFile;
   int64_t version = 0;
   std::string overlayPath;
+  std::string avoidPath;  // for the current avoid options (empty without)
 };
 
-std::vector<DownloadedMap> DownloadedMaps()
+uint32_t CurrentAvoidMask()
+{
+  return static_cast<uint32_t>(
+      routing::RoutingOptions::LoadOptionsFromSettings(routing::VehicleType::Car).GetOptions());
+}
+
+std::vector<DownloadedMap> DownloadedMaps(uint32_t avoidMask)
 {
   std::vector<DownloadedMap> maps;
   std::vector<std::shared_ptr<MwmInfo>> infos;
@@ -48,15 +58,26 @@ std::vector<DownloadedMap> DownloadedMaps()
     if (!info || info->GetType() != MwmInfo::COUNTRY)
       continue;
     auto const & lf = info->GetLocalFile();
-    maps.push_back({lf.GetCountryName(), lf, info->GetVersion(),
-                    plus_overlay::OverlayPathForMap(lf.GetPath(MapFileType::Map))});
+    auto const mwmPath = lf.GetPath(MapFileType::Map);
+    maps.push_back({lf.GetCountryName(), lf, info->GetVersion(), plus_overlay::OverlayPathForMap(mwmPath),
+                    avoidMask ? plus_overlay::AvoidOverlayPathForMap(mwmPath, avoidMask) : std::string()});
   }
   return maps;
 }
 
-bool NeedsBuild(DownloadedMap const & m)
+bool NeedsBaseBuild(DownloadedMap const & m)
 {
   return !plus_overlay::OverlayFileMatches(m.overlayPath, m.version, plus_overlay::DefaultParamsHash());
+}
+
+bool NeedsAvoidBuild(DownloadedMap const & m, uint32_t avoidMask)
+{
+  if (avoidMask == 0)
+    return false;
+  uint64_t buildId = 0;
+  if (!plus_overlay::OverlayFileMatches(m.overlayPath, m.version, plus_overlay::DefaultParamsHash(), &buildId))
+    return true;
+  return !plus_overlay::AvoidCliquesFileMatches(m.avoidPath, buildId, avoidMask);
 }
 }  // namespace
 
@@ -67,8 +88,9 @@ JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nati
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
   std::vector<std::string> ids;
-  for (auto const & m : DownloadedMaps())
-    if (NeedsBuild(m))
+  uint32_t const mask = CurrentAvoidMask();
+  for (auto const & m : DownloadedMaps(mask))
+    if (NeedsBaseBuild(m) || NeedsAvoidBuild(m, mask))
       ids.push_back(m.countryId);
   return jni::ToJavaStringArray(env, ids);
 }
@@ -79,13 +101,15 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
   std::string const id = jni::ToNativeString(env, countryId);
+  uint32_t const mask = CurrentAvoidMask();
   std::unique_ptr<DownloadedMap> map;
-  for (auto & m : DownloadedMaps())
+  for (auto & m : DownloadedMaps(mask))
     if (m.countryId == id)
       map = std::make_unique<DownloadedMap>(std::move(m));
   if (!map)
     return 3;
-  if (!NeedsBuild(*map))
+  bool const needBase = NeedsBaseBuild(*map);
+  if (!needBase && !NeedsAvoidBuild(*map, mask))
     return 4;
 
   g_cancel = false;
@@ -102,26 +126,57 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(
       g_stage = stage;
   };
   auto & storage = frm()->GetStorage();
-  auto const r = plus_overlay::BuildOverlayFile(
-      map->localFile, [&storage](std::string const & cid) { return storage.GetParentIdFor(cid); },
-      map->overlayPath, o);
-  switch (r.status)
+  auto const parentGetter = [&storage](std::string const & cid) { return storage.GetParentIdFor(cid); };
+  auto const report = [&id](plus_overlay::BuildResult const & r, char const * what) -> jint
   {
-  case plus_overlay::BuildResult::Status::Ok:
-    LOG(LINFO, ("Comaps++ overlay built for", id, ":", r.fileBytes / 1048576.0, "MB in", r.seconds, "s, peak memory",
-                r.peakRssKb / 1024, "MB"));
-    return 0;
-  case plus_overlay::BuildResult::Status::Cancelled: LOG(LINFO, ("Comaps++ overlay build cancelled for", id)); return 1;
-  case plus_overlay::BuildResult::Status::Failed:
-    LOG(LWARNING, ("Comaps++ overlay build failed for", id, ":", r.error));
+    switch (r.status)
+    {
+    case plus_overlay::BuildResult::Status::Ok:
+      LOG(LINFO, ("Comaps++", what, "built for", id, ":", r.fileBytes / 1048576.0, "MB in", r.seconds,
+                  "s, peak memory", r.peakRssKb / 1024, "MB"));
+      return 0;
+    case plus_overlay::BuildResult::Status::Cancelled: LOG(LINFO, ("Comaps++", what, "cancelled for", id)); return 1;
+    case plus_overlay::BuildResult::Status::Failed:
+      LOG(LWARNING, ("Comaps++", what, "failed for", id, ":", r.error));
+      return 2;
+    }
     return 2;
+  };
+  if (needBase)
+  {
+    g_buildingAvoidMask = 0;
+    jint const code =
+        report(plus_overlay::BuildOverlayFile(map->localFile, parentGetter, map->overlayPath, o), "overlay");
+    if (code != 0)
+      return code;
   }
-  return 2;
+  if (NeedsAvoidBuild(*map, mask))
+  {
+    g_buildingAvoidMask = mask;
+    g_progress = 0;
+    jint const code = report(plus_overlay::BuildAvoidCliquesFile(map->localFile, parentGetter, mask,
+                                                                 map->overlayPath, map->avoidPath, o),
+                             "avoid-option overlay");
+    g_buildingAvoidMask = 0;
+    return code;
+  }
+  return 0;
 }
 
 JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeCancel(JNIEnv *, jclass)
 {
   g_cancel = true;
+}
+
+// Avoid options (RoutingOptions bits) of the file being built; 0 while building a base file or idle.
+JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuildingAvoidMask(JNIEnv *, jclass)
+{
+  return static_cast<jint>(g_buildingAvoidMask.load());
+}
+
+JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeCurrentAvoidMask(JNIEnv *, jclass)
+{
+  return static_cast<jint>(CurrentAvoidMask());
 }
 
 JNIEXPORT jdouble JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeProgress(JNIEnv *, jclass)
@@ -145,9 +200,11 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDelete
   for (auto const & [d, type] : subdirs)
     if (!d.empty() && d.find_first_not_of("0123456789") == std::string::npos)
       dirs.insert(base::JoinPath(root, d));
+  // Avoid-option files: keep those of the current options; with none set, keep the last ones used.
+  uint32_t const mask = CurrentAvoidMask();
   size_t deleted = 0;
   for (auto const & d : dirs)
-    deleted += plus_overlay::DeleteOrphanedOverlayFiles(d);
+    deleted += plus_overlay::DeleteOrphanedOverlayFiles(d, mask != 0 ? static_cast<int64_t>(mask) : -1);
   if (deleted)
     LOG(LINFO, ("Comaps++ overlay: deleted", deleted, "files of removed or updated maps"));
   return static_cast<jint>(deleted);

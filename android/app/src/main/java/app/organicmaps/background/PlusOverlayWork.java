@@ -121,7 +121,7 @@ public class PlusOverlayWork extends Worker
         final String name = MapManager.nativeGetName(countryId);
         try
         {
-          setForegroundAsync(foregroundInfo(name, 0, "")).get();
+          setForegroundAsync(foregroundInfo(name, 0, "", false)).get();
         }
         catch (Exception e)
         {
@@ -129,8 +129,17 @@ public class PlusOverlayWork extends Worker
           Logger.w(TAG, "Can't show the progress notification", e);
         }
         final var tick = ticker.scheduleWithFixedDelay(() -> {
-          if (!isStopped())
-            updateProgress(name, PlusOverlay.nativeProgress(), PlusOverlay.nativeStage());
+          if (isStopped())
+            return;
+          final int building = PlusOverlay.nativeBuildingAvoidMask();
+          if (building != 0 && building != PlusOverlay.nativeCurrentAvoidMask())
+          {
+            // Avoid options changed meanwhile: the run queued by that change builds the right files.
+            Logger.i(TAG, "Avoid options changed, stopping the build for the old ones");
+            PlusOverlay.nativeCancel();
+            return;
+          }
+          updateProgress(name, PlusOverlay.nativeProgress(), PlusOverlay.nativeStage(), building != 0);
         }, 1, 1, TimeUnit.SECONDS);
 
         Logger.i(TAG, "Building the fast-routing overlay for " + countryId);
@@ -164,14 +173,16 @@ public class PlusOverlayWork extends Worker
   }
 
   @NonNull
-  private Notification progressNotification(@NonNull String name, double progress, @NonNull String stage)
+  private Notification progressNotification(@NonNull String name, double progress, @NonNull String stage,
+                                            boolean avoidOptions)
   {
     final PendingIntent cancel = WorkManager.getInstance(mContext).createCancelPendingIntent(getId());
     final int percent = (int) Math.round(progress * 100);
     return new NotificationCompat.Builder(mContext, CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_logo_small)
         .setColor(ContextCompat.getColor(mContext, R.color.notification))
-        .setContentTitle(mContext.getString(R.string.plus_overlay_building, name))
+        .setContentTitle(mContext.getString(avoidOptions ? R.string.plus_overlay_building_avoid
+                                                         : R.string.plus_overlay_building, name))
         .setContentText(stage.isEmpty() ? mContext.getString(R.string.plus_overlay_building_text)
                                         : stage + " · " + percent + "%")
         .setProgress(100, percent, progress <= 0)
@@ -184,21 +195,22 @@ public class PlusOverlayWork extends Worker
   }
 
   @NonNull
-  private ForegroundInfo foregroundInfo(@NonNull String name, double progress, @NonNull String stage)
+  private ForegroundInfo foregroundInfo(@NonNull String name, double progress, @NonNull String stage,
+                                        boolean avoidOptions)
   {
-    final Notification n = progressNotification(name, progress, stage);
+    final Notification n = progressNotification(name, progress, stage, avoidOptions);
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
       return new ForegroundInfo(PROGRESS_NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
     return new ForegroundInfo(PROGRESS_NOTIFICATION_ID, n);
   }
 
-  private void updateProgress(@NonNull String name, double progress, @NonNull String stage)
+  private void updateProgress(@NonNull String name, double progress, @NonNull String stage, boolean avoidOptions)
   {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
         && ContextCompat.checkSelfPermission(mContext, POST_NOTIFICATIONS) != PERMISSION_GRANTED)
       return;
     NotificationManagerCompat.from(mContext).notify(PROGRESS_NOTIFICATION_ID,
-                                                    progressNotification(name, progress, stage));
+                                                    progressNotification(name, progress, stage, avoidOptions));
   }
 
   private void notifyResult(int built, int failed)

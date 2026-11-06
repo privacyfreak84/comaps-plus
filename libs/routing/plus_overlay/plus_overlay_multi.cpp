@@ -35,6 +35,8 @@ DEFINE_string(router_out, "", "router mode: output file.");
 DEFINE_string(router_in, "", "overlay mode: router results to compare with.");
 DEFINE_string(overlay_dir, "", "runtime mode: directory with <map>.plusovl files.");
 DEFINE_bool(avoid_toll, false, "router mode: set the 'avoid toll roads' option for the run (restored after).");
+DEFINE_int32(avoid_mask, -1, "router mode: avoid options for the run as RoutingOptions bits (2 toll, 4 motorway, "
+                             "8 ferry, 16 dirt); -1: leave the settings alone.");
 DEFINE_double(start_dir_deg, -1, "router mode: start direction (compass degrees, 0 = north); < 0: none.");
 DEFINE_bool(force_joints, true, "router mode: COMAPS_PLUS_FORCE_JOINTS=1 for the normal search.");
 
@@ -55,6 +57,7 @@ struct RouteSpec
 {
   std::string name;
   ms::LatLon a, b;
+  std::vector<ms::LatLon> via;  // intermediate stops (router mode)
 };
 
 std::vector<RouteSpec> BuiltinRoutes()
@@ -402,12 +405,26 @@ routing::Segment ParseSeg(std::string const & t)
 
 std::vector<RouteSpec> ReadRoutes(std::string const & path)
 {
+  // name lat lon [lat lon ...] lat lon: start, optional stops, finish.
   std::vector<RouteSpec> out;
   std::ifstream in(path);
-  std::string name;
-  double a, b, c, d;
-  while (in >> name >> a >> b >> c >> d)
-    out.push_back({name, ms::LatLon(a, b), ms::LatLon(c, d)});
+  std::string line;
+  while (std::getline(in, line))
+  {
+    std::istringstream ls(line);
+    std::string name;
+    if (!(ls >> name))
+      continue;
+    std::vector<ms::LatLon> pts;
+    double lat, lon;
+    while (ls >> lat >> lon)
+      pts.emplace_back(lat, lon);
+    if (pts.size() < 2)
+      continue;
+    RouteSpec r{name, pts.front(), pts.back(), {}};
+    r.via.assign(pts.begin() + 1, pts.end() - 1);
+    out.push_back(std::move(r));
+  }
   return out;
 }
 
@@ -546,10 +563,13 @@ int RunRouter(Multi & m)
   if (FLAGS_force_joints)
     setenv("COMAPS_PLUS_FORCE_JOINTS", "1", 1);
   auto const savedOptions = routing::RoutingOptions::LoadOptionsFromSettings(routing::VehicleType::Car);
-  if (FLAGS_avoid_toll)
+  if (FLAGS_avoid_toll || FLAGS_avoid_mask >= 0)
   {
-    routing::RoutingOptions o;
-    o.Add(routing::RoutingOptions::Toll);
+    routing::RoutingOptions o(FLAGS_avoid_mask >= 0 ? static_cast<routing::RoutingOptions::OptionType>(FLAGS_avoid_mask)
+                                                    : routing::RoutingOptions::OptionType(0),
+                              routing::VehicleType::Car);
+    if (FLAGS_avoid_toll)
+      o.Add(routing::RoutingOptions::Toll);
     routing::RoutingOptions::SaveOptionsToSettings(o);
   }
   auto const routes = FLAGS_routes.empty() ? BuiltinRoutes() : ReadRoutes(FLAGS_routes);
@@ -570,8 +590,12 @@ int RunRouter(Multi & m)
       double const a = FLAGS_start_dir_deg * M_PI / 180.0;
       dir = m2::PointD(std::sin(a), std::cos(a));  // mercator x east, y north
     }
+    std::vector<m2::PointD> pts{mercator::FromLatLon(r.a)};
+    for (auto const & v : r.via)
+      pts.push_back(mercator::FromLatLon(v));
+    pts.push_back(mercator::FromLatLon(r.b));
     auto const code = router->CalculateRoute(
-        routing::Checkpoints(mercator::FromLatLon(r.a), mercator::FromLatLon(r.b)), dir,
+        routing::Checkpoints(std::move(pts)), dir,
         false /* adjustToPrevRoute */, delegate, route);
     if (code == routing::RouterResultCode::NoError && FLAGS_start_dir_deg >= 0)
     {

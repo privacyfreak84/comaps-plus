@@ -1,6 +1,8 @@
 #include "routing/plus_overlay/overlay_file.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <random>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -14,7 +16,7 @@ namespace plus_overlay
 {
 namespace
 {
-constexpr char kMagic[8] = {'P', 'L', 'U', 'S', 'O', 'V', 'L', '2'};
+constexpr char kMagic[8] = {'P', 'L', 'U', 'S', 'O', 'V', 'L', '3'};
 constexpr size_t kMaxSections = 64;
 
 enum Section : uint32_t
@@ -48,6 +50,7 @@ enum LevelSection : uint32_t
 enum HeaderFlags : uint32_t
 {
   kCell1Is16Bit = 1,
+  kCliquesOnly = 2,  // an avoid-option file: only the per-level clique sections, for one base file
 };
 
 #pragma pack(push, 1)
@@ -64,7 +67,10 @@ struct Header
   uint32_t numFeatures;
   uint32_t numCells[8];
   uint32_t flags;
-  uint32_t reserved[7];
+  uint64_t buildId;      // random per build of a base file; avoid-option files name their base file by it
+  uint64_t baseBuildId;  // avoid-option files: buildId of the base file
+  uint32_t avoidMask;    // avoid-option files: RoutingOptions bits the cliques were computed without
+  uint32_t reserved[1];
   uint64_t offset[kMaxSections];
   uint64_t size[kMaxSections];
 };
@@ -99,6 +105,108 @@ uint64_t BuildParamsHash(std::vector<uint32_t> const & cellSizes, double minBala
   return h;
 }
 
+namespace
+{
+// Sparse cliques of one level: a bit per (entry, exit), rows word-aligned, and the finite values in row order.
+bool EncodeCliques(LevelOverlay const & L, uint32_t numCells, std::vector<uint32_t> & rowRank,
+                   std::vector<uint64_t> & bits, std::vector<float> & values, std::string * error)
+{
+  rowRank.clear();
+  bits.clear();
+  values.clear();
+  rowRank.reserve(L.entries.size());
+  for (uint32_t c = 0; c < numCells; ++c)
+  {
+    uint64_t const nEn = L.entryOff[c + 1] - L.entryOff[c], nEx = L.exitOff[c + 1] - L.exitOff[c];
+    uint64_t const wpr = (nEx + 63) / 64;
+    for (uint64_t i = 0; i < nEn; ++i)
+    {
+      if (values.size() > 0xFFFFFFFFULL)
+      {
+        SetError(error, "too many clique values in one level");
+        return false;
+      }
+      rowRank.push_back(static_cast<uint32_t>(values.size()));
+      uint64_t const w0 = bits.size();
+      bits.resize(w0 + wpr, 0);
+      for (uint64_t j = 0; j < nEx; ++j)
+      {
+        double const w = L.mat[L.matOff[c] + i * nEx + j];
+        if (w >= kInf)
+          continue;
+        bits[w0 + j / 64] |= uint64_t(1) << (j % 64);
+        values.push_back(static_cast<float>(w));
+      }
+    }
+  }
+  return true;
+}
+
+// Writes |path|.tmp section by section, then renames it to |path|.
+class SectionWriter
+{
+public:
+  SectionWriter(std::string const & path, Header & h) : m_path(path), m_tmp(path + ".tmp"), m_h(h)
+  {
+    m_out.open(m_tmp, std::ios::binary | std::ios::trunc);
+    if (m_out)
+      m_out.write(reinterpret_cast<char const *>(&m_h), sizeof(m_h));
+    m_pos = sizeof(m_h);
+  }
+  bool IsOpen() const { return static_cast<bool>(m_out); }
+  void Put(uint32_t id, void const * data, uint64_t bytes)
+  {
+    static char const zeros[8] = {};
+    uint64_t const pad = (8 - m_pos % 8) % 8;
+    m_out.write(zeros, static_cast<std::streamsize>(pad));
+    m_pos += pad;
+    m_h.offset[id] = m_pos;
+    m_h.size[id] = bytes;
+    if (bytes)
+      m_out.write(static_cast<char const *>(data), static_cast<std::streamsize>(bytes));
+    m_pos += bytes;
+  }
+  template <class V>
+  void PutVec(uint32_t id, V const & v)
+  {
+    Put(id, v.data(), v.size() * sizeof(v[0]));
+  }
+  bool Finish(std::string * error)
+  {
+    m_out.seekp(0);
+    m_out.write(reinterpret_cast<char const *>(&m_h), sizeof(m_h));
+    m_out.close();
+    if (!m_out)
+    {
+      SetError(error, "write failed");
+      std::remove(m_tmp.c_str());
+      return false;
+    }
+    if (std::rename(m_tmp.c_str(), m_path.c_str()) != 0)
+    {
+      SetError(error, "rename failed");
+      std::remove(m_tmp.c_str());
+      return false;
+    }
+    return true;
+  }
+
+private:
+  std::string m_path, m_tmp;
+  Header & m_h;
+  std::ofstream m_out;
+  uint64_t m_pos = 0;
+};
+
+uint64_t NewBuildId()
+{
+  std::random_device rd;
+  uint64_t const t = static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
+  uint64_t id = (uint64_t(rd()) << 32) ^ rd() ^ (t * 0x9E3779B97F4A7C15ULL);
+  return id == 0 ? 1 : id;
+}
+}  // namespace
+
 bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partition const & p, Overlay const & ov,
                       std::string * error)
 {
@@ -126,29 +234,15 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   }
   for (size_t li = 0; li < levels; ++li)
     h.numCells[li] = p.numCells[li];
+  h.buildId = NewBuildId();
 
-  std::string const tmp = path + ".tmp";
-  std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-  if (!out)
+  SectionWriter w(path, h);
+  if (!w.IsOpen())
   {
-    SetError(error, "can't create " + tmp);
+    SetError(error, "can't create " + path + ".tmp");
     return false;
   }
-  out.write(reinterpret_cast<char const *>(&h), sizeof(h));
-  uint64_t pos = sizeof(h);
-  auto put = [&](uint32_t id, void const * data, uint64_t bytes)
-  {
-    static char const zeros[8] = {};
-    uint64_t const pad = (8 - pos % 8) % 8;
-    out.write(zeros, static_cast<std::streamsize>(pad));
-    pos += pad;
-    h.offset[id] = pos;
-    h.size[id] = bytes;
-    if (bytes)
-      out.write(static_cast<char const *>(data), static_cast<std::streamsize>(bytes));
-    pos += bytes;
-  };
-  auto putVec = [&](uint32_t id, auto const & v) { put(id, v.data(), v.size() * sizeof(v[0])); };
+  auto putVec = [&](uint32_t id, auto const & v) { w.PutVec(id, v); };
 
   // Feature -> first segment, as a u32 per 64 features plus a u16 offset per feature.
   {
@@ -211,35 +305,11 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   {
     auto const & L = ov.levels[li];
     std::vector<uint32_t> eo(L.entryOff.begin(), L.entryOff.end()), xo(L.exitOff.begin(), L.exitOff.end());
-    // Sparse cliques: a bit per (entry, exit), rows word-aligned, and the finite values in row order.
     std::vector<uint32_t> rowRank;
     std::vector<uint64_t> bits;
     std::vector<float> values;
-    rowRank.reserve(L.entries.size());
-    for (uint32_t c = 0; c < p.numCells[li]; ++c)
-    {
-      uint64_t const nEn = L.entryOff[c + 1] - L.entryOff[c], nEx = L.exitOff[c + 1] - L.exitOff[c];
-      uint64_t const wpr = (nEx + 63) / 64;
-      for (uint64_t i = 0; i < nEn; ++i)
-      {
-        if (values.size() > 0xFFFFFFFFULL)
-        {
-          SetError(error, "too many clique values in one level");
-          return false;
-        }
-        rowRank.push_back(static_cast<uint32_t>(values.size()));
-        uint64_t const w0 = bits.size();
-        bits.resize(w0 + wpr, 0);
-        for (uint64_t j = 0; j < nEx; ++j)
-        {
-          double const w = L.mat[L.matOff[c] + i * nEx + j];
-          if (w >= kInf)
-            continue;
-          bits[w0 + j / 64] |= uint64_t(1) << (j % 64);
-          values.push_back(static_cast<float>(w));
-        }
-      }
-    }
+    if (!EncodeCliques(L, p.numCells[li], rowRank, bits, values, error))
+      return false;
     uint32_t const base = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
     putVec(base + kEntryOff, eo);
     putVec(base + kExitOff, xo);
@@ -249,73 +319,140 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
     putVec(base + kBits, bits);
     putVec(base + kValues, values);
   }
-  out.seekp(0);
-  out.write(reinterpret_cast<char const *>(&h), sizeof(h));
-  out.close();
-  if (!out)
-  {
-    SetError(error, "write failed");
-    std::remove(tmp.c_str());
-    return false;
-  }
-  if (std::rename(tmp.c_str(), path.c_str()) != 0)
-  {
-    SetError(error, "rename failed");
-    std::remove(tmp.c_str());
-    return false;
-  }
-  return true;
+  return w.Finish(error);
 }
 
-bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t paramsHash)
+bool WriteAvoidCliquesFile(std::string const & path, MappedOverlay const & base, uint32_t avoidMask,
+                           Overlay const & ov, std::string * error)
+{
+  size_t const levels = base.Levels();
+  if (ov.levels.size() != levels)
+  {
+    SetError(error, "level count differs from the base file");
+    return false;
+  }
+  Header h;
+  std::memset(&h, 0, sizeof(h));
+  std::memcpy(h.magic, kMagic, sizeof(kMagic));
+  h.formatVersion = kFileFormatVersion;
+  h.numLevels = static_cast<uint32_t>(levels);
+  h.mwmVersion = base.MwmVersion();
+  h.paramsHash = base.ParamsHash();
+  h.baseN = base.BaseN();
+  h.n = base.NumVertices();
+  h.numFeatures = base.NumFeatures();
+  for (size_t li = 0; li < levels; ++li)
+    h.numCells[li] = base.GetLevel(li).numCells;
+  h.flags = kCliquesOnly;
+  h.buildId = NewBuildId();
+  h.baseBuildId = base.BuildId();
+  h.avoidMask = avoidMask;
+
+  SectionWriter w(path, h);
+  if (!w.IsOpen())
+  {
+    SetError(error, "can't create " + path + ".tmp");
+    return false;
+  }
+  for (size_t li = 0; li < levels; ++li)
+  {
+    std::vector<uint32_t> rowRank;
+    std::vector<uint64_t> bits;
+    std::vector<float> values;
+    if (!EncodeCliques(ov.levels[li], h.numCells[li], rowRank, bits, values, error))
+      return false;
+    uint32_t const sec = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
+    w.PutVec(sec + kRowRank, rowRank);
+    w.PutVec(sec + kBits, bits);
+    w.PutVec(sec + kValues, values);
+  }
+  return w.Finish(error);
+}
+
+namespace
+{
+bool ReadHeader(std::string const & path, Header & h)
 {
   int const fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0)
     return false;
-  Header h;
   bool const ok = ::pread(fd, &h, sizeof(h), 0) == static_cast<ssize_t>(sizeof(h));
   ::close(fd);
-  return ok && std::memcmp(h.magic, kMagic, sizeof(kMagic)) == 0 && h.formatVersion == kFileFormatVersion &&
-         h.mwmVersion == mwmVersion && h.paramsHash == paramsHash;
+  return ok && std::memcmp(h.magic, kMagic, sizeof(kMagic)) == 0 && h.formatVersion == kFileFormatVersion;
+}
+}  // namespace
+
+bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t paramsHash, uint64_t * buildId)
+{
+  Header h;
+  if (!ReadHeader(path, h) || (h.flags & kCliquesOnly) || h.mwmVersion != mwmVersion || h.paramsHash != paramsHash)
+    return false;
+  if (buildId)
+    *buildId = h.buildId;
+  return true;
+}
+
+bool AvoidCliquesFileMatches(std::string const & path, uint64_t baseBuildId, uint32_t avoidMask)
+{
+  Header h;
+  return ReadHeader(path, h) && (h.flags & kCliquesOnly) && h.baseBuildId == baseBuildId && h.avoidMask == avoidMask;
+}
+
+bool MappedOverlay::Mapping::Open(std::string const & path, std::string * error)
+{
+  fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+  {
+    SetError(error, "no file");
+    return false;
+  }
+  struct stat st;
+  if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(Header)))
+  {
+    SetError(error, "too small");
+    return false;
+  }
+  size = static_cast<uint64_t>(st.st_size);
+  void * ptr = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+  if (ptr != MAP_FAILED)
+  {
+    data = static_cast<uint8_t const *>(ptr);
+    mapped = true;
+    return true;
+  }
+  buffer.resize(size);
+  if (::pread(fd, buffer.data(), size, 0) != static_cast<ssize_t>(size))
+  {
+    SetError(error, "read failed");
+    return false;
+  }
+  data = buffer.data();
+  return true;
+}
+
+MappedOverlay::Mapping::~Mapping()
+{
+  if (mapped)
+    ::munmap(const_cast<uint8_t *>(data), size);
+  if (fd >= 0)
+    ::close(fd);
 }
 
 std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int64_t expectMwmVersion,
                                                    uint64_t expectParamsHash, std::string * error)
 {
   std::unique_ptr<MappedOverlay> m(new MappedOverlay());
-  m->m_fd = ::open(path.c_str(), O_RDONLY);
-  if (m->m_fd < 0)
-  {
-    SetError(error, "no file");
+  if (!m->m_file.Open(path, error))
     return nullptr;
-  }
-  struct stat st;
-  if (::fstat(m->m_fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(Header)))
-  {
-    SetError(error, "too small");
-    return nullptr;
-  }
-  m->m_size = static_cast<uint64_t>(st.st_size);
-  void * ptr = ::mmap(nullptr, m->m_size, PROT_READ, MAP_SHARED, m->m_fd, 0);
-  if (ptr != MAP_FAILED)
-  {
-    m->m_data = static_cast<uint8_t const *>(ptr);
-    m->m_mapped = true;
-  }
-  else
-  {
-    m->m_buffer.resize(m->m_size);
-    if (::pread(m->m_fd, m->m_buffer.data(), m->m_size, 0) != static_cast<ssize_t>(m->m_size))
-    {
-      SetError(error, "read failed");
-      return nullptr;
-    }
-    m->m_data = m->m_buffer.data();
-  }
-  auto const & h = *reinterpret_cast<Header const *>(m->m_data);
+  auto const & h = *reinterpret_cast<Header const *>(m->m_file.data);
   if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || h.formatVersion != kFileFormatVersion)
   {
     SetError(error, "not a v" + std::to_string(kFileFormatVersion) + " overlay file");
+    return nullptr;
+  }
+  if (h.flags & kCliquesOnly)
+  {
+    SetError(error, "an avoid-option file, not a base overlay file");
     return nullptr;
   }
   if (expectMwmVersion != 0 && h.mwmVersion != expectMwmVersion)
@@ -333,29 +470,25 @@ std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int
   return m;
 }
 
-MappedOverlay::~MappedOverlay()
-{
-  if (m_mapped)
-    ::munmap(const_cast<uint8_t *>(m_data), m_size);
-  if (m_fd >= 0)
-    ::close(m_fd);
-}
+MappedOverlay::~MappedOverlay() = default;
 
 bool MappedOverlay::Parse(std::string * error)
 {
-  auto const & h = *reinterpret_cast<Header const *>(m_data);
+  auto const & h = *reinterpret_cast<Header const *>(m_file.data);
   for (size_t i = 0; i < kMaxSections; ++i)
   {
-    if (h.offset[i] + h.size[i] > m_size || (h.size[i] && h.offset[i] % 8 != 0))
+    if (h.offset[i] + h.size[i] > m_file.size || (h.size[i] && h.offset[i] % 8 != 0))
     {
       SetError(error, "bad section table");
       return false;
     }
   }
-  auto sec = [&](uint32_t id) { return m_data + h.offset[id]; };
+  auto sec = [&](uint32_t id) { return m_file.data + h.offset[id]; };
   auto count = [&](uint32_t id, size_t elem) { return h.size[id] / elem; };
 
   m_mwmVersion = h.mwmVersion;
+  m_paramsHash = h.paramsHash;
+  m_buildId = h.buildId;
   m_n = h.n;
   m_baseN = h.baseN;
   m_numSlots = h.numSlots;
@@ -457,6 +590,73 @@ bool MappedOverlay::Parse(std::string * error)
     m_copyId[(uint64_t(m_copyState[i]) << 32) | m_copyOrig[i]] = local;
     m_copiesOf[m_copyOrig[i]].push_back(local);
   }
+  return true;
+}
+
+bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error)
+{
+  Mapping mp;
+  if (!mp.Open(path, error))
+    return false;
+  auto const & h = *reinterpret_cast<Header const *>(mp.data);
+  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || h.formatVersion != kFileFormatVersion ||
+      !(h.flags & kCliquesOnly) || h.baseBuildId != m_buildId || h.avoidMask != avoidMask ||
+      h.numLevels != m_levels.size())
+  {
+    SetError(error, "avoid-option file doesn't belong to this overlay file");
+    return false;
+  }
+  for (size_t i = 0; i < kMaxSections; ++i)
+  {
+    if (h.offset[i] + h.size[i] > mp.size || (h.size[i] && h.offset[i] % 8 != 0))
+    {
+      SetError(error, "bad section table");
+      return false;
+    }
+  }
+  struct Cliques
+  {
+    uint32_t const * rowRank;
+    uint64_t const * bits;
+    float const * values;
+  };
+  std::vector<Cliques> cl(m_levels.size());
+  for (size_t li = 0; li < m_levels.size(); ++li)
+  {
+    auto const & L = m_levels[li];
+    uint32_t const base = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
+    uint64_t const nEntries = L.entryOff[L.numCells];
+    uint64_t const nWords = L.wordOff[L.numCells];
+    uint64_t const nValues = h.size[base + kValues] / 4;
+    if (h.numCells[li] != L.numCells || h.size[base + kRowRank] != nEntries * 4 || h.size[base + kBits] != nWords * 8)
+    {
+      SetError(error, "avoid-option file has other level sizes");
+      return false;
+    }
+    cl[li].rowRank = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kRowRank]);
+    cl[li].bits = reinterpret_cast<uint64_t const *>(mp.data + h.offset[base + kBits]);
+    cl[li].values = reinterpret_cast<float const *>(mp.data + h.offset[base + kValues]);
+    uint64_t bitsSet = 0;
+    for (uint64_t w = 0; w < nWords; ++w)
+      bitsSet += static_cast<uint64_t>(__builtin_popcountll(cl[li].bits[w]));
+    if (bitsSet != nValues || (nEntries > 0 && cl[li].rowRank[nEntries - 1] > nValues))
+    {
+      SetError(error, "bad clique values");
+      return false;
+    }
+  }
+  for (size_t li = 0; li < m_levels.size(); ++li)
+  {
+    m_levels[li].rowRank = cl[li].rowRank;
+    m_levels[li].bits = cl[li].bits;
+    m_levels[li].values = cl[li].values;
+  }
+  std::swap(m_avoidFile.fd, mp.fd);
+  std::swap(m_avoidFile.data, mp.data);
+  std::swap(m_avoidFile.size, mp.size);
+  std::swap(m_avoidFile.mapped, mp.mapped);
+  std::swap(m_avoidFile.buffer, mp.buffer);
+  m_avoidMask = avoidMask;
   return true;
 }
 

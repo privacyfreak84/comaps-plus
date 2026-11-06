@@ -55,6 +55,8 @@ struct MapRt
   routing::NumMwmId id = 0;
   std::string path;
   int64_t version = 0;
+  uint32_t avoidMask = 0;
+  std::string avoidPath;
   bool tried = false;
   std::unique_ptr<MappedOverlay> ovl;
   std::string error;
@@ -84,6 +86,8 @@ struct OverlayRouter::Impl
     {
       mr.tried = true;
       mr.ovl = MappedOverlay::Open(mr.path, mr.version, paramsHash, &mr.error);
+      if (mr.ovl && mr.avoidMask != 0 && !mr.ovl->AttachAvoidCliques(mr.avoidPath, mr.avoidMask, &mr.error))
+        mr.ovl.reset();
       if (mr.ovl)
       {
         for (uint32_t i = 0; i < mr.ovl->NumTransitions(); ++i)
@@ -604,12 +608,15 @@ void OverlayRouter::SetMaps(std::vector<OverlayMap> const & maps)
     mr.id = om.id;
     mr.path = om.path;
     mr.version = om.mwmVersion;
+    mr.avoidMask = om.avoidMask;
+    mr.avoidPath = om.avoidPath;
     auto it = m_impl->mapIdx.find(om.id);
     if (it != m_impl->mapIdx.end())
     {
       auto & old = m_impl->maps[it->second];
       // A map whose file was missing or stale is tried again (its overlay may have been built since).
-      if (old.path == om.path && old.version == om.mwmVersion && old.ovl)
+      if (old.path == om.path && old.version == om.mwmVersion && old.avoidMask == om.avoidMask &&
+          old.avoidPath == om.avoidPath && old.ovl)
         mr = std::move(old);
     }
     next.push_back(std::move(mr));
@@ -730,6 +737,13 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   if (srcReal.empty() && tgtReal.empty() && direct >= kInf)
     return finish(Result::NoRoute, "");
 
+  auto lap = [&, last = t0](double & into) mutable
+  {
+    auto const now = std::chrono::steady_clock::now();
+    into = std::chrono::duration<double, std::milli>(now - last).count();
+    last = now;
+  };
+  lap(stats.fakeMs);
   // 2. Seeds: walk chains from the real segments to overlay vertices.
   struct Seed
   {
@@ -818,6 +832,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     }
   }
 
+  lap(stats.seedMs);
   // 3. Overlay search.
   I.endCells.assign(I.maps.size(), {});
   I.mapHasEnd.assign(I.maps.size(), 0);
@@ -942,6 +957,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     }
   }
 
+  lap(stats.searchMs);
   // 4. Assemble the starter path.
   auto fakePrefix = [&](Segment const & firstReal)
   {
@@ -1064,6 +1080,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     if (!routing::IndexGraphStarter::IsFakeSegment(s))
       used.insert(s.GetMwmId());
   stats.mapsUsed = used.size();
+  lap(stats.unpackMs);
   return finish(Result::Ok, "");
 }
 }  // namespace plus_overlay

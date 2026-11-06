@@ -56,6 +56,16 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFile,
                              routing::VehicleModelFactory::CountryParentNameGetterFn const & countryParentNameGetter,
                              std::string const & outPath, BuildOptions const & options);
 
-// Overlay files (*.plusovl) in |dir| whose map (same name, .mwm) is gone. Returns how many were deleted.
-size_t DeleteOrphanedOverlayFiles(std::string const & dir);
+// Avoid-option cliques for |avoidMask| (RoutingOptions bits): the base file's vertices, partition and
+// boundaries, edge weights from CoMaps' graph with those options. Needs the base file (|basePath|, empty:
+// next to the map) and writes |outPath| (empty: AvoidOverlayPathForMap). About 40% of a full build's time
+// (no partition step).
+BuildResult BuildAvoidCliquesFile(platform::LocalCountryFile const & localFile,
+                                  routing::VehicleModelFactory::CountryParentNameGetterFn const & countryParentNameGetter,
+                                  uint32_t avoidMask, std::string const & basePath, std::string const & outPath,
+                                  BuildOptions const & options);
+
+// Overlay files (*.plusovl) in |dir| whose map (same name, .mwm) is gone, interrupted builds, and, if
+// |keepAvoidMask| >= 0, avoid-option files for other masks. Returns how many were deleted.
+size_t DeleteOrphanedOverlayFiles(std::string const & dir, int64_t keepAvoidMask = -1);
 }  // namespace plus_overlay
