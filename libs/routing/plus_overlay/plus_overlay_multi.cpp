@@ -22,7 +22,11 @@
 
 #include <cstdlib>
 #include <optional>
+#include <set>
 #include <sstream>
+
+#include "base/scope_guard.hpp"
+#include "base/string_utils.hpp"
 
 DEFINE_string(mwms, "India_Uttar Pradesh;India_Madhya Pradesh", "';'-separated maps to load.");
 DEFINE_string(cache_dir, "", "Directory for per-map raw graph caches (<map>.graph).");
@@ -35,6 +39,9 @@ DEFINE_string(router_out, "", "router mode: output file.");
 DEFINE_string(router_in, "", "overlay mode: router results to compare with.");
 DEFINE_string(overlay_dir, "", "runtime mode: directory with <map>.plusovl files.");
 DEFINE_string(vehicle, "car", "router mode: car | pedestrian | bicycle.");
+DEFINE_string(reroute_offsets, "300,1500,4000", "reroute mode: metres off the route (comma-separated).");
+DEFINE_bool(wrong_turn, false, "reroute mode: leave the route by taking a wrong turn at a junction and driving "
+                               "on for the --reroute_offsets distances, instead of jumping sideways.");
 DEFINE_bool(avoid_toll, false, "router mode: set the 'avoid toll roads' option for the run (restored after).");
 DEFINE_int32(avoid_mask, -1, "router mode: avoid options for the run as RoutingOptions bits (2 toll, 4 motorway, "
                              "8 ferry, 16 dirt); -1: leave the settings alone.");
@@ -640,6 +647,156 @@ int RunRouter(Multi & m)
   return 0;
 }
 
+// Rerouting: the driver leaves the route at several places (kept going straight, ended up off the
+// route by some distance) and the app asks for a new route with adjustToPrevRoute, as RoutingManager
+// does on RouteNeedsRebuild. Compared with a fresh route from the same place (the best route).
+int RunReroute(Multi & m)
+{
+  auto const savedOptions = routing::RoutingOptions::LoadOptionsFromSettings(routing::VehicleType::Car);
+  if (FLAGS_avoid_mask >= 0)
+    routing::RoutingOptions::SaveOptionsToSettings(routing::RoutingOptions(
+        static_cast<routing::RoutingOptions::OptionType>(FLAGS_avoid_mask), routing::VehicleType::Car));
+  SCOPE_GUARD(restoreOptions, [&] { routing::RoutingOptions::SaveOptionsToSettings(savedOptions); });
+  auto const routes = FLAGS_routes.empty() ? BuiltinRoutes() : ReadRoutes(FLAGS_routes);
+  traffic::TrafficCache traffic;
+  std::shared_ptr<storage::CountryInfoGetter> cig, cig2;
+  auto router = m.MakeRouter(traffic, cig);
+  auto fresh = m.MakeRouter(traffic, cig2);
+  routing::RouterDelegate delegate;
+  delegate.SetTimeout(3600);
+  std::vector<double> fractions{0.1, 0.3, 0.5, 0.7, 0.9};
+  std::vector<double> offsets;
+  for (auto const & t : strings::Tokenize(FLAGS_reroute_offsets, ","))
+    offsets.push_back(std::stod(std::string(t)));
+  std::cout.precision(2);
+  std::cout.setf(std::ios::fixed);
+  for (auto const & r : routes)
+  {
+    m2::PointD const a = mercator::FromLatLon(r.a), b = mercator::FromLatLon(r.b);
+    routing::Route base("", 0);
+    auto code = router->CalculateRoute(routing::Checkpoints(a, b), m2::PointD::Zero(), false, delegate, base);
+    if (code != routing::RouterResultCode::NoError)
+    {
+      std::cout << r.name << ": first route failed " << routing::DebugPrint(code) << "\n";
+      continue;
+    }
+    // Cumulative lengths along the polyline.
+    auto const & poly = base.GetPoly();
+    std::vector<double> cum{0};
+    for (size_t i = 1; i < poly.GetSize(); ++i)
+      cum.push_back(cum.back() + mercator::DistanceOnEarth(poly.GetPoint(i - 1), poly.GetPoint(i)));
+    std::cout << r.name << " (" << cum.back() / 1000 << " km, ETA " << Hms(base.GetTotalTimeSec()) << ")\n";
+    // Real segments of the route, in order (for wrong turns).
+    std::vector<routing::Segment> rsegs;
+    for (auto const & rs : base.GetRouteSegments())
+      if (rs.GetSegment().IsRealSegment() && (rsegs.empty() || !(rsegs.back() == rs.GetSegment())))
+        rsegs.push_back(rs.GetSegment());
+    std::set<routing::Segment> onRoute(rsegs.begin(), rsegs.end());
+    auto pointOf = [&](routing::Segment const & sg, bool front)
+    {
+      auto const ll = m.world->GetIndexGraph(sg.GetMwmId()).GetPoint(sg, front);
+      return mercator::FromLatLon(ll);
+    };
+    for (double f : fractions)
+    {
+      size_t i = std::lower_bound(cum.begin(), cum.end(), f * cum.back()) - cum.begin();
+      i = std::min(std::max<size_t>(i, 1), poly.GetSize() - 1);
+      m2::PointD const p = poly.GetPoint(i);
+      m2::PointD dir = poly.GetPoint(i) - poly.GetPoint(i - 1);
+      if (dir.Length() > 0)
+        dir = dir.Normalize();
+      for (double off : offsets)
+      {
+        // Off to the right of the direction of travel, still heading the same way.
+        m2::PointD const right(dir.y, -dir.x);
+        m2::PointD q = mercator::GetSmPoint(p, right.x * off, right.y * off);
+        std::string how;
+        if (FLAGS_wrong_turn)
+        {
+          // From the route segment nearest to this fraction, find the next junction with a road that
+          // leaves the route, turn into it and keep going (straightest continuation) for |off| metres.
+          size_t k = static_cast<size_t>(f * rsegs.size());
+          routing::IndexGraph::SegmentEdgeListT edges;
+          bool turned = false;
+          routing::Segment cur;
+          for (; k + 1 < rsegs.size() && !turned; ++k)
+          {
+            edges.clear();
+            m.world->GetIndexGraph(rsegs[k].GetMwmId()).GetEdgeList(rsegs[k], true, true, edges);
+            for (auto const & e : edges)
+            {
+              auto const & t = e.GetTarget();
+              if (t == rsegs[k + 1] || onRoute.count(t) || (t.GetFeatureId() == rsegs[k].GetFeatureId() &&
+                                                            t.GetSegmentIdx() == rsegs[k].GetSegmentIdx()))
+                continue;
+              cur = t;
+              turned = true;
+              break;
+            }
+          }
+          if (!turned)
+          {
+            std::cout << "  at " << int(f * 100) << "%: no junction to turn wrong at\n";
+            continue;
+          }
+          double driven = mercator::DistanceOnEarth(pointOf(cur, false), pointOf(cur, true));
+          for (int guard = 0; guard < 100000 && driven < off; ++guard)
+          {
+            edges.clear();
+            m.world->GetIndexGraph(cur.GetMwmId()).GetEdgeList(cur, true, true, edges);
+            m2::PointD const d0 = (pointOf(cur, true) - pointOf(cur, false)).Normalize();
+            double bestCos = -2;
+            routing::Segment next;
+            for (auto const & e : edges)
+            {
+              auto const & t = e.GetTarget();
+              if (t.GetFeatureId() == cur.GetFeatureId() && t.GetSegmentIdx() == cur.GetSegmentIdx())
+                continue;  // U-turn
+              m2::PointD const d1 = (pointOf(t, true) - pointOf(t, false)).Normalize();
+              double const c = m2::DotProduct(d0, d1);
+              if (c > bestCos)
+                bestCos = c, next = t;
+            }
+            if (bestCos < -1.5)
+              break;  // dead end
+            cur = next;
+            driven += mercator::DistanceOnEarth(pointOf(cur, false), pointOf(cur, true));
+          }
+          q = pointOf(cur, true);
+          dir = (pointOf(cur, true) - pointOf(cur, false)).Normalize();
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "wrong turn, %.1f km driven", driven / 1000);
+          how = buf;
+        }
+        // The app reroutes from the route it is following: restore it first.
+        routing::Route again("", 0);
+        router->CalculateRoute(routing::Checkpoints(a, b), m2::PointD::Zero(), false, delegate, again);
+        routing::Route adj("", 0), best("", 0);
+        auto t0 = Clock::now();
+        auto const c1 = router->CalculateRoute(routing::Checkpoints(q, b), dir, true /* adjustToPrevRoute */,
+                                               delegate, adj);
+        double const adjSec = Since(t0);
+        bool const adjusted = router->PlusLastWasAdjusted();
+        t0 = Clock::now();
+        auto const c2 = fresh->CalculateRoute(routing::Checkpoints(q, b), dir, false, delegate, best);
+        double const bestSec = Since(t0);
+        std::cout << "  at " << int(f * 100) << "%, " << (how.empty() ? std::to_string(int(off)) + " m off" : how)
+                  << ": ";
+        if (c1 != routing::RouterResultCode::NoError || c2 != routing::RouterResultCode::NoError)
+        {
+          std::cout << "reroute " << routing::DebugPrint(c1) << ", fresh " << routing::DebugPrint(c2) << "\n";
+          continue;
+        }
+        double const diff = adj.GetTotalTimeSec() - best.GetTotalTimeSec();
+        std::cout << (adjusted ? "rejoined old route" : "new route       ") << " in " << adjSec << " s, ETA "
+                  << Hms(adj.GetTotalTimeSec()) << " | best route " << bestSec << " s, ETA "
+                  << Hms(best.GetTotalTimeSec()) << " | reroute worse by " << diff / 60 << " min\n";
+      }
+    }
+  }
+  return 0;
+}
+
 struct RouterAnswer
 {
   bool ok = false;
@@ -685,6 +842,12 @@ int main(int argc, char ** argv)
   Multi m;
   m.Init(mwms);
 
+  if (FLAGS_mode == "reroute")
+  {
+    if (FLAGS_force_joints)
+      setenv("COMAPS_PLUS_FORCE_JOINTS", "1", 1);
+    return RunReroute(m);
+  }
   if (FLAGS_mode == "router")
     return RunRouter(m);
   if (FLAGS_mode == "runtime")

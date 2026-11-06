@@ -358,6 +358,7 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
   try
   {
     SCOPE_GUARD(featureRoadGraphClear, [this] { ClearState(); });
+    m_plusLastWasAdjusted = false;
 
     if (adjustToPrevRoute && m_lastRoute && m_lastFakeEdges && finalPoint == m_lastRoute->GetFinish())
     {
@@ -367,7 +368,10 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
       {
         auto const code = AdjustRoute(checkpoints, startDirection, delegate, route);
         if (code != RouterResultCode::RouteNotFound)
+        {
+          m_plusLastWasAdjusted = code == RouterResultCode::NoError;
           return code;
+        }
 
         LOG(LWARNING, ("Can't adjust route, do full rebuild, prev start:", mercator::ToLatLon(m_lastRoute->GetStart()),
                        "start:", mercator::ToLatLon(startPoint), "finish:", mercator::ToLatLon(finalPoint)));

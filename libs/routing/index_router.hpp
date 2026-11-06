@@ -138,9 +138,15 @@ private:
 
   RouterResultCode DoCalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
                                     RouterDelegate const & delegate, Route & route);
-  // Comaps++: answers a car subroute from the per-map overlay files if every downloaded map has one
-  // and no avoid option is set; false means "use the normal search".
+  // Comaps++: answers a car subroute from the per-map overlay files (for the current avoid options) if
+  // every map the search reaches has one; false means "use the normal search".
   bool TryPlusOverlay(IndexGraphStarter & starter, std::vector<Segment> & subroute);
+public:
+  // Comaps++ tests: the last CalculateRoute rejoined the previous route (AdjustRoute) instead of a new search.
+  bool PlusLastWasAdjusted() const { return m_plusLastWasAdjusted; }
+
+private:
+  bool m_plusLastWasAdjusted = false;
 
   RouterResultCode CalculateSubroute(Checkpoints const & checkpoints, size_t subrouteIdx,
                                      RouterDelegate const & delegate, std::shared_ptr<AStarProgress> const & progress,
