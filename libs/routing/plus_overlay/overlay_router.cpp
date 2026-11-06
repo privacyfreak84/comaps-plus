@@ -2,6 +2,7 @@
 
 #include "routing/base/astar_graph.hpp"
 #include "routing/base/astar_vertex_data.hpp"
+#include "routing/cross_mwm_graph.hpp"
 #include "routing/index_graph.hpp"
 #include "routing/index_graph_starter.hpp"
 #include "routing/route_weight.hpp"
@@ -52,11 +53,22 @@ Key MakeKey(uint32_t m, uint32_t v) { return (uint64_t(m) << 32) | v; }
 uint32_t MapOf(Key k) { return static_cast<uint32_t>(k >> 32); }
 uint32_t LocalOf(Key k) { return static_cast<uint32_t>(k); }
 
+// Raw keys: a real segment of a map without a usable overlay file (crossed approximately, see FindPath).
+constexpr Key kRawBit = Key(1) << 62;
+bool IsRaw(Key k) { return k != kNoKey && (k & kRawBit) != 0; }
+
+enum EdgeKind : uint8_t
+{
+  kBaseEdge = 0,  // a chain of real segments (overlay) or one real edge
+  kTwinEdge = 1,  // the same physical segment in the next map
+  kLeapEdge = 2,  // across a map without overlay: enter -> exit on CoMaps' border-to-border time
+};
+
 struct BaseEdge
 {
   Key to;
   double w;
-  bool twin;
+  uint8_t kind;
 };
 
 struct Label
@@ -161,29 +173,164 @@ struct OverlayRouter::Impl
       return;
     }
     starter->GetGraph().GetTwinsInner(s, outgoing, twinScratch);
-    for (auto const & t : twinScratch)
+    auto const twins = twinScratch;  // KeyOfTwin may reuse the scratch list
+    for (auto const & t : twins)
     {
-      auto it = mapIdx.find(t.GetMwmId());
-      MappedOverlay const * o = it == mapIdx.end() ? nullptr : Ovl(it->second);
-      if (!o)
-      {
-        needsMissingMap = true;
-        missingMap = t.GetMwmId();
-        continue;
-      }
-      if (!o->HasSegment(t.GetFeatureId(), t.GetSegmentIdx()) ||
-          !o->Kept(o->Slot(t.GetFeatureId(), t.GetSegmentIdx(), t.IsForward())))
-      {
-        LOG(LWARNING, ("Comaps++ overlay: border segment", t, "is not in its map's overlay file"));
-        needsMissingMap = true;
-        missingMap = t.GetMwmId();
-        continue;
-      }
-      out.push_back({MakeKey(it->second, o->Rank(o->Slot(t.GetFeatureId(), t.GetSegmentIdx(), t.IsForward()))), 0.0,
-                     true});
+      // A neighbour without a usable overlay is crossed approximately (raw keys and CoMaps' leaps).
+      out.push_back({KeyOfTwin(t), 0.0, kTwinEdge});
       if (chains)
         chains->emplace_back();
     }
+  }
+
+  // Per query: real segments used as raw keys.
+  std::vector<Segment> rawSegs;
+  std::unordered_map<Segment, uint32_t> rawIdx;
+  std::set<routing::NumMwmId> approxTouched;  // maps without overlay the search crossed
+
+  Key RawKey(Segment const & s)
+  {
+    auto [it, inserted] = rawIdx.emplace(s, static_cast<uint32_t>(rawSegs.size()));
+    if (inserted)
+      rawSegs.push_back(s);
+    approxTouched.insert(s.GetMwmId());
+    return kRawBit | it->second;
+  }
+  Segment const & RawSeg(Key k) const { return rawSegs[static_cast<size_t>(k & ~kRawBit)]; }
+
+  // Key of a real segment reached by a twin link: its overlay vertex, or a raw key if its map has no
+  // usable overlay (or the segment isn't a vertex there).
+  Key KeyOfTwin(Segment const & t)
+  {
+    auto it = mapIdx.find(t.GetMwmId());
+    MappedOverlay const * o = it == mapIdx.end() ? nullptr : Ovl(it->second);
+    if (o && o->HasSegment(t.GetFeatureId(), t.GetSegmentIdx()))
+    {
+      uint32_t const slot = o->Slot(t.GetFeatureId(), t.GetSegmentIdx(), t.IsForward());
+      if (o->Kept(slot))
+        return MakeKey(it->second, o->Rank(slot));
+    }
+    return RawKey(t);
+  }
+
+  // Edges of a raw key: twins at a border exit (outgoing) / enter (ingoing), CoMaps' cross-map leaps from
+  // an enter to the map's exits (outgoing) / to an exit from the map's enters (ingoing).
+  void RawEdges(Key x, bool outgoing, std::vector<BaseEdge> & out, std::vector<std::vector<Segment>> * chains)
+  {
+    Segment const s = RawSeg(x);
+    auto & cross = starter->GetGraph().GetCrossMwmGraph();
+    if (cross.IsTransition(s, outgoing))
+    {
+      twinScratch.clear();
+      starter->GetGraph().GetTwinsInner(s, outgoing, twinScratch);
+      for (auto const & t : twinScratch)
+      {
+        out.push_back({KeyOfTwin(t), 0.0, kTwinEdge});
+        if (chains)
+          chains->emplace_back();
+      }
+    }
+    if (cross.IsTransition(s, !outgoing))
+    {
+      routing::CrossMwmGraph::EdgeListT leaps;
+      if (outgoing)
+        cross.GetOutgoingEdgeList(s, leaps);
+      else
+        cross.GetIngoingEdgeList(s, leaps);
+      for (auto const & e : leaps)
+      {
+        out.push_back({RawKey(e.GetTarget()), e.GetWeight().GetIntegratedWeight(), kLeapEdge});
+        if (chains)
+          chains->emplace_back();
+      }
+    }
+  }
+
+  // A* on the starter inside one map (the world graph in single-map mode, so no twins): from |from| (fake
+  // or real) to |to|. Appends the segments after |from| up to and including |to|. Restrictions are
+  // checked the way CoMaps does (with the search's parents). Bounded: false if it grows too large.
+  OverlayRouter::LegRefiner legRefiner;
+
+  bool RefineInMap(Segment const & from, Segment const & to, std::vector<Segment> & out, double * cost = nullptr,
+                   bool anyMap = false)
+  {
+    if (legRefiner)
+    {
+      std::vector<Segment> leg;
+      double w = 0;
+      if (!legRefiner(from, to, anyMap, leg, w) || leg.empty() || !(leg.back() == to))
+      {
+        LOG(LINFO, ("Comaps++ overlay: no leg from", from, "to", to));
+        return false;
+      }
+      out.insert(out.end(), leg.begin() + (leg.front() == from ? 1 : 0), leg.end());
+      if (cost)
+        *cost = w;
+      return true;
+    }
+    auto & st = *starter;
+    auto & g = st.GetGraph();
+    auto const prevMode = g.GetMode();
+    g.SetMode(anyMap ? routing::WorldGraphMode::NoLeaps : routing::WorldGraphMode::SingleMwm);
+    using Parents = routing::AStarGraph<Segment, routing::SegmentEdge, routing::RouteWeight>::Parents;
+    Parents parents;
+    st.SetAStarParents(true, parents);
+    ms::LatLon const target = st.GetPoint(to, true /* front */);
+    std::unordered_map<Segment, double> dist{{from, 0.0}};
+    std::unordered_set<Segment> closed;
+    std::priority_queue<std::pair<double, Segment>, std::vector<std::pair<double, Segment>>, std::greater<>> q;
+    q.push({0.0, from});
+    routing::IndexGraphStarter::EdgeListT es;
+    bool found = false;
+    constexpr size_t kMaxSettled = 6000000;
+    while (!q.empty() && closed.size() < kMaxSettled)
+    {
+      Segment const x = q.top().second;
+      q.pop();
+      if (!closed.insert(x).second)
+        continue;
+      if (x == to)
+      {
+        found = true;
+        break;
+      }
+      double const dx = dist[x];
+      es.clear();
+      routing::astar::VertexData<Segment, routing::RouteWeight> const vd(x, routing::RouteWeight(dx));
+      st.GetOutgoingEdgesList(vd, es);
+      ++baseScans;
+      for (auto const & e : es)
+      {
+        Segment const & t = e.GetTarget();
+        if (!routing::IndexGraphStarter::IsFakeSegment(t) && !routing::IndexGraphStarter::IsFakeSegment(to) &&
+            t.GetMwmId() != to.GetMwmId())
+          continue;
+        double const nd = dx + e.GetWeight().GetIntegratedWeight();
+        auto it = dist.find(t);
+        if (it == dist.end() || nd < it->second)
+        {
+          dist[t] = nd;
+          parents[t] = x;
+          q.push({nd + st.HeuristicCostEstimate(t, target).GetIntegratedWeight(), t});
+        }
+      }
+    }
+    std::vector<Segment> rev;
+    if (found)
+    {
+      for (Segment y = to; !(y == from); y = parents.at(y))
+        rev.push_back(y);
+      if (cost)
+        *cost = dist[to];
+    }
+    st.DropAStarParents();
+    g.SetMode(prevMode);
+    if (!found)
+    {
+      return false;
+    }
+    out.insert(out.end(), rev.rbegin(), rev.rend());
+    return true;
   }
 
   routing::IndexGraph & Graph(uint32_t m)
@@ -344,6 +491,11 @@ struct OverlayRouter::Impl
     out.clear();
     if (chains)
       chains->clear();
+    if (IsRaw(x))
+    {
+      RawEdges(x, true /* outgoing */, out, chains);
+      return;
+    }
     uint32_t const m = MapOf(x), v = LocalOf(x);
     auto const & o = *maps[m].ovl;
     uint32_t const base = o.IsCopy(v) ? o.CopyOrig(v) : v;
@@ -384,6 +536,11 @@ struct OverlayRouter::Impl
   void InEdges(Key x, std::vector<BaseEdge> & out)
   {
     out.clear();
+    if (IsRaw(x))
+    {
+      RawEdges(x, false /* outgoing */, out, nullptr);
+      return;
+    }
     uint32_t const m = MapOf(x), v = LocalOf(x);
     auto const & o = *maps[m].ovl;
     uint32_t const base = o.IsCopy(v) ? o.CopyOrig(v) : v;
@@ -443,6 +600,13 @@ struct OverlayRouter::Impl
   template <class Relax>
   void ScanF(Key x, double d, Relax && relax, std::vector<BaseEdge> & tmp)
   {
+    if (IsRaw(x))
+    {
+      OutEdges(x, tmp, nullptr);
+      for (auto const & e : tmp)
+        relax(e.to, d + e.w, x, 0);
+      return;
+    }
     size_t const lvl = QueryLevel(x);
     OutEdges(x, tmp, nullptr);
     if (lvl == 0)
@@ -466,6 +630,13 @@ struct OverlayRouter::Impl
   template <class Relax>
   void ScanB(Key x, double d, Relax && relax, std::vector<BaseEdge> & tmp)
   {
+    if (IsRaw(x))
+    {
+      InEdges(x, tmp);
+      for (auto const & e : tmp)
+        relax(e.to, d + e.w, x, 0);
+      return;
+    }
     size_t const lvl = QueryLevel(x);
     InEdges(x, tmp);
     if (lvl == 0)
@@ -501,7 +672,9 @@ struct OverlayRouter::Impl
       if (best < 0)
         return false;
       // A twin link is the same physical segment in the next map: CoMaps lists it once.
-      if (!es[best].twin)
+      if (es[best].kind == kLeapEdge)
+        return RefineInMap(RawSeg(u), RawSeg(v), out);
+      if (es[best].kind != kTwinEdge)
         out.insert(out.end(), chains[best].begin(), chains[best].end());
       return true;
     }
@@ -633,6 +806,11 @@ OverlayRouter::OverlayRouter(uint64_t paramsHash) : m_impl(std::make_unique<Impl
 
 OverlayRouter::~OverlayRouter() = default;
 
+void OverlayRouter::SetLegRefiner(LegRefiner refiner)
+{
+  m_impl->legRefiner = std::move(refiner);
+}
+
 void OverlayRouter::SetMaps(std::vector<OverlayMap> const & maps)
 {
   // Keep already opened files of maps that are unchanged.
@@ -710,6 +888,9 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   I.starter = &starter;
   I.graphs.assign(I.maps.size(), nullptr);
   I.baseScans = 0;
+  I.rawSegs.clear();
+  I.rawIdx.clear();
+  I.approxTouched.clear();
   I.needsMissingMap = false;
   auto finish = [&](Result r, std::string const & why)
   {
@@ -785,17 +966,74 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     Segment real;
     double cost;
     std::vector<Segment> chain;  // real segments from |real| to the overlay vertex (both included)
+    bool leap = false;           // a border transition of an end's map without overlay (cost estimated)
   };
   std::unordered_map<Key, Seed> src, tgt;
+  // Ends in maps without a usable overlay: like CoMaps' long-route mode, the end connects to that map's
+  // border transitions with an estimated time (straight line at top speed, scaled by kEndLegFactor since
+  // roads inside a map take several times longer). The search only picks the corridor: the part near such
+  // an end is then found by CoMaps' own search from a handover point on the overlay route (see below).
+  constexpr double kEndLegFactor = 4.0;
+  std::set<routing::NumMwmId> rawStart, rawFinish;
+  for (auto const & [s, c] : srcReal)
+    if (I.MapOfSegment(s) == kNone)
+      rawStart.insert(s.GetMwmId());
+  for (auto const & [s, c] : tgtReal)
+    if (I.MapOfSegment(s) == kNone)
+      rawFinish.insert(s.GetMwmId());
+  auto & worldGraph = starter.GetGraph();
+  ms::LatLon const startLL = starter.GetStartJunction().GetLatLon();
+  ms::LatLon const finishLL = starter.GetFinishJunction().GetLatLon();
+  // Both ends in the same map without overlay: the in-map route is one candidate; routes that leave the
+  // map are compared with it after the search.
+  // Both ends in the same map without overlay: no overlay can shorten the search much, so this is CoMaps'
+  // own joint search end to end (across maps, so routes that leave the map and come back are found).
+  for (auto const id : rawStart)
+  {
+    if (!rawFinish.count(id))
+      continue;
+    path.assign(1, starter.GetStartSegment());
+    if (!I.RefineInMap(starter.GetStartSegment(), starter.GetFinishSegment(), path, &stats.weight,
+                       true /* anyMap */))
+      return finish(Result::NoRoute, "");
+    std::set<routing::NumMwmId> usedMaps;
+    for (auto const & sg : path)
+      if (!routing::IndexGraphStarter::IsFakeSegment(sg))
+        usedMaps.insert(sg.GetMwmId());
+    stats.mapsUsed = usedMaps.size();
+    for (auto const used : usedMaps)
+    {
+      auto it = I.mapIdx.find(used);
+      if (it == I.mapIdx.end() || !I.Ovl(it->second))
+        stats.approxMaps.push_back(used);
+    }
+    return finish(Result::Ok, "");
+  }
+  for (auto const id : rawStart)
+    worldGraph.GetCrossMwmGraph().ForEachTransition(id, false /* isEnter */, [&](Segment const & e)
+    {
+      double const w =
+          kEndLegFactor * worldGraph.HeuristicCostEstimate(startLL, starter.GetPoint(e, true)).GetIntegratedWeight();
+      Key const k = I.RawKey(e);
+      auto it = src.find(k);
+      if (it == src.end() || w < it->second.cost)
+        src[k] = {e, w, {}, true};
+    });
+  for (auto const id : rawFinish)
+    worldGraph.GetCrossMwmGraph().ForEachTransition(id, true /* isEnter */, [&](Segment const & e)
+    {
+      double const w =
+          kEndLegFactor * worldGraph.HeuristicCostEstimate(starter.GetPoint(e, true), finishLL).GetIntegratedWeight();
+      Key const k = I.RawKey(e);
+      auto it = tgt.find(k);
+      if (it == tgt.end() || w < it->second.cost)
+        tgt[k] = {e, w, {}, true};
+    });
   for (auto const & [s, c] : srcReal)
   {
     uint32_t const m = I.MapOfSegment(s);
     if (m == kNone)
-    {
-      stats.hasMissingMap = true;
-      stats.missingMap = s.GetMwmId();
-      return finish(Result::NotApplicable, "start map has no overlay");
-    }
+      continue;
     double w = c;
     uint32_t kept;
     bool inner;
@@ -805,17 +1043,13 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     Key const k = MakeKey(m, kept);
     auto it = src.find(k);
     if (it == src.end() || w < it->second.cost)
-      src[k] = {s, w, chain};
+      src[k] = {s, w, chain, false};
   }
   for (auto const & [s, c] : tgtReal)
   {
     uint32_t const m = I.MapOfSegment(s);
     if (m == kNone)
-    {
-      stats.hasMissingMap = true;
-      stats.missingMap = s.GetMwmId();
-      return finish(Result::NotApplicable, "finish map has no overlay");
-    }
+      continue;
     double w = c;
     uint32_t kept;
     bool inner;
@@ -828,7 +1062,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       Key const k = MakeKey(m, local);
       auto it = tgt.find(k);
       if (it == tgt.end() || w < it->second.cost)
-        tgt[k] = {s, w, chain};
+        tgt[k] = {s, w, chain, false};
     };
     add(kept);
     if (auto const * copies = o.CopiesOf(kept))
@@ -842,6 +1076,8 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   Segment directSrc, directTgt;
   for (auto const & [k, sd] : src)
   {
+    if (sd.leap)
+      continue;
     double acc = srcReal.at(sd.real);
     for (size_t i = 0; i < sd.chain.size(); ++i)
     {
@@ -873,6 +1109,8 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   I.mapHasEnd.assign(I.maps.size(), 0);
   auto noteEnd = [&](Key k)
   {
+    if (IsRaw(k))
+      return;
     uint32_t const m = MapOf(k);
     auto const & o = *I.maps[m].ovl;
     if (I.endCells[m].empty())
@@ -1065,8 +1303,16 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     }
     auto const & s0 = src.at(first);
     auto const & t0 = tgt.at(last);
-    path = fakePrefix(s0.real);
-    path.insert(path.end(), s0.chain.begin(), s0.chain.end());
+    if (s0.leap)
+    {
+      // From the start (in a map without overlay) to the border exit the search chose: replaced below.
+      path = {starter.GetStartSegment(), s0.real};
+    }
+    else
+    {
+      path = fakePrefix(s0.real);
+      path.insert(path.end(), s0.chain.begin(), s0.chain.end());
+    }
     stats.srcCost = s0.cost;
     stats.srcEnd = path.size() - 1;
     static bool const debug = [] {
@@ -1107,14 +1353,90 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
                   count[l], claimed[l], actual[l], claimed[l] - actual[l]);
     stats.tgtCost = t0.cost;
     stats.tgtBegin = path.size() - 1;
-    path.insert(path.end(), t0.chain.begin(), t0.chain.end());
-    auto const suf = fakeSuffix(t0.real);
-    path.insert(path.end(), suf.begin(), suf.end());
+    if (!t0.leap)
+    {
+      path.insert(path.end(), t0.chain.begin(), t0.chain.end());
+      auto const suf = fakeSuffix(t0.real);
+      path.insert(path.end(), suf.begin(), suf.end());
+    }
+    if (s0.leap || t0.leap)
+    {
+      // An end in a map without overlay. The border crossing the search chose rests on an estimate, so
+      // the route keeps the overlay part only up to a handover point a good distance before that crossing
+      // (after it, at the start), and CoMaps' own search across maps finds the rest exactly: it may pick
+      // another crossing, or leave and re-enter the map. Without a handover point (the overlay part is
+      // short), CoMaps' search does the whole route.
+      constexpr double kHandoverM = 30000;
+      stats.srcEnd = stats.tgtBegin = 0;
+      auto usable = [&](Segment const & sg) {
+        return !routing::IndexGraphStarter::IsFakeSegment(sg) && I.MapOfSegment(sg) != kNone;
+      };
+      auto whole = [&]() {
+        path.assign(1, starter.GetStartSegment());
+        return I.RefineInMap(starter.GetStartSegment(), starter.GetFinishSegment(), path, nullptr,
+                             true /* anyMap */);
+      };
+      bool done = false;
+      if (t0.leap)
+      {
+        ms::LatLon const at = starter.GetPoint(t0.real, true);
+        size_t j = path.size();
+        for (size_t k = path.size(); k-- > (s0.leap ? 2 : 0);)
+          if (usable(path[k]) && ms::DistanceOnEarth(starter.GetPoint(path[k], true), at) >= kHandoverM)
+          {
+            j = k;
+            break;
+          }
+        if (j == path.size())
+        {
+          if (!whole())
+            return finish(Result::NoRoute, "");
+          done = true;
+        }
+        else
+        {
+          path.resize(j + 1);
+          if (!I.RefineInMap(path[j], starter.GetFinishSegment(), path, nullptr, true /* anyMap */))
+            return finish(Result::NotApplicable, "no way into the finish");
+        }
+      }
+      if (s0.leap && !done)
+      {
+        ms::LatLon const at = starter.GetPoint(s0.real, true);
+        size_t i = 0;
+        for (size_t k = 2; k < path.size(); ++k)
+          if (usable(path[k]) && ms::DistanceOnEarth(starter.GetPoint(path[k], true), at) >= kHandoverM)
+          {
+            i = k;
+            break;
+          }
+        if (i == 0)
+        {
+          if (!whole())
+            return finish(Result::NoRoute, "");
+        }
+        else
+        {
+          std::vector<Segment> np{starter.GetStartSegment()};
+          if (!I.RefineInMap(starter.GetStartSegment(), path[i], np, nullptr, true /* anyMap */))
+            return finish(Result::NotApplicable, "no way out of the start map");
+          np.insert(np.end(), path.begin() + i + 1, path.end());
+          path = std::move(np);
+        }
+      }
+    }
   }
   for (auto const & s : path)
     if (!routing::IndexGraphStarter::IsFakeSegment(s))
       used.insert(s.GetMwmId());
   stats.mapsUsed = used.size();
+  // Maps the route crosses without an overlay: that part of the route is approximate.
+  for (auto const id : used)
+  {
+    auto it = I.mapIdx.find(id);
+    if (it == I.mapIdx.end() || !I.Ovl(it->second))
+      stats.approxMaps.push_back(id);
+  }
   lap(stats.unpackMs);
   return finish(Result::Ok, "");
 }

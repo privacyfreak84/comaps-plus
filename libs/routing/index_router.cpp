@@ -360,6 +360,7 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
     SCOPE_GUARD(featureRoadGraphClear, [this] { ClearState(); });
     m_plusLastWasAdjusted = false;
     m_plusNormalReason.clear();
+    m_plusApproxMaps.clear();
     base::Timer plusTimer;
     auto const publishReport = [this, &plusTimer]()
     {
@@ -377,11 +378,20 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
         r.engine = plus_overlay::EngineReport::Engine::Normal;
         r.reason = m_plusNormalReason;
       }
+      else if (!m_plusApproxMaps.empty())
+      {
+        r.engine = plus_overlay::EngineReport::Engine::Approximate;
+        r.approxMaps = m_plusApproxMaps;
+      }
       plus_overlay::SetLastEngineReport(r);
     };
     SCOPE_GUARD(plusReport, publishReport);
 
-    if (adjustToPrevRoute && m_lastRoute && m_lastFakeEdges && finalPoint == m_lastRoute->GetFinish())
+    // Comaps++: car reroutes are full overlay routes (best route from the new position, 0.3-3 s); CoMaps'
+    // rejoin search is kept for the other vehicle types and when the overlay is switched off.
+    bool const plusSkipsAdjust = m_vehicleType == VehicleType::Car && !PlusOverlayDisabled();
+    if (adjustToPrevRoute && !plusSkipsAdjust && m_lastRoute && m_lastFakeEdges &&
+        finalPoint == m_lastRoute->GetFinish())
     {
       double const distanceToRoute = m_lastRoute->CalcDistance(startPoint);
       double const distanceToFinish = mercator::DistanceOnEarth(startPoint, finalPoint);
@@ -711,7 +721,7 @@ RouterResultCode IndexRouter::CalculateSubroute(Checkpoints const & checkpoints,
 
   if (!guidesActive)
   {
-    auto const code = TryPlusOverlay(starter, subroute);
+    auto const code = TryPlusOverlay(starter, delegate, subroute);
     if (code == RouterResultCode::NoError || code == RouterResultCode::RouteNotFound)
       return code;
   }
@@ -738,7 +748,19 @@ RouterResultCode IndexRouter::CalculateSubroute(Checkpoints const & checkpoints,
   UNREACHABLE();
 }
 
-RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & subroute)
+// static
+bool IndexRouter::PlusOverlayDisabled()
+{
+  static bool const disabled = []
+  {
+    char const * e = std::getenv("COMAPS_PLUS_OVERLAY");
+    return e && std::string(e) == "0";
+  }();
+  return disabled;
+}
+
+RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, RouterDelegate const & delegate,
+                                             vector<Segment> & subroute)
 {
   auto const notApplicable = [this](std::string const & why)
   {
@@ -748,12 +770,7 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector
   };
   if (m_vehicleType != VehicleType::Car)
     return RouterResultCode::NeedMoreMaps;
-  static bool const disabled = []
-  {
-    char const * e = std::getenv("COMAPS_PLUS_OVERLAY");
-    return e && std::string(e) == "0";
-  }();
-  if (disabled)
+  if (PlusOverlayDisabled())
     return notApplicable("overlay switched off (COMAPS_PLUS_OVERLAY=0)");
   // With avoid options each map also needs its cliques for exactly those options (built in the
   // background next to the base file); a map without them counts as having no overlay.
@@ -786,6 +803,31 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector
   auto & graph = starter.GetGraph();
   auto const prevMode = graph.GetMode();
   graph.SetMode(WorldGraphMode::NoLeaps);
+  // Legs inside maps whose overlay isn't built yet: CoMaps' joint search within the map (then across
+  // maps if that fails), as CoMaps does for the legs of its long-route mode.
+  RoutesCalculator calculator(starter, delegate);
+  auto const legProgress = make_shared<AStarProgress>();
+  m_plusOverlay->SetLegRefiner(
+      [&](Segment const & from, Segment const & to, bool anyMap, vector<Segment> & leg, double & weight)
+  {
+    RoutingResultT const * res = nullptr;
+    if (anyMap)
+    {
+      graph.SetMode(WorldGraphMode::Joints);
+      res = calculator.Calc(from, to, legProgress, 0.0);
+    }
+    else
+    {
+      res = calculator.Calc2Times(from, to, legProgress, 0.0);
+    }
+    graph.SetMode(WorldGraphMode::NoLeaps);
+    if (!res)
+      return false;
+    leg = res->m_path;
+    weight = res->m_distance.GetIntegratedWeight();
+    return true;
+  });
+  SCOPE_GUARD(dropRefiner, [this] { m_plusOverlay->SetLegRefiner({}); });
   plus_overlay::OverlayRouter::Stats stats;
   plus_overlay::OverlayRouter::Result result;
   {
@@ -799,6 +841,14 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector
     LOG(LINFO, ("Comaps++ overlay route (avoid options", avoidMask, "):", stats.ms, "ms,", stats.settled, "settled,", stats.baseScans,
                 "edge lists,", stats.mapsUsed, "maps, weight", stats.weight, "; phases ms: ends", stats.fakeMs, "seeds",
                 stats.seedMs, "search", stats.searchMs, "unpack", stats.unpackMs));
+    for (auto const id : stats.approxMaps)
+    {
+      auto const name = m_numMwmIds->GetFile(id).GetName();
+      if (std::find(m_plusApproxMaps.begin(), m_plusApproxMaps.end(), name) == m_plusApproxMaps.end())
+        m_plusApproxMaps.push_back(name);
+    }
+    if (!stats.approxMaps.empty())
+      LOG(LINFO, ("Comaps++ overlay: approximate through", m_plusApproxMaps, "(overlay not built yet)"));
     return RouterResultCode::NoError;
   }
   subroute.clear();

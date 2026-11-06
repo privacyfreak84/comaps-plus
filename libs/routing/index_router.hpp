@@ -142,9 +142,13 @@ private:
   // every map the search reaches has one; false means "use the normal search".
   // NoError: answered; RouteNotFound: the overlay is complete and there is no route; any other code
   // (NeedMoreMaps used as "not applicable"): use the normal search.
-  RouterResultCode TryPlusOverlay(IndexGraphStarter & starter, std::vector<Segment> & subroute);
+  RouterResultCode TryPlusOverlay(IndexGraphStarter & starter, RouterDelegate const & delegate,
+                                  std::vector<Segment> & subroute);
+  static bool PlusOverlayDisabled();
   // Why the normal search ran for some leg of the route being calculated (empty: it didn't).
   std::string m_plusNormalReason;
+  // Maps the route crossed approximately (no overlay file yet).
+  std::vector<std::string> m_plusApproxMaps;
 public:
   // Comaps++ tests: the last CalculateRoute rejoined the previous route (AdjustRoute) instead of a new search.
   bool PlusLastWasAdjusted() const { return m_plusLastWasAdjusted; }
