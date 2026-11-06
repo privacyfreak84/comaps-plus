@@ -558,6 +558,130 @@ int RunRuntime(Multi & m)
     }
     bool const same = bad == 0 && std::abs(w - st.weight) <= 1e-3 * std::max(1.0, st.weight);
     consistent += same;
+    if (!FLAGS_router_in.empty())
+    {
+      // The other router's path for this route (real segments only): weight of its real part and of the
+      // overlay path's real part, both from CoMaps' edges.
+      std::ifstream rin(FLAGS_router_in);
+      std::string line;
+      while (std::getline(rin, line))
+      {
+        std::istringstream ls(line);
+        std::string name, tok;
+        int okFlag;
+        double secs, eta;
+        size_t n;
+        if (!(ls >> name >> okFlag >> secs >> eta >> n) || name != r.name)
+          continue;
+        std::vector<routing::Segment> other;
+        while (ls >> tok)
+        {
+          unsigned mw, ft, si, fw;
+          if (std::sscanf(tok.c_str(), "%u:%u:%u:%u", &mw, &ft, &si, &fw) == 4)
+            other.emplace_back(static_cast<routing::NumMwmId>(mw), ft, si, fw != 0);
+        }
+        auto realWeight = [&](std::vector<routing::Segment> const & segs, size_t & gaps)
+        {
+          double sum = 0;
+          gaps = 0;
+          for (size_t k = 1; k < segs.size(); ++k)
+          {
+            routing::Segment from = segs[k - 1];
+            if (from.GetMwmId() != segs[k].GetMwmId())
+            {
+              routing::Segment twin;
+              if (ovr.TwinOfExit(from, twin))
+                from = twin;
+            }
+            ies.clear();
+            world.GetIndexGraph(from.GetMwmId()).GetEdgeList(from, true, true, ies);
+            double best = kInf;
+            for (auto const & e : ies)
+              if (e.GetTarget() == segs[k])
+                best = std::min(best, e.GetWeight().GetIntegratedWeight());
+            if (best >= kInf)
+              ++gaps;
+            else
+              sum += best;
+          }
+          return sum;
+        };
+        // Fake parts with the starter's own edges: start -> first real segment, last real -> finish.
+        auto fakeCost = [&](routing::Segment const & from, routing::Segment const & to, bool toReal)
+        {
+          std::map<routing::Segment, double> dist{{from, 0}};
+          std::priority_queue<std::pair<double, routing::Segment>, std::vector<std::pair<double, routing::Segment>>,
+                              std::greater<>> q;
+          q.push({0, from});
+          Parents pp;
+          starter.SetAStarParents(true, pp);
+          double res = kInf;
+          while (!q.empty())
+          {
+            auto [d, x] = q.top();
+            q.pop();
+            if (d > dist[x])
+              continue;
+            if (x == to)
+            {
+              res = d;
+              break;
+            }
+            if (x != from && !routing::IndexGraphStarter::IsFakeSegment(x))
+              continue;  // only through fake vertices
+            es.clear();
+            routing::astar::VertexData<routing::Segment, routing::RouteWeight> const vd(x, routing::RouteWeight(0));
+            starter.GetOutgoingEdgesList(vd, es);
+            for (auto const & e : es)
+            {
+              auto const & t = e.GetTarget();
+              if (!routing::IndexGraphStarter::IsFakeSegment(t) && !(toReal && t == to))
+                continue;
+              double const nd = d + e.GetWeight().GetIntegratedWeight();
+              auto it = dist.find(t);
+              if (it == dist.end() || nd < it->second)
+              {
+                dist[t] = nd;
+                q.push({nd, t});
+              }
+            }
+          }
+          starter.DropAStarParents();
+          return res;
+        };
+        if (other.size() > 2)
+        {
+          // The route's first/last real segments may be the projection segments, which the starter holds
+          // as fake partial segments: then the path joins real segments one step later/earlier.
+          double fs = fakeCost(starter.GetStartSegment(), other.front(), true);
+          if (fs >= kInf)
+          {
+            fs = fakeCost(starter.GetStartSegment(), other[1], true);
+            other.erase(other.begin());
+          }
+          double ff = fakeCost(other.back(), starter.GetFinishSegment(), false);
+          if (ff >= kInf && other.size() > 1)
+          {
+            ff = fakeCost(other[other.size() - 2], starter.GetFinishSegment(), false);
+            other.pop_back();
+          }
+          size_t gg;
+          double const rp = realWeight(other, gg);
+          std::cout << "\n    other router on this starter: start part " << fs << " + real part " << rp
+                    << " + finish part " << ff << " = " << fs + rp + ff << " (overlay " << st.weight << ")";
+        }
+        std::vector<routing::Segment> mine;
+        for (auto const & sg : path)
+          if (!routing::IndexGraphStarter::IsFakeSegment(sg))
+            mine.push_back(sg);
+        size_t g1, g2;
+        double const wo = realWeight(other, g1), wm = realWeight(mine, g2);
+        std::cout << "\n    other router: " << other.size() << " real segments, real-part weight " << wo << " (" << g1
+                  << " gaps), first " << DebugPrint(other.front()) << " last " << DebugPrint(other.back())
+                  << "\n    overlay:      " << mine.size() << " real segments, real-part weight " << wm << " (" << g2
+                  << " gaps), first " << DebugPrint(mine.front()) << " last " << DebugPrint(mine.back()) << "\n";
+      }
+    }
     std::cout << "overlay " << Hms(st.weight) << " (" << st.weight << " s) in " << st.ms << " ms, " << st.settled
               << " settled, " << st.baseScans << " edge lists, " << path.size() << " segments, " << st.mapsUsed
               << " maps | path re-scored " << w << " s"
