@@ -13,6 +13,7 @@ import androidx.annotation.Nullable;
 import androidx.core.app.ServiceCompat;
 import androidx.core.content.ContextCompat;
 import app.organicmaps.MwmApplication;
+import app.organicmaps.background.PlusOverlayWork;
 import app.organicmaps.sdk.downloader.CountryItem;
 import app.organicmaps.sdk.downloader.MapManager;
 import app.organicmaps.sdk.util.log.Logger;
@@ -85,6 +86,8 @@ public class DownloaderService extends Service implements MapManager.StorageCall
 
     if (!isDownloading)
     {
+      // Comaps++: prepare fast routing for the maps just downloaded or updated.
+      PlusOverlayWork.enqueue(this);
       if (hasFailed)
       {
         // Detach service from the notification to keep after the service is stopped.

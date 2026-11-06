@@ -42,6 +42,7 @@ set(SRC
   app/organicmaps/sdk/routing/RouteStepInfo.hpp
   app/organicmaps/sdk/routing/RoutingInfo.hpp
   app/organicmaps/sdk/routing/RoutingOptions.cpp
+  app/organicmaps/sdk/routing/PlusOverlay.cpp
   app/organicmaps/sdk/routing/TransitRouteInfo.hpp
   app/organicmaps/sdk/routing/TransitStepInfo.hpp
   app/organicmaps/sdk/ChoosePositionMode.cpp

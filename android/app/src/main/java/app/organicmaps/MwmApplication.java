@@ -16,6 +16,7 @@ import androidx.lifecycle.LifecycleOwner;
 import androidx.lifecycle.ProcessLifecycleOwner;
 import androidx.preference.PreferenceManager;
 import app.organicmaps.background.OsmUploadWork;
+import app.organicmaps.background.PlusOverlayWork;
 import app.organicmaps.downloader.DownloaderNotifier;
 import app.organicmaps.location.LocationProviderFactoryImpl;
 import app.organicmaps.location.TrackRecordingService;
@@ -140,6 +141,7 @@ public class MwmApplication extends Application implements Application.ActivityL
     DownloaderNotifier.createNotificationChannel(this);
     NavigationService.createNotificationChannel(this);
     TrackRecordingService.createNotificationChannel(this);
+    PlusOverlayWork.createNotificationChannel(this);
 
     registerActivityLifecycleCallbacks(this);
     mDisplayManager = new DisplayManager();
@@ -151,6 +153,8 @@ public class MwmApplication extends Application implements Application.ActivityL
       ThemeSwitcher.INSTANCE.initialize(this);
       ThemeSwitcher.INSTANCE.restart(false);
       ProcessLifecycleOwner.get().getLifecycle().addObserver(mProcessLifecycleObserver);
+      // Comaps++: build overlay files for maps that don't have a current one (missed or interrupted runs).
+      PlusOverlayWork.enqueue(this);
       onComplete.run();
     });
   }
