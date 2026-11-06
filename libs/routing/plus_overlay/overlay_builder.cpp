@@ -23,6 +23,8 @@
 #include "base/file_name_utils.hpp"
 #include "base/logging.hpp"
 
+#include <malloc.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -32,6 +34,20 @@
 #include <map>
 #include <sstream>
 #include <tuple>
+
+namespace
+{
+// Hands memory freed by a finished stage back to the system, so the phone counts only what the build
+// still uses (the allocator otherwise keeps it, and the app looks bigger than it is).
+void ReleaseFreedMemory()
+{
+#if defined(__GLIBC__)
+  malloc_trim(0);
+#elif defined(M_PURGE)
+  mallopt(M_PURGE, 0);
+#endif
+}
+}  // namespace
 
 namespace plus_overlay
 {
@@ -799,6 +815,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     LeanExpandViaWay(lg, viaWay, rep);
     std::vector<uint8_t>().swap(lg.interior);
     mg.reset();  // the router keeps its own IndexGraph; this one was only needed for extraction
+    ReleaseFreedMemory();
     Graph & g = lg.g;
     double const extractSec = Since(t0);
     {
@@ -859,6 +876,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       std::vector<float>().swap(g.lat);
       std::vector<float>().swap(g.lon);
     }
+    ReleaseFreedMemory();
 
     rep.Progress(0.85, "computing shortcuts");
     Overlay ov;
