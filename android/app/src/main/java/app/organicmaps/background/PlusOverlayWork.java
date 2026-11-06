@@ -6,9 +6,13 @@ import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 import android.app.Notification;
 import android.app.PendingIntent;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.core.app.NotificationChannelCompat;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
@@ -25,7 +29,10 @@ import app.organicmaps.R;
 import app.organicmaps.sdk.downloader.MapManager;
 import app.organicmaps.sdk.routing.PlusOverlay;
 import app.organicmaps.sdk.util.log.Logger;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -34,8 +41,8 @@ import java.util.concurrent.TimeUnit;
 /**
  * Comaps++: builds the overlay files for fast car routing on the phone, one map at a time, after a map
  * download or update (and at app start for anything missed). Shows a progress notification with a
- * Cancel button; cancelling stops the running build and leaves the router on the normal search for
- * that map until the next run.
+ * Cancel button; cancelling stops the running build. Until a map's files are built, routes cross that
+ * map on estimates (see PlusRouteStatus); maps a route needs are built first.
  */
 public class PlusOverlayWork extends Worker
 {
@@ -45,6 +52,66 @@ public class PlusOverlayWork extends Worker
   private static final int PROGRESS_NOTIFICATION_ID = 7301;
   private static final int RESULT_NOTIFICATION_ID = 7302;
   private static final int BUILD_THREADS = 2;
+  // A build the app didn't live to finish (the system killed it, e.g. for memory): retried with one
+  // thread (less memory), and given up after this many attempts until the map changes.
+  private static final String KEY_BUILDING = "plus_overlay_building";
+  private static final String KEY_KILLED_PREFIX = "plus_overlay_killed_";
+  private static final int MAX_KILLED = 3;
+
+  /** Called on the main thread when a map's fast-route files are ready. */
+  public interface MapReadyListener
+  {
+    void onMapReady(@NonNull String countryId);
+  }
+
+  // Maps a route crossed on estimates: built before the others.
+  private static final Set<String> sPriority = Collections.synchronizedSet(new LinkedHashSet<>());
+  @Nullable
+  private static volatile String sBuilding;
+  private static volatile boolean sPreempted;
+  @Nullable
+  private static MapReadyListener sMapReady;
+
+  public static void setMapReadyListener(@Nullable MapReadyListener listener)
+  {
+    sMapReady = listener;
+  }
+
+  /** The map being built now, or null. */
+  @Nullable
+  public static String building()
+  {
+    return sBuilding;
+  }
+
+  /** After map downloads or updates: builds what they need, and tries maps given up on again. */
+  public static void onMapsChanged(@NonNull Context context)
+  {
+    final SharedPreferences prefs = MwmApplication.prefs(context);
+    final SharedPreferences.Editor edit = prefs.edit();
+    for (String key : prefs.getAll().keySet())
+      if (key.startsWith(KEY_KILLED_PREFIX))
+        edit.remove(key);
+    edit.apply();
+    enqueue(context);
+  }
+
+  /**
+   * Builds these maps' files before the others. A build of another map that isn't half done yet is
+   * stopped and done later.
+   */
+  public static void prioritize(@NonNull Context context, @NonNull Collection<String> countryIds)
+  {
+    sPriority.addAll(countryIds);
+    final String now = sBuilding;
+    if (now != null && !sPriority.contains(now) && PlusOverlay.nativeProgress() < 0.5)
+    {
+      Logger.i(TAG, "Pausing the build for " + now + " for a map a route needs");
+      sPreempted = true;
+      PlusOverlay.nativeCancel();
+    }
+    enqueue(context);
+  }
 
   @NonNull
   private final Context mContext;
@@ -93,6 +160,14 @@ public class PlusOverlayWork extends Worker
     }
 
     PlusOverlay.nativeDeleteOrphans(PlusOverlaySettings.isKeepAll(mContext));
+    final SharedPreferences prefs = MwmApplication.prefs(mContext);
+    final String killed = prefs.getString(KEY_BUILDING, null);
+    if (killed != null)
+    {
+      final int n = prefs.getInt(KEY_KILLED_PREFIX + killed, 0) + 1;
+      Logger.w(TAG, "The build for " + killed + " didn't finish last time (" + n + ")");
+      prefs.edit().remove(KEY_BUILDING).putInt(KEY_KILLED_PREFIX + killed, n).apply();
+    }
     if (mapsToBuild().length == 0)
       return Result.success();
 
@@ -105,14 +180,18 @@ public class PlusOverlayWork extends Worker
       while (!isStopped())
       {
         String next = null;
-        for (String id : mapsToBuild())
+        final String[] todo = mapsToBuild();
+        for (String id : todo)
         {
-          if (!attempted.contains(id))
+          if (!attempted.contains(id) && sPriority.contains(id) && killedCount(id) < MAX_KILLED)
           {
             next = id;
             break;
           }
         }
+        for (int i = 0; next == null && i < todo.length; ++i)
+          if (!attempted.contains(todo[i]) && killedCount(todo[i]) < MAX_KILLED)
+            next = todo[i];
         if (next == null)
           break;
         attempted.add(next);
@@ -142,14 +221,37 @@ public class PlusOverlayWork extends Worker
           updateProgress(name, PlusOverlay.nativeProgress(), PlusOverlay.nativeStage(), building != 0);
         }, 1, 1, TimeUnit.SECONDS);
 
-        Logger.i(TAG, "Building the fast-routing overlay for " + countryId);
-        final int r = PlusOverlay.nativeBuild(countryId, BUILD_THREADS);
+        final int threads = killedCount(countryId) > 0 ? 1 : BUILD_THREADS;
+        Logger.i(TAG, "Building the fast-routing overlay for " + countryId + " with " + threads + " threads");
+        prefs.edit().putString(KEY_BUILDING, countryId).commit();
+        sBuilding = countryId;
+        final int r = PlusOverlay.nativeBuild(countryId, threads);
+        sBuilding = null;
+        final boolean preempted = sPreempted;
+        sPreempted = false;
+        prefs.edit().remove(KEY_BUILDING).apply();
         tick.cancel(false);
         Logger.i(TAG, "Overlay build for " + countryId + ": " + r);
         if (r == PlusOverlay.BUILD_CANCELLED)
+        {
+          if (preempted && !isStopped())
+          {
+            // Paused for a map a route needs: that one next, this one again later.
+            attempted.remove(countryId);
+            continue;
+          }
           break;
-        if (r == PlusOverlay.BUILD_OK)
-          ++built;
+        }
+        sPriority.remove(countryId);
+        if (r == PlusOverlay.BUILD_OK || r == PlusOverlay.BUILD_UP_TO_DATE)
+        {
+          prefs.edit().remove(KEY_KILLED_PREFIX + countryId).apply();
+          if (r == PlusOverlay.BUILD_OK)
+            ++built;
+          final MapReadyListener listener = sMapReady;
+          if (listener != null)
+            new Handler(Looper.getMainLooper()).post(() -> listener.onMapReady(countryId));
+        }
         else if (r == PlusOverlay.BUILD_FAILED)
           ++failed;
       }
@@ -162,6 +264,11 @@ public class PlusOverlayWork extends Worker
     if (!isStopped() && (built > 0 || failed > 0))
       notifyResult(built, failed);
     return Result.success();
+  }
+
+  private int killedCount(@NonNull String countryId)
+  {
+    return MwmApplication.prefs(mContext).getInt(KEY_KILLED_PREFIX + countryId, 0);
   }
 
   // Maps that need building, the one you are in and the nearest first.
@@ -195,6 +302,9 @@ public class PlusOverlayWork extends Worker
                                                          : R.string.plus_overlay_building, name))
         .setContentText(stage.isEmpty() ? mContext.getString(R.string.plus_overlay_building_text)
                                         : stage + " · " + percent + "%")
+        .setSubText(sBuilding != null && PlusRouteStatus.isOnRoute(sBuilding)
+                        ? mContext.getString(R.string.plus_overlay_for_route)
+                        : null)
         .setProgress(100, percent, progress <= 0)
         .setOngoing(true)
         .setOnlyAlertOnce(true)

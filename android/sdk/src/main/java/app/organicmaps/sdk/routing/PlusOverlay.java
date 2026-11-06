@@ -52,9 +52,15 @@ public final class PlusOverlay
    */
   public static native int nativeDeleteOrphans(boolean keepAllAvoid);
 
-  /** {engine, seconds, reason} of the last car route; engine: "none", "fast", "rejoin" or "normal". */
+  /**
+   * {engine, seconds, reason, map ids...} of the last car route; engine: "none", "fast", "rejoin", "normal"
+   * or "approximate" (fast, but crossing the listed maps, whose files aren't built yet, on estimates).
+   */
   @NonNull
   public static native String[] nativeLastEngine();
+
+  /** Builds the current route again (from the current position when navigating); main thread only. */
+  public static native void nativeRefreshRoute();
 
   /** Bytes used by all overlay files. */
   public static native long nativeStorageBytes();

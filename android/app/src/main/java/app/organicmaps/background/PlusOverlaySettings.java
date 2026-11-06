@@ -50,6 +50,7 @@ public final class PlusOverlaySettings
     case "fast": text = context.getString(R.string.plus_engine_fast, secs); break;
     case "rejoin": text = context.getString(R.string.plus_engine_rejoin, secs); break;
     case "normal": text = context.getString(R.string.plus_engine_normal, secs, r[2]); break;
+    case "approximate": text = context.getString(R.string.plus_engine_approximate, secs); break;
     default: return;
     }
     android.widget.Toast.makeText(context, text, android.widget.Toast.LENGTH_LONG).show();
@@ -79,9 +80,14 @@ public final class PlusOverlaySettings
   @NonNull
   public static String summary(@NonNull Context context)
   {
-    return context.getString(isKeepAll(context) ? R.string.plus_overlay_storage_pref_all
-                                                : R.string.plus_overlay_storage_pref_current,
-                             usedSpace(context));
+    final String storage = context.getString(isKeepAll(context) ? R.string.plus_overlay_storage_pref_all
+                                                                 : R.string.plus_overlay_storage_pref_current,
+                                             usedSpace(context));
+    final int maps = MapManager.nativeGetDownloadedCount();
+    if (maps <= 0)
+      return storage;
+    final int ready = Math.max(0, maps - PlusOverlay.nativeMapsToBuild(false, 0, 0).length);
+    return context.getString(R.string.plus_overlay_ready_count, ready, maps) + "\n" + storage;
   }
 
   /** Once, when there is at least one downloaded map (before that the question means nothing). */

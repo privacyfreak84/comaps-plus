@@ -23,4 +23,9 @@
     <string name="plus_engine_fast" translatable="false">Fast route · %1$s s</string>
     <string name="plus_engine_rejoin" translatable="false">Back onto your route · %1$s s</string>
     <string name="plus_engine_normal" translatable="false">Normal router · %1$s s · %2$s</string>
+    <string name="plus_engine_approximate" translatable="false">Fast route, estimated through maps not prepared yet · %1$s s</string>
+    <string name="plus_route_approximate" translatable="false">Fast routes for %s aren\'t ready yet, so this route may be a few minutes off. They\'re being prepared now, and the route will update by itself when they\'re done.</string>
+    <string name="plus_route_refreshing" translatable="false">Fast routes for %s are ready: updating your route</string>
+    <string name="plus_overlay_for_route" translatable="false">Your route will update when this is done</string>
+    <string name="plus_overlay_ready_count" translatable="false">Ready for %1$d of %2$d downloaded maps</string>
 </resources>

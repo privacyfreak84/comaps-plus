@@ -280,9 +280,18 @@ JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nati
   case plus_overlay::EngineReport::Engine::Overlay: engine = "fast"; break;
   case plus_overlay::EngineReport::Engine::Rejoin: engine = "rejoin"; break;
   case plus_overlay::EngineReport::Engine::Normal: engine = "normal"; break;
+  case plus_overlay::EngineReport::Engine::Approximate: engine = "approximate"; break;
   }
-  std::vector<std::string> const out{engine, std::to_string(r.seconds), r.reason};
+  std::vector<std::string> out{engine, std::to_string(r.seconds), r.reason};
+  out.insert(out.end(), r.approxMaps.begin(), r.approxMaps.end());
   return jni::ToJavaStringArray(env, out);
+}
+
+JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeRefreshRoute(JNIEnv *, jclass)
+{
+  // Builds the current route again from the current position (navigation) or its start (planning),
+  // as on a traffic update; the new route replaces the old one only if it is found.
+  frm()->GetRoutingManager().RoutingSession().RebuildRouteOnTrafficUpdate();
 }
 
 JNIEXPORT jlong JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeStorageBytes(JNIEnv *, jclass)

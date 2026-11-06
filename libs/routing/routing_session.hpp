@@ -63,6 +63,10 @@ public:
                     NeedMoreMapsCallback const & needMoreMapsCallback, RemoveRouteCallback const & removeRouteCallback,
                     uint32_t timeoutSec, SessionState routeRebuildingState, bool adjustToPrevRoute);
 
+  /// Builds the current route again, from the current position when following it (also used by
+  /// Comaps++ once a map's fast-route data is ready).
+  void RebuildRouteOnTrafficUpdate();
+
   m2::PointD GetStartPoint() const;
   m2::PointD GetEndPoint() const;
 
@@ -276,7 +280,6 @@ private:
   void AssignRoute(std::shared_ptr<Route> const & route, RouterResultCode e);
   /// RemoveRoute() removes m_route and resets route attributes (m_lastDistance, m_moveAwayCounter).
   void RemoveRoute();
-  void RebuildRouteOnTrafficUpdate();
 
   void PassCheckpoints();
 

@@ -87,7 +87,7 @@ public class DownloaderService extends Service implements MapManager.StorageCall
     if (!isDownloading)
     {
       // Comaps++: prepare fast routing for the maps just downloaded or updated.
-      PlusOverlayWork.enqueue(this);
+      PlusOverlayWork.onMapsChanged(this);
       if (hasFailed)
       {
         // Detach service from the notification to keep after the service is stopped.
