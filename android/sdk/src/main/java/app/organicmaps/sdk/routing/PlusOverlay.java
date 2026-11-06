@@ -17,17 +17,20 @@ public final class PlusOverlay
   private PlusOverlay() {}
 
   /**
-   * Downloaded maps whose overlay file is missing or stale (map updated, or built by another version), or
-   * that lack the overlay for the current avoid options.
+   * Downloaded maps whose base overlay file is missing or stale (map updated, or built by another
+   * version). Files for avoid options are built only for maps a route needs.
    */
   @NonNull
   public static native String[] nativeMapsToBuild(boolean hasPosition, double lat, double lon);
 
+  /** Whether a map lacks its base file or the file for the current avoid options. */
+  public static native boolean nativeNeedsBuild(@NonNull String countryId);
+
   /**
-   * Builds what one map lacks (base overlay file, then the one for the current avoid options); blocks for
-   * minutes. Returns one of the BUILD_* codes.
+   * Builds what one map lacks: the base overlay file, then, with {@code withAvoid}, the one for the
+   * current avoid options; blocks for minutes. Returns one of the BUILD_* codes.
    */
-  public static native int nativeBuild(@NonNull String countryId, int threads);
+  public static native int nativeBuild(@NonNull String countryId, int threads, boolean withAvoid);
 
   /** Stops a running build soon (it then returns BUILD_CANCELLED and writes nothing). */
   public static native void nativeCancel();

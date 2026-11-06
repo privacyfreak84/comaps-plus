@@ -8,9 +8,9 @@
     <string name="plus_overlay_done" translatable="false">Fast car routes ready for %d new or updated maps</string>
     <string name="plus_overlay_failed" translatable="false">Fast routes couldn\'t be prepared for %d maps; routing uses the normal search for them</string>
     <string name="plus_overlay_storage_title" translatable="false">Fast routes and avoid settings</string>
-    <string name="plus_overlay_storage_intro" translatable="false">To calculate long car routes in seconds, the app prepares extra route data on your phone for each map you download. If you turn on avoid settings (tolls, motorways, ferries, dirt or paved roads), it prepares one more set of this data for that exact mix of settings.</string>
+    <string name="plus_overlay_storage_intro" translatable="false">To calculate long car routes in seconds, the app prepares extra route data on your phone for each map you download. If you turn on avoid settings (tolls, motorways, ferries, dirt or paved roads), it prepares one more set of this data for that exact mix of settings, only for the maps your routes go through.</string>
     <string name="plus_overlay_storage_current" translatable="false">Only for my current avoid settings (recommended)</string>
-    <string name="plus_overlay_storage_current_text" translatable="false">Uses the least space. When you switch to a different mix of avoid settings, the phone prepares it again in the background, a few minutes per map. Until it\'s ready, routes still work but take longer to calculate.</string>
+    <string name="plus_overlay_storage_current_text" translatable="false">Uses the least space. When you switch to a different mix of avoid settings, the phone prepares it again for the maps your route goes through, about a minute per map. Until then that route is a close estimate, and it updates by itself when the data is ready.</string>
     <string name="plus_overlay_storage_all" translatable="false">For every mix of avoid settings I use</string>
     <string name="plus_overlay_storage_all_text" translatable="false">Switching back to settings you\'ve used before is instant, but every mix takes extra space: up to about a third of the size of each map.</string>
     <string name="plus_overlay_storage_used" translatable="false">Fast-route data now uses %s.</string>

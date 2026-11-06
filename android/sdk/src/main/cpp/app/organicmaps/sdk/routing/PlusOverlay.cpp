@@ -112,19 +112,19 @@ bool NeedsAvoidBuild(DownloadedMap const & m, uint32_t avoidMask)
 
 extern "C"
 {
-// Downloaded maps whose overlay file is missing or was built for another map version / build parameters.
-// Most useful first: the map you are in, then the nearest ones (without a position: smallest first).
+// Downloaded maps whose base overlay file is missing or was built for another map version / build
+// parameters. Most useful first: the map you are in, then the nearest ones (without a position: smallest
+// first). Files for avoid options are built only for maps a route needs (nativeNeedsBuild/nativeBuild).
 JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeMapsToBuild(JNIEnv * env, jclass,
                                                                                          jboolean hasPosition,
                                                                                          jdouble lat, jdouble lon)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
-  uint32_t const mask = CurrentAvoidMask();
   m2::PointD const here = mercator::FromLatLon(lat, lon);
   std::vector<std::pair<double, std::string>> todo;
-  for (auto const & m : DownloadedMaps(mask))
+  for (auto const & m : DownloadedMaps(0))
   {
-    if (!NeedsBaseBuild(m) && !NeedsAvoidBuild(m, mask))
+    if (!NeedsBaseBuild(m))
       continue;
     double key = 0;
     if (hasPosition)
@@ -147,9 +147,24 @@ JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nati
   return jni::ToJavaStringArray(env, ids);
 }
 
+// Whether a downloaded map lacks its base file or the file for the current avoid options.
+JNIEXPORT jboolean JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeNeedsBuild(JNIEnv * env, jclass,
+                                                                                       jstring countryId)
+{
+  CHECK(g_framework, ("Framework isn't created yet!"));
+  std::string const id = jni::ToNativeString(env, countryId);
+  uint32_t const mask = CurrentAvoidMask();
+  for (auto const & m : DownloadedMaps(mask))
+    if (m.countryId == id)
+      return NeedsBaseBuild(m) || NeedsAvoidBuild(m, mask);
+  return false;
+}
+
+// Builds the base file if needed, then (with |withAvoid|) the file for the current avoid options.
 // 0: built, 1: cancelled, 2: failed, 3: the map isn't downloaded (any more), 4: already up to date.
 JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(JNIEnv * env, jclass,
-                                                                                jstring countryId, jint threads)
+                                                                                jstring countryId, jint threads,
+                                                                                jboolean withAvoid)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
   std::string const id = jni::ToNativeString(env, countryId);
@@ -161,7 +176,7 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(
   if (!map)
     return 3;
   bool const needBase = NeedsBaseBuild(*map);
-  if (!needBase && !NeedsAvoidBuild(*map, mask))
+  if (!needBase && !(withAvoid && NeedsAvoidBuild(*map, mask)))
     return 4;
 
   g_cancel = false;
@@ -205,7 +220,7 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(
       return code;
   }
   o.partitionTreePath.clear();
-  if (NeedsAvoidBuild(*map, mask))
+  if (withAvoid && NeedsAvoidBuild(*map, mask))
   {
     g_buildingAvoidMask = mask;
     g_progress = 0;

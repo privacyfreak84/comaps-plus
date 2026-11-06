@@ -42,7 +42,8 @@ import java.util.concurrent.TimeUnit;
  * Comaps++: builds the overlay files for fast car routing on the phone, one map at a time, after a map
  * download or update (and at app start for anything missed). Shows a progress notification with a
  * Cancel button; cancelling stops the running build. Until a map's files are built, routes cross that
- * map on estimates (see PlusRouteStatus); maps a route needs are built first.
+ * map on estimates (see PlusRouteStatus); maps a route needs are built first. Every downloaded map gets
+ * its base file; the file for the current avoid options is built only for maps a route needed it in.
  */
 public class PlusOverlayWork extends Worker
 {
@@ -168,7 +169,7 @@ public class PlusOverlayWork extends Worker
       Logger.w(TAG, "The build for " + killed + " didn't finish last time (" + n + ")");
       prefs.edit().remove(KEY_BUILDING).putInt(KEY_KILLED_PREFIX + killed, n).apply();
     }
-    if (mapsToBuild().length == 0)
+    if (nextMap(new HashSet<>()) == null)
       return Result.success();
 
     int built = 0;
@@ -179,19 +180,7 @@ public class PlusOverlayWork extends Worker
     {
       while (!isStopped())
       {
-        String next = null;
-        final String[] todo = mapsToBuild();
-        for (String id : todo)
-        {
-          if (!attempted.contains(id) && sPriority.contains(id) && killedCount(id) < MAX_KILLED)
-          {
-            next = id;
-            break;
-          }
-        }
-        for (int i = 0; next == null && i < todo.length; ++i)
-          if (!attempted.contains(todo[i]) && killedCount(todo[i]) < MAX_KILLED)
-            next = todo[i];
+        final String next = nextMap(attempted);
         if (next == null)
           break;
         attempted.add(next);
@@ -225,7 +214,7 @@ public class PlusOverlayWork extends Worker
         Logger.i(TAG, "Building the fast-routing overlay for " + countryId + " with " + threads + " threads");
         prefs.edit().putString(KEY_BUILDING, countryId).commit();
         sBuilding = countryId;
-        final int r = PlusOverlay.nativeBuild(countryId, threads);
+        final int r = PlusOverlay.nativeBuild(countryId, threads, sPriority.contains(countryId));
         sBuilding = null;
         final boolean preempted = sPreempted;
         sPreempted = false;
@@ -264,6 +253,28 @@ public class PlusOverlayWork extends Worker
     if (!isStopped() && (built > 0 || failed > 0))
       notifyResult(built, failed);
     return Result.success();
+  }
+
+  // Next map to build: those a route needs (base and avoid-option files), then the base files of the others.
+  @Nullable
+  private String nextMap(@NonNull Set<String> attempted)
+  {
+    final String[] priority;
+    synchronized (sPriority)
+    {
+      priority = sPriority.toArray(new String[0]);
+    }
+    for (String id : priority)
+    {
+      if (!PlusOverlay.nativeNeedsBuild(id))
+        sPriority.remove(id);
+      else if (!attempted.contains(id) && killedCount(id) < MAX_KILLED)
+        return id;
+    }
+    for (String id : mapsToBuild())
+      if (!attempted.contains(id) && killedCount(id) < MAX_KILLED)
+        return id;
+    return null;
   }
 
   private int killedCount(@NonNull String countryId)

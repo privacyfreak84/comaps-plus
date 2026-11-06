@@ -1368,9 +1368,9 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       // short), CoMaps' search does the whole route.
       constexpr double kHandoverM = 30000;
       stats.srcEnd = stats.tgtBegin = 0;
-      auto usable = [&](Segment const & sg) {
-        return !routing::IndexGraphStarter::IsFakeSegment(sg) && I.MapOfSegment(sg) != kNone;
-      };
+      // Any real road segment will do, also one inside a map crossed on estimates further away (its leg
+      // there was already found on real roads).
+      auto usable = [&](Segment const & sg) { return !routing::IndexGraphStarter::IsFakeSegment(sg); };
       auto whole = [&]() {
         path.assign(1, starter.GetStartSegment());
         return I.RefineInMap(starter.GetStartSegment(), starter.GetFinishSegment(), path, nullptr,
