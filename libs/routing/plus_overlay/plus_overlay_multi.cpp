@@ -34,6 +34,9 @@ DEFINE_string(routes_out, "", "overlay mode: write the routes used (named + rout
 DEFINE_string(router_out, "", "router mode: output file.");
 DEFINE_string(router_in, "", "overlay mode: router results to compare with.");
 DEFINE_string(overlay_dir, "", "runtime mode: directory with <map>.plusovl files.");
+DEFINE_bool(avoid_toll, false, "router mode: set the 'avoid toll roads' option for the run (restored after).");
+DEFINE_double(start_dir_deg, -1, "router mode: start direction (compass degrees, 0 = north); < 0: none.");
+DEFINE_bool(force_joints, true, "router mode: COMAPS_PLUS_FORCE_JOINTS=1 for the normal search.");
 
 namespace
 {
@@ -540,7 +543,15 @@ int RunRuntime(Multi & m)
 
 int RunRouter(Multi & m)
 {
-  setenv("COMAPS_PLUS_FORCE_JOINTS", "1", 1);
+  if (FLAGS_force_joints)
+    setenv("COMAPS_PLUS_FORCE_JOINTS", "1", 1);
+  auto const savedOptions = routing::RoutingOptions::LoadOptionsFromSettings(routing::VehicleType::Car);
+  if (FLAGS_avoid_toll)
+  {
+    routing::RoutingOptions o;
+    o.Add(routing::RoutingOptions::Toll);
+    routing::RoutingOptions::SaveOptionsToSettings(o);
+  }
   auto const routes = FLAGS_routes.empty() ? BuiltinRoutes() : ReadRoutes(FLAGS_routes);
   traffic::TrafficCache traffic;
   std::shared_ptr<storage::CountryInfoGetter> cig;
@@ -553,9 +564,31 @@ int RunRouter(Multi & m)
     routing::Route route("" /* router */, 0 /* routeId */);
     delegate.SetTimeout(3600);
     auto const t0 = Clock::now();
+    m2::PointD dir = m2::PointD::Zero();
+    if (FLAGS_start_dir_deg >= 0)
+    {
+      double const a = FLAGS_start_dir_deg * M_PI / 180.0;
+      dir = m2::PointD(std::sin(a), std::cos(a));  // mercator x east, y north
+    }
     auto const code = router->CalculateRoute(
-        routing::Checkpoints(mercator::FromLatLon(r.a), mercator::FromLatLon(r.b)), m2::PointD::Zero(),
+        routing::Checkpoints(mercator::FromLatLon(r.a), mercator::FromLatLon(r.b)), dir,
         false /* adjustToPrevRoute */, delegate, route);
+    if (code == routing::RouterResultCode::NoError && FLAGS_start_dir_deg >= 0)
+    {
+      // Bearing of the first 30 m of the route.
+      auto const & poly = route.GetPoly();
+      m2::PointD const p0 = poly.Front();
+      m2::PointD p1 = p0;
+      for (size_t i = 1; i < poly.GetSize(); ++i)
+      {
+        p1 = poly.GetPoint(i);
+        if (mercator::DistanceOnEarth(p0, p1) > 30)
+          break;
+      }
+      double const b = std::fmod(std::atan2(p1.x - p0.x, p1.y - p0.y) * 180.0 / M_PI + 360.0, 360.0);
+      std::cout << "  " << r.name << ": requested start direction " << FLAGS_start_dir_deg << " deg, route starts at "
+                << b << " deg\n";
+    }
     double const secs = Since(t0);
     std::vector<routing::Segment> segs;
     if (code == routing::RouterResultCode::NoError)
@@ -574,6 +607,7 @@ int RunRouter(Multi & m)
       out << " " << SegStr(s);
     out << "\n";
   }
+  routing::RoutingOptions::SaveOptionsToSettings(savedOptions);
   return 0;
 }
 

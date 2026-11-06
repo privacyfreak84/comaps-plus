@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <limits>
 #include <utility>
+#include <functional>
 #include <vector>
 
 namespace plus_overlay
@@ -61,6 +62,10 @@ struct PartitionParams
   double minBalance = 0.3;           // each half gets at least this share of the vertices
   int directions = 8;                // projection angles tried per bisection
   unsigned threads = 1;              // subtrees are split on this many threads
+  // Optional: polled during the split; once it returns true the partition stops early (incomplete).
+  std::function<bool()> cancelled;
+  // Optional: share of vertices placed in final cells so far, in [0, 1]. Called from worker threads.
+  std::function<void(double)> progress;
 };
 
 struct Partition
@@ -103,7 +108,11 @@ struct Overlay
 void BuildBoundaries(Graph const & g, Partition const & p, Overlay & ov,
                      std::vector<uint8_t> const * extraRole = nullptr);
 // Computes all clique matrices bottom-up. Returns seconds per level.
-std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov, unsigned threads);
+// |cancelled| (optional) is polled between cells; once true the remaining cells are skipped.
+// |progress| (optional) gets the done share in [0, 1], from worker threads.
+std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov, unsigned threads,
+                              std::function<bool()> const & cancelled = {},
+                              std::function<void(double)> const & progress = {});
 // Recomputes only the cells (at every level) that contain any of |touched|. Used after edge
 // weights change, e.g. avoided places. Returns number of cells recomputed.
 class Scratch;

@@ -38,9 +38,12 @@ public:
   explicit OverlayRouter(uint64_t paramsHash);
   ~OverlayRouter();
 
-  // Maps that may take part in a route (normally every downloaded map). Files are opened on first use.
+  // Maps that may take part in a route (normally every downloaded map). A map's file is opened only
+  // when a query first reaches that map. If the search reaches the border of a map with no usable file
+  // before the route is settled, FindPath returns NotApplicable (that map could be on the best route).
   void SetMaps(std::vector<OverlayMap> const & maps);
-  // Opens every map's file; false (and the maps without a usable file in |missing|) unless all are ready.
+  // Opens every map's file (tools, tests); false (and the maps without a usable file in |missing|)
+  // unless all are ready.
   bool AllMapsReady(std::vector<routing::NumMwmId> * missing = nullptr);
 
   enum class Result
@@ -62,6 +65,8 @@ public:
     double srcCost = 0, tgtCost = 0;
     size_t srcEnd = 0, tgtBegin = 0;
     std::string reason;  // why NotApplicable
+    bool hasMissingMap = false;        // NotApplicable because the route may pass through a map
+    routing::NumMwmId missingMap = 0;  // without a usable overlay file: this one
   };
 
   // |path| starts with starter.GetStartSegment() and ends with starter.GetFinishSegment().

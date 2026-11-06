@@ -218,6 +218,12 @@ public:
       }
     }
     if (m <= cs[0] || m < 2)
+    {
+      if (m_params.progress && m_g.n > 0)
+        m_params.progress(static_cast<double>(m_placed.fetch_add(m) + m) / m_g.n);
+      return;
+    }
+    if (m_params.cancelled && m_params.cancelled())
       return;
 
     uint32_t const stamp = m_stamp.fetch_add(1) + 1;
@@ -324,6 +330,7 @@ private:
   float m_k = 1;
   std::atomic<uint32_t> m_stamp{0};
   std::atomic<int> m_freeThreads{0};
+  std::atomic<uint64_t> m_placed{0};
   std::mutex m_cellMutex;
 };
 }  // namespace
@@ -572,7 +579,8 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
 }
 }  // namespace
 
-std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov, unsigned threads)
+std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov, unsigned threads,
+                              std::function<bool()> const & cancelled, std::function<void(double)> const & progress)
 {
   threads = std::max(1u, threads);
   std::vector<double> seconds;
@@ -590,7 +598,19 @@ std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov
       pool.emplace_back([&, t]()
       {
         for (uint32_t c = next.fetch_add(1); c < nc; c = next.fetch_add(1))
+        {
+          if ((c & 63) == 0)
+          {
+            if (cancelled && cancelled())
+            {
+              next.store(nc);
+              break;
+            }
+            if (progress && nc > 0)
+              progress((li + static_cast<double>(c) / nc) / p.Levels());
+          }
           ComputeCell(g, p, ov, li, c, lc, localId, scratch[t]);
+        }
       });
     }
     for (auto & th : pool)

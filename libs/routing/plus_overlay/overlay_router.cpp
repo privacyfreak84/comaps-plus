@@ -8,6 +8,8 @@
 #include "routing/segment.hpp"
 #include "routing/world_graph.hpp"
 
+#include "base/logging.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -26,7 +28,6 @@ namespace
 using routing::Segment;
 using Key = uint64_t;  // map index << 32 | overlay vertex
 constexpr Key kNoKey = std::numeric_limits<Key>::max();
-constexpr float kFloatInf = 1e29f;
 
 Key MakeKey(uint32_t m, uint32_t v) { return (uint64_t(m) << 32) | v; }
 uint32_t MapOf(Key k) { return static_cast<uint32_t>(k >> 32); }
@@ -57,6 +58,7 @@ struct MapRt
   bool tried = false;
   std::unique_ptr<MappedOverlay> ovl;
   std::string error;
+  std::vector<uint32_t> exits, enters;  // sorted overlay vertices that are border transitions
 };
 }  // namespace
 
@@ -82,8 +84,67 @@ struct OverlayRouter::Impl
     {
       mr.tried = true;
       mr.ovl = MappedOverlay::Open(mr.path, mr.version, paramsHash, &mr.error);
+      if (mr.ovl)
+      {
+        for (uint32_t i = 0; i < mr.ovl->NumTransitions(); ++i)
+        {
+          auto const & t = mr.ovl->Transition(i);
+          (t.isEnter ? mr.enters : mr.exits).push_back(t.local);
+        }
+        std::sort(mr.exits.begin(), mr.exits.end());
+        std::sort(mr.enters.begin(), mr.enters.end());
+      }
     }
     return mr.ovl.get();
+  }
+
+  // Set when the search settles a border vertex whose neighbouring map has no usable overlay: the
+  // best route could pass through that map, so the overlay can't answer the query exactly.
+  bool needsMissingMap = false;
+  routing::NumMwmId missingMap = 0;
+  std::vector<Segment> twinScratch;
+
+  // Twins of a border vertex, found with CoMaps' own cross-map graph (exactly the joins the normal
+  // search makes). Appends overlay keys; a twin in a map without a usable overlay sets needsMissingMap.
+  void Twins(uint32_t m, uint32_t v, Segment const & s, bool outgoing, std::vector<BaseEdge> & out,
+             std::vector<std::vector<Segment>> * chains)
+  {
+    auto const & set = outgoing ? maps[m].exits : maps[m].enters;
+    if (!std::binary_search(set.begin(), set.end(), v))
+      return;
+    twinScratch.clear();
+    if (!starter->GetGraph().GetCrossMwmGraph().IsTransition(s, outgoing))
+    {
+      // The file lists a border vertex CoMaps doesn't know: the file doesn't match the map.
+      LOG(LWARNING, ("Comaps++ overlay: not a border transition in the map:", s, outgoing));
+      needsMissingMap = true;
+      missingMap = s.GetMwmId();
+      return;
+    }
+    starter->GetGraph().GetTwinsInner(s, outgoing, twinScratch);
+    for (auto const & t : twinScratch)
+    {
+      auto it = mapIdx.find(t.GetMwmId());
+      MappedOverlay const * o = it == mapIdx.end() ? nullptr : Ovl(it->second);
+      if (!o)
+      {
+        needsMissingMap = true;
+        missingMap = t.GetMwmId();
+        continue;
+      }
+      if (!o->HasSegment(t.GetFeatureId(), t.GetSegmentIdx()) ||
+          !o->Kept(o->Slot(t.GetFeatureId(), t.GetSegmentIdx(), t.IsForward())))
+      {
+        LOG(LWARNING, ("Comaps++ overlay: border segment", t, "is not in its map's overlay file"));
+        needsMissingMap = true;
+        missingMap = t.GetMwmId();
+        continue;
+      }
+      out.push_back({MakeKey(it->second, o->Rank(o->Slot(t.GetFeatureId(), t.GetSegmentIdx(), t.IsForward()))), 0.0,
+                     true});
+      if (chains)
+        chains->emplace_back();
+    }
   }
 
   routing::IndexGraph & Graph(uint32_t m)
@@ -277,17 +338,7 @@ struct OverlayRouter::Impl
         chains->push_back(segs);
     }
     if (!o.IsCopy(v))
-    {
-      auto it = twinOut.find(x);
-      if (it != twinOut.end())
-        for (Key k : it->second)
-          if (Ovl(MapOf(k)))
-          {
-            out.push_back({k, 0.0, true});
-            if (chains)
-              chains->emplace_back();
-          }
-    }
+      Twins(m, v, s, true /* outgoing */, out, chains);
   }
 
   // Overlay in-edges of |x| (each as the edge from the predecessor to x).
@@ -327,13 +378,7 @@ struct OverlayRouter::Impl
           consider(c);
     }
     if (!o.IsCopy(v))
-    {
-      auto it = twinIn.find(x);
-      if (it != twinIn.end())
-        for (Key k : it->second)
-          if (Ovl(MapOf(k)))
-            out.push_back({k, 0.0, true});
-    }
+      Twins(m, v, s, false /* outgoing */, out, nullptr);
   }
 
   // Search state of one query.
@@ -370,19 +415,10 @@ struct OverlayRouter::Impl
     size_t const li = lvl - 1;
     uint32_t const m = MapOf(x), v = LocalOf(x);
     auto const & o = *maps[m].ovl;
-    auto const & L = o.GetLevel(li);
     uint32_t const c = o.Cell(li, v);
     if (o.IsEntry(li, v))
-    {
-      uint64_t const x0 = L.exitOff[c], nEx = L.exitOff[c + 1] - x0;
-      uint64_t const base = L.matOff[c] + uint64_t(o.EntryIdx(li, c, v)) * nEx;
-      for (uint64_t j = 0; j < nEx; ++j)
-      {
-        float const w = L.mat[base + j];
-        if (w < kFloatInf)
-          relax(MakeKey(m, L.exits[x0 + j]), d + w, x, static_cast<uint8_t>(lvl));
-      }
-    }
+      o.ForEachFromEntry(li, c, v, [&](uint32_t exit, float w)
+                         { relax(MakeKey(m, exit), d + w, x, static_cast<uint8_t>(lvl)); });
     for (auto const & e : tmp)
       if (MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
         relax(e.to, d + e.w, x, 0);
@@ -402,20 +438,10 @@ struct OverlayRouter::Impl
     size_t const li = lvl - 1;
     uint32_t const m = MapOf(x), v = LocalOf(x);
     auto const & o = *maps[m].ovl;
-    auto const & L = o.GetLevel(li);
     uint32_t const c = o.Cell(li, v);
     if (o.IsExit(li, v))
-    {
-      uint64_t const e0 = L.entryOff[c], nEn = L.entryOff[c + 1] - e0;
-      uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
-      uint64_t const col = o.ExitIdx(li, c, v);
-      for (uint64_t i = 0; i < nEn; ++i)
-      {
-        float const w = L.mat[L.matOff[c] + i * nEx + col];
-        if (w < kFloatInf)
-          relax(MakeKey(m, L.entries[e0 + i]), d + w, x, static_cast<uint8_t>(lvl));
-      }
-    }
+      o.ForEachToExit(li, c, v, [&](uint32_t entry, float w)
+                      { relax(MakeKey(m, entry), d + w, x, static_cast<uint8_t>(lvl)); });
     for (auto const & e : tmp)
       if (MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
         relax(e.to, d + e.w, x, 0);
@@ -485,19 +511,10 @@ struct OverlayRouter::Impl
             relax(e.to, d + e.w, x, 0);
         continue;
       }
-      auto const & C = o.GetLevel(li - 1);
       uint32_t const cc = o.Cell(li - 1, xv);
       if (o.IsEntry(li - 1, xv))
-      {
-        uint64_t const cx0 = C.exitOff[cc], cnEx = C.exitOff[cc + 1] - cx0;
-        uint64_t const base = C.matOff[cc] + uint64_t(o.EntryIdx(li - 1, cc, xv)) * cnEx;
-        for (uint64_t j = 0; j < cnEx; ++j)
-        {
-          float const w = C.mat[base + j];
-          if (w < kFloatInf)
-            relax(MakeKey(m, C.exits[cx0 + j]), d + w, x, static_cast<uint8_t>(li));
-        }
-      }
+        o.ForEachFromEntry(li - 1, cc, xv, [&](uint32_t exit, float w)
+                           { relax(MakeKey(m, exit), d + w, x, static_cast<uint8_t>(li)); });
       if (o.IsExit(li - 1, xv))
         for (auto const & e : tmp)
           if (MapOf(e.to) == m && o.Cell(li, LocalOf(e.to)) == c && o.Cell(li - 1, LocalOf(e.to)) != cc)
@@ -591,7 +608,8 @@ void OverlayRouter::SetMaps(std::vector<OverlayMap> const & maps)
     if (it != m_impl->mapIdx.end())
     {
       auto & old = m_impl->maps[it->second];
-      if (old.path == om.path && old.version == om.mwmVersion)
+      // A map whose file was missing or stale is tried again (its overlay may have been built since).
+      if (old.path == om.path && old.version == om.mwmVersion && old.ovl)
         mr = std::move(old);
     }
     next.push_back(std::move(mr));
@@ -650,7 +668,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   I.starter = &starter;
   I.graphs.assign(I.maps.size(), nullptr);
   I.baseScans = 0;
-  I.BuildTwins();
+  I.needsMissingMap = false;
   auto finish = [&](Result r, std::string const & why)
   {
     stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -724,7 +742,11 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   {
     uint32_t const m = I.MapOfSegment(s);
     if (m == kNone)
+    {
+      stats.hasMissingMap = true;
+      stats.missingMap = s.GetMwmId();
       return finish(Result::NotApplicable, "start map has no overlay");
+    }
     double w = c;
     uint32_t kept;
     bool inner;
@@ -740,7 +762,11 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   {
     uint32_t const m = I.MapOfSegment(s);
     if (m == kNone)
+    {
+      stats.hasMissingMap = true;
+      stats.missingMap = s.GetMwmId();
       return finish(Result::NotApplicable, "finish map has no overlay");
+    }
     double w = c;
     uint32_t kept;
     bool inner;
@@ -891,6 +917,12 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       ++stats.settled;
       I.ScanF(x, d, relaxF, tmp);
     }
+    if (I.needsMissingMap)
+    {
+      stats.hasMissingMap = true;
+      stats.missingMap = I.missingMap;
+      return finish(Result::NotApplicable, "the route may pass through a map without an overlay");
+    }
     else
     {
       auto const [d, x] = hb.top();
@@ -901,6 +933,12 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       lx.done = true;
       ++stats.settled;
       I.ScanB(x, d, relaxB, tmp);
+      if (I.needsMissingMap)
+      {
+        stats.hasMissingMap = true;
+      stats.missingMap = I.missingMap;
+        return finish(Result::NotApplicable, "the route may pass through a map without an overlay");
+      }
     }
   }
 

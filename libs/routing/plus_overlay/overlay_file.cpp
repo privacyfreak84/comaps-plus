@@ -14,12 +14,12 @@ namespace plus_overlay
 {
 namespace
 {
-constexpr char kMagic[8] = {'P', 'L', 'U', 'S', 'O', 'V', 'L', '1'};
+constexpr char kMagic[8] = {'P', 'L', 'U', 'S', 'O', 'V', 'L', '2'};
 constexpr size_t kMaxSections = 64;
 
 enum Section : uint32_t
 {
-  kFeatBase = 0,
+  kFeatBlock = 0,  // u32 per 64 features: first segment of the block's first feature
   kKeptBits,
   kKeptRank,
   kCopyOrig,
@@ -29,7 +29,25 @@ enum Section : uint32_t
   kParents,
   kRoles,
   kTransitions,
-  kLevelBase = 16,  // + 5 * level + {0 entryOff, 1 exitOff, 2 entries, 3 exits, 4 mat}
+  kFeatLow,        // u16 per feature (+1): first segment relative to its block
+  kLevelBase = 16,  // + kLevelSections * level + LevelSection
+};
+
+enum LevelSection : uint32_t
+{
+  kEntryOff = 0,  // u32 per cell + 1
+  kExitOff,       // u32 per cell + 1
+  kEntries,       // u32, per cell ascending
+  kExits,         // u32, per cell ascending
+  kRowRank,       // u32 per entry: finite clique values before its row (in the level)
+  kBits,          // u64: per cell, entry rows of ceil(exits / 64) words; bit set = finite
+  kValues,        // float32: the finite clique values, row by row
+  kLevelSections
+};
+
+enum HeaderFlags : uint32_t
+{
+  kCell1Is16Bit = 1,
 };
 
 #pragma pack(push, 1)
@@ -45,6 +63,8 @@ struct Header
   uint32_t n;
   uint32_t numFeatures;
   uint32_t numCells[8];
+  uint32_t flags;
+  uint32_t reserved[7];
   uint64_t offset[kMaxSections];
   uint64_t size[kMaxSections];
 };
@@ -99,6 +119,11 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   h.baseN = fc.baseN;
   h.n = fc.n;
   h.numFeatures = static_cast<uint32_t>(fc.featBase.size() - 1);
+  if (fc.featBase.empty() || static_cast<uint64_t>(kLevelBase) + kLevelSections * levels > kMaxSections)
+  {
+    SetError(error, "bad contents");
+    return false;
+  }
   for (size_t li = 0; li < levels; ++li)
     h.numCells[li] = p.numCells[li];
 
@@ -125,7 +150,26 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   };
   auto putVec = [&](uint32_t id, auto const & v) { put(id, v.data(), v.size() * sizeof(v[0])); };
 
-  putVec(kFeatBase, fc.featBase);
+  // Feature -> first segment, as a u32 per 64 features plus a u16 offset per feature.
+  {
+    uint64_t const nf = fc.featBase.size();  // numFeatures + 1
+    std::vector<uint32_t> block((nf + 63) / 64);
+    std::vector<uint16_t> low(nf);
+    for (uint64_t f = 0; f < nf; ++f)
+    {
+      if (f % 64 == 0)
+        block[f / 64] = fc.featBase[f];
+      uint64_t const d = fc.featBase[f] - block[f / 64];
+      if (d > 0xFFFF)
+      {
+        SetError(error, "a block of 64 features has more than 65535 road segments");
+        return false;
+      }
+      low[f] = static_cast<uint16_t>(d);
+    }
+    putVec(kFeatBlock, block);
+    putVec(kFeatLow, low);
+  }
   putVec(kKeptBits, fc.keptBits);
   putVec(kKeptRank, fc.keptRank);
   putVec(kCopyOrig, fc.copyOrig);
@@ -137,7 +181,16 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
     pat.insert(pat.end(), pt.begin(), pt.end());
   }
   putVec(kPatterns, pat);
-  putVec(kCell1, p.cell[0]);
+  if (p.numCells[0] <= 0x10000)
+  {
+    h.flags |= kCell1Is16Bit;
+    std::vector<uint16_t> c16(p.cell[0].begin(), p.cell[0].end());
+    putVec(kCell1, c16);
+  }
+  else
+  {
+    putVec(kCell1, p.cell[0]);
+  }
   // Parent tables: for each level >= 1, the level-li cell of every level-(li-1) cell.
   std::vector<uint32_t> parents;
   for (size_t li = 1; li < levels; ++li)
@@ -158,15 +211,43 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   {
     auto const & L = ov.levels[li];
     std::vector<uint32_t> eo(L.entryOff.begin(), L.entryOff.end()), xo(L.exitOff.begin(), L.exitOff.end());
-    std::vector<float> m32(L.mat.size());
-    for (size_t i = 0; i < L.mat.size(); ++i)
-      m32[i] = L.mat[i] >= kInf ? 1e30f : static_cast<float>(L.mat[i]);
-    uint32_t const base = kLevelBase + 5 * static_cast<uint32_t>(li);
-    putVec(base + 0, eo);
-    putVec(base + 1, xo);
-    putVec(base + 2, L.entries);
-    putVec(base + 3, L.exits);
-    putVec(base + 4, m32);
+    // Sparse cliques: a bit per (entry, exit), rows word-aligned, and the finite values in row order.
+    std::vector<uint32_t> rowRank;
+    std::vector<uint64_t> bits;
+    std::vector<float> values;
+    rowRank.reserve(L.entries.size());
+    for (uint32_t c = 0; c < p.numCells[li]; ++c)
+    {
+      uint64_t const nEn = L.entryOff[c + 1] - L.entryOff[c], nEx = L.exitOff[c + 1] - L.exitOff[c];
+      uint64_t const wpr = (nEx + 63) / 64;
+      for (uint64_t i = 0; i < nEn; ++i)
+      {
+        if (values.size() > 0xFFFFFFFFULL)
+        {
+          SetError(error, "too many clique values in one level");
+          return false;
+        }
+        rowRank.push_back(static_cast<uint32_t>(values.size()));
+        uint64_t const w0 = bits.size();
+        bits.resize(w0 + wpr, 0);
+        for (uint64_t j = 0; j < nEx; ++j)
+        {
+          double const w = L.mat[L.matOff[c] + i * nEx + j];
+          if (w >= kInf)
+            continue;
+          bits[w0 + j / 64] |= uint64_t(1) << (j % 64);
+          values.push_back(static_cast<float>(w));
+        }
+      }
+    }
+    uint32_t const base = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
+    putVec(base + kEntryOff, eo);
+    putVec(base + kExitOff, xo);
+    putVec(base + kEntries, L.entries);
+    putVec(base + kExits, L.exits);
+    putVec(base + kRowRank, rowRank);
+    putVec(base + kBits, bits);
+    putVec(base + kValues, values);
   }
   out.seekp(0);
   out.write(reinterpret_cast<char const *>(&h), sizeof(h));
@@ -184,6 +265,18 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
     return false;
   }
   return true;
+}
+
+bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t paramsHash)
+{
+  int const fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    return false;
+  Header h;
+  bool const ok = ::pread(fd, &h, sizeof(h), 0) == static_cast<ssize_t>(sizeof(h));
+  ::close(fd);
+  return ok && std::memcmp(h.magic, kMagic, sizeof(kMagic)) == 0 && h.formatVersion == kFileFormatVersion &&
+         h.mwmVersion == mwmVersion && h.paramsHash == paramsHash;
 }
 
 std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int64_t expectMwmVersion,
@@ -222,7 +315,7 @@ std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int
   auto const & h = *reinterpret_cast<Header const *>(m->m_data);
   if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || h.formatVersion != kFileFormatVersion)
   {
-    SetError(error, "not a v1 overlay file");
+    SetError(error, "not a v" + std::to_string(kFileFormatVersion) + " overlay file");
     return nullptr;
   }
   if (expectMwmVersion != 0 && h.mwmVersion != expectMwmVersion)
@@ -267,20 +360,22 @@ bool MappedOverlay::Parse(std::string * error)
   m_baseN = h.baseN;
   m_numSlots = h.numSlots;
   m_numFeatures = h.numFeatures;
-  if (h.numLevels == 0 || h.numLevels > kMaxLevels || count(kFeatBase, 4) != m_numFeatures + 1ULL ||
-      count(kCell1, 4) != m_n || count(kRoles, 1) != m_n || count(kCopyOrig, 4) != m_n - m_baseN ||
-      count(kCopyState, 4) != m_n - m_baseN)
+  m_cell16 = (h.flags & kCell1Is16Bit) != 0;
+  if (h.numLevels == 0 || h.numLevels > kMaxLevels || count(kFeatLow, 2) != m_numFeatures + 1ULL ||
+      count(kFeatBlock, 4) != (m_numFeatures + 1ULL + 63) / 64 || count(kCell1, m_cell16 ? 2 : 4) != m_n ||
+      count(kRoles, 1) != m_n || count(kCopyOrig, 4) != m_n - m_baseN || count(kCopyState, 4) != m_n - m_baseN)
   {
     SetError(error, "inconsistent sizes");
     return false;
   }
-  m_featBase = reinterpret_cast<uint32_t const *>(sec(kFeatBase));
+  m_featBlock = reinterpret_cast<uint32_t const *>(sec(kFeatBlock));
+  m_featLow = reinterpret_cast<uint16_t const *>(sec(kFeatLow));
   m_keptBits = reinterpret_cast<uint64_t const *>(sec(kKeptBits));
   m_keptRank = reinterpret_cast<uint32_t const *>(sec(kKeptRank));
   m_numWords = static_cast<uint32_t>(count(kKeptBits, 8));
   m_copyOrig = reinterpret_cast<uint32_t const *>(sec(kCopyOrig));
   m_copyState = reinterpret_cast<uint32_t const *>(sec(kCopyState));
-  m_cell1 = reinterpret_cast<uint32_t const *>(sec(kCell1));
+  m_cell1 = sec(kCell1);
   m_roles = sec(kRoles);
   m_transitions = reinterpret_cast<FileTransition const *>(sec(kTransitions));
   m_numTransitions = static_cast<uint32_t>(count(kTransitions, sizeof(FileTransition)));
@@ -298,24 +393,39 @@ bool MappedOverlay::Parse(std::string * error)
       m_parents[li] = par + parUsed;
       parUsed += h.numCells[li - 1];
     }
-    uint32_t const base = kLevelBase + 5 * static_cast<uint32_t>(li);
-    if (count(base + 0, 4) != L.numCells + 1ULL || count(base + 1, 4) != L.numCells + 1ULL)
+    uint32_t const base = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
+    if (count(base + kEntryOff, 4) != L.numCells + 1ULL || count(base + kExitOff, 4) != L.numCells + 1ULL)
     {
       SetError(error, "bad level offsets");
       return false;
     }
-    L.entryOff = reinterpret_cast<uint32_t const *>(sec(base + 0));
-    L.exitOff = reinterpret_cast<uint32_t const *>(sec(base + 1));
-    L.entries = reinterpret_cast<uint32_t const *>(sec(base + 2));
-    L.exits = reinterpret_cast<uint32_t const *>(sec(base + 3));
-    L.mat = reinterpret_cast<float const *>(sec(base + 4));
-    L.matOff.assign(L.numCells + 1, 0);
+    L.entryOff = reinterpret_cast<uint32_t const *>(sec(base + kEntryOff));
+    L.exitOff = reinterpret_cast<uint32_t const *>(sec(base + kExitOff));
+    L.entries = reinterpret_cast<uint32_t const *>(sec(base + kEntries));
+    L.exits = reinterpret_cast<uint32_t const *>(sec(base + kExits));
+    L.rowRank = reinterpret_cast<uint32_t const *>(sec(base + kRowRank));
+    L.bits = reinterpret_cast<uint64_t const *>(sec(base + kBits));
+    L.values = reinterpret_cast<float const *>(sec(base + kValues));
+    L.wordOff.assign(L.numCells + 1, 0);
     for (uint32_t c = 0; c < L.numCells; ++c)
-      L.matOff[c + 1] = L.matOff[c] + uint64_t(L.entryOff[c + 1] - L.entryOff[c]) * (L.exitOff[c + 1] - L.exitOff[c]);
-    if (L.matOff[L.numCells] != count(base + 4, 4) || count(base + 2, 4) != L.entryOff[L.numCells] ||
-        count(base + 3, 4) != L.exitOff[L.numCells])
+    {
+      uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
+      L.wordOff[c + 1] = L.wordOff[c] + uint64_t(L.entryOff[c + 1] - L.entryOff[c]) * ((nEx + 63) / 64);
+    }
+    uint64_t const nEntries = L.entryOff[L.numCells], nValues = count(base + kValues, 4);
+    if (L.wordOff[L.numCells] != count(base + kBits, 8) || count(base + kEntries, 4) != nEntries ||
+        count(base + kExits, 4) != L.exitOff[L.numCells] || count(base + kRowRank, 4) != nEntries)
     {
       SetError(error, "bad level sizes");
+      return false;
+    }
+    // Every row's values must lie inside the values section.
+    uint64_t bitsSet = 0;
+    for (uint64_t w = 0; w < L.wordOff[L.numCells]; ++w)
+      bitsSet += static_cast<uint64_t>(__builtin_popcountll(L.bits[w]));
+    if (bitsSet != nValues || (nEntries > 0 && L.rowRank[nEntries - 1] > nValues))
+    {
+      SetError(error, "bad clique values");
       return false;
     }
   }
@@ -371,9 +481,19 @@ uint32_t MappedOverlay::SlotOf(uint32_t local) const
 void MappedOverlay::Decode(uint32_t slot, uint32_t & feature, uint32_t & segIdx, bool & forward) const
 {
   uint32_t const seg = slot / 2;
-  auto const * it = std::upper_bound(m_featBase, m_featBase + m_numFeatures + 1, seg);
-  feature = static_cast<uint32_t>(it - m_featBase) - 1;
-  segIdx = seg - m_featBase[feature];
+  // Last feature whose first segment <= seg: first by block, then inside the block.
+  uint32_t const numBlocks = (m_numFeatures + 1 + 63) / 64;
+  uint32_t const blk =
+      static_cast<uint32_t>(std::upper_bound(m_featBlock, m_featBlock + numBlocks, seg) - m_featBlock) - 1;
+  uint32_t lo = blk * 64, hi = std::min(blk * 64 + 64, m_numFeatures + 1);  // FeatBase(lo) <= seg
+  while (hi - lo > 1)
+  {
+    uint32_t const mid = (lo + hi) / 2;
+    (FeatBase(mid) <= seg ? lo : hi) = mid;
+  }
+  // Features without segments share their first segment with the next one: take the last.
+  feature = lo;
+  segIdx = seg - FeatBase(feature);
   forward = (slot % 2) == 0;
 }
 
@@ -403,6 +523,22 @@ uint32_t MappedOverlay::EntryIdx(size_t li, uint32_t cell, uint32_t v) const
   auto const * b = L.entries + L.entryOff[cell];
   auto const * e = L.entries + L.entryOff[cell + 1];
   return static_cast<uint32_t>(std::lower_bound(b, e, v) - b);
+}
+
+float MappedOverlay::Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) const
+{
+  auto const & L = m_levels[li];
+  uint64_t const nEx = L.exitOff[cell + 1] - L.exitOff[cell];
+  uint64_t const wpr = (nEx + 63) / 64;
+  uint64_t const row = L.wordOff[cell] + i * wpr;
+  uint64_t const word = L.bits[row + j / 64];
+  if (!((word >> (j % 64)) & 1))
+    return 1e30f;
+  uint64_t idx = L.rowRank[L.entryOff[cell] + i];
+  for (uint64_t k = 0; k < j / 64; ++k)
+    idx += static_cast<uint64_t>(__builtin_popcountll(L.bits[row + k]));
+  idx += static_cast<uint64_t>(__builtin_popcountll(word & ((uint64_t(1) << (j % 64)) - 1)));
+  return L.values[idx];
 }
 
 uint32_t MappedOverlay::ExitIdx(size_t li, uint32_t cell, uint32_t v) const

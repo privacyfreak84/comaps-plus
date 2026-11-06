@@ -110,6 +110,8 @@ set(SRC
   plus_overlay/overlay.cpp
   plus_overlay/overlay.hpp
   plus_overlay/overlay_file.cpp
+  plus_overlay/overlay_builder.cpp
+  plus_overlay/overlay_builder.hpp
   plus_overlay/overlay_file.hpp
   plus_overlay/overlay_router.cpp
   plus_overlay/overlay_router.hpp

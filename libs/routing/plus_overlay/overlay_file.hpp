@@ -1,6 +1,6 @@
 #pragma once
 
-// Comaps++ per-map overlay file, format v1.
+// Comaps++ per-map overlay file, format v2.
 //
 // One file per map (<map name>.plusovl next to the .mwm). It holds no road graph: CoMaps' own
 // IndexGraph supplies the base edges at query time. Contents:
@@ -9,7 +9,8 @@
 //   - via-way restriction patterns and the automaton-state copies of their segments;
 //   - the nested partition (level-1 cell per vertex, parent tables above);
 //   - per vertex a role byte (entry/exit of its cell, two bits per level);
-//   - per level: entries/exits of every cell and the entry x exit cliques (float32);
+//   - per level: entries/exits of every cell and the entry x exit cliques, sparse: one bit per
+//     (entry, exit) pair and the finite values as float32 (about a third of the pairs are unreachable);
 //   - the map's border transitions (OSM way id + segment index), used to join maps at query time.
 // The header carries the map version and a hash of the build parameters; a file whose map version or
 // parameters don't match is treated as missing and rebuilt.
@@ -25,7 +26,7 @@
 
 namespace plus_overlay
 {
-constexpr uint32_t kFileFormatVersion = 1;
+constexpr uint32_t kFileFormatVersion = 2;
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
 
@@ -75,6 +76,10 @@ inline std::string OverlayPathForMap(std::string const & mwmPath)
   return (dot == std::string::npos ? mwmPath : mwmPath.substr(0, dot)) + kFileExtension;
 }
 
+// Cheap check (header only): |path| is an overlay file of this format, built for map version
+// |mwmVersion| with the build parameters |paramsHash|.
+bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t paramsHash);
+
 bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partition const & p, Overlay const & ov,
                       std::string * error = nullptr);
 
@@ -89,8 +94,10 @@ public:
     uint32_t const * exitOff = nullptr;
     uint32_t const * entries = nullptr;   // per cell, ascending
     uint32_t const * exits = nullptr;
-    float const * mat = nullptr;          // per cell, row-major entry x exit
-    std::vector<uint64_t> matOff;         // numCells + 1
+    uint32_t const * rowRank = nullptr;   // per entry: values before its row
+    uint64_t const * bits = nullptr;      // per cell, per entry row: ceil(exits / 64) words
+    float const * values = nullptr;
+    std::vector<uint64_t> wordOff;        // numCells + 1: first word of each cell
   };
 
   // Null (and |error| set) if the file is missing, damaged or doesn't match the expected map version
@@ -110,13 +117,14 @@ public:
 
   // Segment slots.
   uint32_t NumFeatures() const { return m_numFeatures; }
+  uint32_t FeatBase(uint32_t feature) const { return m_featBlock[feature >> 6] + m_featLow[feature]; }
   bool HasSegment(uint32_t feature, uint32_t segIdx) const
   {
-    return feature < m_numFeatures && segIdx < m_featBase[feature + 1] - m_featBase[feature];
+    return feature < m_numFeatures && segIdx < FeatBase(feature + 1) - FeatBase(feature);
   }
   uint32_t Slot(uint32_t feature, uint32_t segIdx, bool forward) const
   {
-    return 2 * (m_featBase[feature] + segIdx) + (forward ? 0 : 1);
+    return 2 * (FeatBase(feature) + segIdx) + (forward ? 0 : 1);
   }
   bool Kept(uint32_t slot) const { return (m_keptBits[slot >> 6] >> (slot & 63)) & 1; }
   uint32_t Rank(uint32_t slot) const
@@ -142,7 +150,8 @@ public:
   // Partition and roles.
   uint32_t Cell(size_t li, uint32_t v) const
   {
-    uint32_t c = m_cell1[v];
+    uint32_t c = m_cell16 ? reinterpret_cast<uint16_t const *>(m_cell1)[v]
+                          : reinterpret_cast<uint32_t const *>(m_cell1)[v];
     for (size_t k = 1; k <= li; ++k)
       c = m_parents[k][c];
     return c;
@@ -151,6 +160,49 @@ public:
   bool IsExit(size_t li, uint32_t v) const { return (m_roles[v] >> (2 * li + 1)) & 1; }
   uint32_t EntryIdx(size_t li, uint32_t cell, uint32_t v) const;
   uint32_t ExitIdx(size_t li, uint32_t cell, uint32_t v) const;
+
+  // Clique weight from entry #i to exit #j of |cell| (>= 1e29 when unreachable).
+  float Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) const;
+  // f(exit vertex, weight) for every exit of |cell| reachable from its entry |v|.
+  template <class F>
+  void ForEachFromEntry(size_t li, uint32_t cell, uint32_t v, F && f) const
+  {
+    auto const & L = m_levels[li];
+    uint64_t const nEx = L.exitOff[cell + 1] - L.exitOff[cell];
+    uint64_t const wpr = (nEx + 63) / 64;
+    uint32_t const i = EntryIdx(li, cell, v);
+    uint64_t const row = L.wordOff[cell] + i * wpr;
+    uint64_t idx = L.rowRank[L.entryOff[cell] + i];
+    uint32_t const * exits = L.exits + L.exitOff[cell];
+    for (uint64_t k = 0; k < wpr; ++k)
+      for (uint64_t w = L.bits[row + k]; w != 0; w &= w - 1)
+        f(exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], L.values[idx++]);
+  }
+  // f(entry vertex, weight) for every entry of |cell| that reaches its exit |v|.
+  template <class F>
+  void ForEachToExit(size_t li, uint32_t cell, uint32_t v, F && f) const
+  {
+    auto const & L = m_levels[li];
+    uint64_t const nEn = L.entryOff[cell + 1] - L.entryOff[cell];
+    uint64_t const nEx = L.exitOff[cell + 1] - L.exitOff[cell];
+    uint64_t const wpr = (nEx + 63) / 64;
+    uint32_t const j = ExitIdx(li, cell, v);
+    uint64_t const k = j / 64, bit = j % 64;
+    uint64_t const below = (uint64_t(1) << bit) - 1;
+    uint32_t const * entries = L.entries + L.entryOff[cell];
+    for (uint64_t i = 0; i < nEn; ++i)
+    {
+      uint64_t const row = L.wordOff[cell] + i * wpr;
+      uint64_t const word = L.bits[row + k];
+      if (!((word >> bit) & 1))
+        continue;
+      uint64_t idx = L.rowRank[L.entryOff[cell] + i];
+      for (uint64_t q = 0; q < k; ++q)
+        idx += static_cast<uint64_t>(__builtin_popcountll(L.bits[row + q]));
+      idx += static_cast<uint64_t>(__builtin_popcountll(word & below));
+      f(entries[i], L.values[idx]);
+    }
+  }
 
   uint32_t NumTransitions() const { return m_numTransitions; }
   FileTransition const & Transition(uint32_t i) const { return m_transitions[i]; }
@@ -167,13 +219,15 @@ private:
 
   int64_t m_mwmVersion = 0;
   uint32_t m_n = 0, m_baseN = 0, m_numSlots = 0, m_numFeatures = 0, m_numTransitions = 0;
-  uint32_t const * m_featBase = nullptr;
+  uint32_t const * m_featBlock = nullptr;
+  uint16_t const * m_featLow = nullptr;
+  bool m_cell16 = false;
   uint64_t const * m_keptBits = nullptr;
   uint32_t const * m_keptRank = nullptr;
   uint32_t m_numWords = 0;
   uint32_t const * m_copyOrig = nullptr;
   uint32_t const * m_copyState = nullptr;
-  uint32_t const * m_cell1 = nullptr;
+  uint8_t const * m_cell1 = nullptr;  // uint16 or uint32 per vertex
   std::vector<uint32_t const *> m_parents;  // [li] for li >= 1: level-(li-1) cell -> level-li cell
   uint8_t const * m_roles = nullptr;
   FileTransition const * m_transitions = nullptr;

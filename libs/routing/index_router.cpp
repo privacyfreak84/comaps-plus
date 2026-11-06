@@ -741,14 +741,9 @@ bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & 
   }
   if (maps.empty())
     return false;
+  // Files are opened only for the maps a query reaches. If the route may pass through a map whose
+  // overlay isn't built yet (or is stale), FindPath says so and the normal search answers.
   m_plusOverlay->SetMaps(maps);
-  vector<NumMwmId> missing;
-  if (!m_plusOverlay->AllMapsReady(&missing))
-  {
-    LOG(LINFO, ("Comaps++ overlay: not built yet for", missing.size(), "of", maps.size(),
-                "downloaded maps, using the normal search"));
-    return false;
-  }
 
   // Fake vertices are expanded through the world graph; leaps mode can't do that.
   auto & graph = starter.GetGraph();
@@ -768,9 +763,10 @@ bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & 
                 "edge lists,", stats.mapsUsed, "maps, weight", stats.weight));
     return true;
   }
-  LOG(LINFO, ("Comaps++ overlay:",
-              result == plus_overlay::OverlayRouter::Result::NoRoute ? std::string("no route") : stats.reason,
-              "- using the normal search"));
+  std::string why = result == plus_overlay::OverlayRouter::Result::NoRoute ? std::string("no route") : stats.reason;
+  if (stats.hasMissingMap)
+    why += " (" + m_numMwmIds->GetFile(stats.missingMap).GetName() + ")";
+  LOG(LINFO, ("Comaps++ overlay:", why, "- using the normal search"));
   subroute.clear();
   return false;
 }
