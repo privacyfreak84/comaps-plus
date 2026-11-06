@@ -26,7 +26,17 @@
 
 namespace plus_overlay
 {
+// Keeping prepared files valid across app updates:
+// - kFileFormatVersion is the layout this code writes. A new layout must stay readable by adding
+//   sections (the reader ignores unknown ones and must treat missing new ones as absent) and raising
+//   kFileFormatVersion; kMinReadableFormatVersion goes up only if old files truly can't be read.
+// - kRoutingDataVersion names what the cliques were computed from (CoMaps' edge weights, turn
+//   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
+//   cliques wrong; that is the only code change that makes the app rebuild every file.
+// - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
 constexpr uint32_t kFileFormatVersion = 3;
+constexpr uint32_t kMinReadableFormatVersion = 3;
+constexpr uint32_t kRoutingDataVersion = 1;
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
 

@@ -16,6 +16,7 @@ namespace plus_overlay
 {
 namespace
 {
+// Fixed; the format version is in the header.
 constexpr char kMagic[8] = {'P', 'L', 'U', 'S', 'O', 'V', 'L', '3'};
 constexpr size_t kMaxSections = 64;
 
@@ -76,6 +77,8 @@ struct Header
 };
 #pragma pack(pop)
 
+bool IsReadableVersion(uint32_t v) { return v >= kMinReadableFormatVersion && v <= kFileFormatVersion; }
+
 uint64_t Fnv(uint64_t h, void const * data, size_t len)
 {
   auto const * p = static_cast<uint8_t const *>(data);
@@ -97,8 +100,15 @@ void SetError(std::string * error, std::string const & msg)
 uint64_t BuildParamsHash(std::vector<uint32_t> const & cellSizes, double minBalance, int directions)
 {
   uint64_t h = 1469598103934665603ULL;
-  uint32_t const v = kFileFormatVersion;
+  // Frozen at 3 (the format version when the hash was introduced): the hash names the routing data in a
+  // file, not its layout, so a new layout doesn't make existing files stale.
+  uint32_t const v = 3;
   h = Fnv(h, &v, sizeof(v));
+  if (kRoutingDataVersion != 1)
+  {
+    uint32_t const d = kRoutingDataVersion;
+    h = Fnv(h, &d, sizeof(d));
+  }
   h = Fnv(h, cellSizes.data(), cellSizes.size() * sizeof(uint32_t));
   h = Fnv(h, &minBalance, sizeof(minBalance));
   h = Fnv(h, &directions, sizeof(directions));
@@ -378,7 +388,7 @@ bool ReadHeader(std::string const & path, Header & h)
     return false;
   bool const ok = ::pread(fd, &h, sizeof(h), 0) == static_cast<ssize_t>(sizeof(h));
   ::close(fd);
-  return ok && std::memcmp(h.magic, kMagic, sizeof(kMagic)) == 0 && h.formatVersion == kFileFormatVersion;
+  return ok && std::memcmp(h.magic, kMagic, sizeof(kMagic)) == 0 && IsReadableVersion(h.formatVersion);
 }
 }  // namespace
 
@@ -445,7 +455,7 @@ std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int
   if (!m->m_file.Open(path, error))
     return nullptr;
   auto const & h = *reinterpret_cast<Header const *>(m->m_file.data);
-  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || h.formatVersion != kFileFormatVersion)
+  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || !IsReadableVersion(h.formatVersion))
   {
     SetError(error, "not a v" + std::to_string(kFileFormatVersion) + " overlay file");
     return nullptr;
@@ -599,7 +609,7 @@ bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidM
   if (!mp.Open(path, error))
     return false;
   auto const & h = *reinterpret_cast<Header const *>(mp.data);
-  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || h.formatVersion != kFileFormatVersion ||
+  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || !IsReadableVersion(h.formatVersion) ||
       !(h.flags & kCliquesOnly) || h.baseBuildId != m_buildId || h.avoidMask != avoidMask ||
       h.numLevels != m_levels.size())
   {

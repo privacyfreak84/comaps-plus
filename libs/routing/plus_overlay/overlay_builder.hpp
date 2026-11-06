@@ -30,6 +30,10 @@ struct BuildOptions
   std::function<void(std::string const & line)> log;
   // After writing, read the file back and compare it with what was built (structure and cliques).
   bool checkFile = false;
+  // Base files: where the map's partition splits are kept across map versions. If it exists, the new
+  // version reuses those cells (no partition search, the slowest step); after a full partition it is
+  // written. Empty: always partition.
+  std::string partitionTreePath;
 };
 
 struct BuildResult
@@ -47,6 +51,7 @@ struct BuildResult
   uint64_t fileBytes = 0;
   double seconds = 0;
   uint64_t peakRssKb = 0;  // process peak (VmHWM) at the end of the build; 0 if unknown
+  bool reusedCells = false;  // the partition came from partitionTreePath
 };
 
 // Builds the overlay for |localFile| (a downloaded country map) and writes it to |outPath| (empty:

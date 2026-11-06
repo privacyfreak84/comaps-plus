@@ -34,6 +34,7 @@ DEFINE_string(routes_out, "", "overlay mode: write the routes used (named + rout
 DEFINE_string(router_out, "", "router mode: output file.");
 DEFINE_string(router_in, "", "overlay mode: router results to compare with.");
 DEFINE_string(overlay_dir, "", "runtime mode: directory with <map>.plusovl files.");
+DEFINE_string(vehicle, "car", "router mode: car | pedestrian | bicycle.");
 DEFINE_bool(avoid_toll, false, "router mode: set the 'avoid toll roads' option for the run (restored after).");
 DEFINE_int32(avoid_mask, -1, "router mode: avoid options for the run as RoutingOptions bits (2 toll, 4 motorway, "
                              "8 ferry, 16 dirt); -1: leave the settings alone.");
@@ -156,7 +157,11 @@ struct Multi
     cig = storage::CountryInfoReader::CreateCountryInfoGetter(GetPlatform());
     auto const countryFileGetter = [cig](m2::PointD const & pt) { return cig->GetRegionCountryId(pt); };
     auto const rectGetter = [cig](std::string const & id) { return cig->GetLimitRectForLeaf(id); };
-    return std::make_unique<routing::IndexRouter>(routing::VehicleType::Car, false /* loadAltitudes */, *cpg,
+    auto const vt = FLAGS_vehicle == "pedestrian" ? routing::VehicleType::Pedestrian
+                    : FLAGS_vehicle == "bicycle"  ? routing::VehicleType::Bicycle
+                                                  : routing::VehicleType::Car;
+    // As the app's RoutingManager: altitudes for everything but cars.
+    return std::make_unique<routing::IndexRouter>(vt, vt != routing::VehicleType::Car /* loadAltitudes */, *cpg,
                                                   countryFileGetter, rectGetter, numMwmIds,
                                                   routing::MakeNumMwmTree(*numMwmIds, *cig), traffic, dataSource);
   }

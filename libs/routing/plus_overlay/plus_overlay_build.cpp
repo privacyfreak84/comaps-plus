@@ -29,6 +29,8 @@ DEFINE_bool(check_file, false, "Read the written file back and compare it with w
 DEFINE_double(cancel_after_s, 0, "Test cancellation: cancel the build after this many seconds (0: never).");
 DEFINE_int32(avoid_mask, 0, "Build the avoid-option cliques for these RoutingOptions bits (2 toll, 4 motorway, "
                             "8 ferry, 16 dirt) instead of the base file; needs the base file.");
+DEFINE_string(partition_tree, "", "Partition splits kept across map versions: reused if the file exists, "
+                                  "written after a full partition.");
 DEFINE_bool(cleanup, false, "Only delete overlay files whose map is gone (and interrupted builds) in the version "
                             "directory, then exit.");
 
@@ -56,6 +58,7 @@ int main(int argc, char ** argv)
   plus_overlay::BuildOptions o;
   o.threads = FLAGS_threads;
   o.checkFile = FLAGS_check_file;
+  o.partitionTreePath = FLAGS_partition_tree;
   o.log = [](std::string const & s) { std::cout << "  " << s << "\n"; };
   std::atomic<int> lastTen{-1};
   o.progress = [&](double f, std::string const & stage)
@@ -92,7 +95,7 @@ int main(int argc, char ** argv)
   case plus_overlay::BuildResult::Status::Ok:
     std::cout << "  written " << r.path << ": " << r.fileBytes / 1048576.0 << " MB (format v"
               << plus_overlay::kFileFormatVersion << ", map version " << r.mwmVersion << ") in " << r.seconds
-              << " s, peak " << r.peakRssKb / 1024 << " MB\n";
+              << " s, peak " << r.peakRssKb / 1024 << " MB" << (r.reusedCells ? ", cells reused" : "") << "\n";
     return 0;
   case plus_overlay::BuildResult::Status::Cancelled:
     std::cout << "  cancelled after " << r.seconds << " s; file exists: "

@@ -828,12 +828,27 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     pp.cancelled = options.cancelled;
     pp.progress = [&rep](double f) { rep.Progress(0.30 + 0.55 * f, "dividing the map into cells"); };
     t0 = Clock::now();
-    Partition part = Bisect(g, pp);
+    Partition part;
+    if (!options.partitionTreePath.empty())
+    {
+      // A map update: same roads mostly, new feature ids. Reuse the cells of the previous version.
+      PartitionTree tree;
+      std::string why;
+      if (LoadPartitionTree(options.partitionTreePath, tree))
+      {
+        if (ReplayPartition(g, tree, pp, part, &why))
+          result.reusedCells = true;
+        else
+          rep.Log("not reusing the previous cells: " + why);
+      }
+    }
+    if (!result.reusedCells)
+      part = Bisect(g, pp);
     rep.CheckCancelled();
     double const partSec = Since(t0);
     {
       std::ostringstream os;
-      os << "cells per level";
+      os << (result.reusedCells ? "cells reused from the previous map version," : "cells per level");
       for (auto nc : part.numCells)
         os << " " << nc;
       os << " in " << partSec << " s, " << Mem();
@@ -902,6 +917,8 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       return result;
     }
     result.fileBytes = mo->FileBytes();
+    if (!options.partitionTreePath.empty() && !result.reusedCells && !SavePartitionTree(part.tree, options.partitionTreePath))
+      rep.Log("couldn't save the partition tree to " + options.partitionTreePath);
 
     if (options.checkFile)
     {

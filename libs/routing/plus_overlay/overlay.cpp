@@ -1,6 +1,9 @@
 #include "routing/plus_overlay/overlay.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <atomic>
 #include <mutex>
 #include <chrono>
@@ -200,14 +203,25 @@ public:
 
   // Subtrees touch disjoint vertex sets, so they can run on different threads: m_rank is only written
   // for the subtree's own vertices, and m_memb (read for neighbours) holds a stamp unique to the call.
-  void Run(std::vector<VertexId> verts, uint64_t parentSize)
+  // Returns the node of |verts| in the partition tree.
+  uint32_t Run(std::vector<VertexId> verts, uint64_t parentSize)
   {
     auto const & cs = m_params.cellSizes;
     size_t const m = verts.size();
+    uint32_t node;
+    {
+      std::lock_guard<std::mutex> lock(m_cellMutex);
+      node = static_cast<uint32_t>(m_p.tree.nodes.size());
+      m_p.tree.nodes.emplace_back();
+    }
     for (size_t li = 0; li < cs.size(); ++li)
     {
       if (m <= cs[li] && parentSize > cs[li])
       {
+        {
+          std::lock_guard<std::mutex> lock(m_cellMutex);
+          m_p.tree.nodes[node].closes |= static_cast<uint8_t>(1u << li);
+        }
         uint32_t id;
         {
           std::lock_guard<std::mutex> lock(m_cellMutex);
@@ -221,10 +235,10 @@ public:
     {
       if (m_params.progress && m_g.n > 0)
         m_params.progress(static_cast<double>(m_placed.fetch_add(m) + m) / m_g.n);
-      return;
+      return node;
     }
     if (m_params.cancelled && m_params.cancelled())
-      return;
+      return node;
 
     uint32_t const stamp = m_stamp.fetch_add(1) + 1;
     for (VertexId v : verts)
@@ -239,6 +253,7 @@ public:
     int64_t bestCut = std::numeric_limits<int64_t>::max();
     size_t bestK = m / 2;
     int bestDir = -1;
+    float bestThreshold = 0;
 
     for (int d = 0; d < m_params.directions; ++d)
     {
@@ -279,6 +294,7 @@ public:
         {
           bestCut = cut;
           bestK = k;
+          bestThreshold = kv[k - 1].first + (kv[k].first - kv[k - 1].first) / 2;
           if (bestOrder.size() != m || d != bestDir)
           {
             bestOrder.resize(m);
@@ -297,6 +313,11 @@ public:
     std::vector<VertexId>().swap(verts);
     std::vector<VertexId>().swap(bestOrder);
 
+    {
+      std::lock_guard<std::mutex> lock(m_cellMutex);
+      m_p.tree.nodes[node].dir = static_cast<uint8_t>(std::max(0, bestDir));
+      m_p.tree.nodes[node].threshold = bestThreshold;
+    }
     // Hand the left half to another thread if one is free and the half is worth it.
     bool spawn = false;
     if (left.size() > 20000)
@@ -307,19 +328,26 @@ public:
       }
       spawn = f > 0;
     }
+    uint32_t leftNode = 0, rightNode = 0;
     if (spawn)
     {
-      std::thread t([this, l = std::move(left), m]() mutable { Run(std::move(l), m); });
-      Run(std::move(right), m);
+      std::thread t([this, l = std::move(left), m, &leftNode]() mutable { leftNode = Run(std::move(l), m); });
+      rightNode = Run(std::move(right), m);
       t.join();
       m_freeThreads.fetch_add(1);
     }
     else
     {
-      Run(std::move(left), m);
-      Run(std::move(right), m);
+      leftNode = Run(std::move(left), m);
+      rightNode = Run(std::move(right), m);
     }
+    std::lock_guard<std::mutex> lock(m_cellMutex);
+    m_p.tree.nodes[node].left = leftNode;
+    m_p.tree.nodes[node].right = rightNode;
+    return node;
   }
+
+  float K() const { return m_k; }
 
 private:
   Graph const & m_g;
@@ -345,8 +373,137 @@ Partition Bisect(Graph const & g, PartitionParams const & params)
   for (uint32_t v = 0; v < g.n; ++v)
     all[v] = v;
   Bisector b(g, params, p);
-  b.Run(std::move(all), std::numeric_limits<uint64_t>::max());
+  p.tree.root = b.Run(std::move(all), std::numeric_limits<uint64_t>::max());
+  p.tree.k = b.K();
+  p.tree.directions = params.directions;
+  p.tree.cellSizes = params.cellSizes;
   return p;
+}
+
+bool ReplayPartition(Graph const & g, PartitionTree const & tree, PartitionParams const & params, Partition & p,
+                     std::string * why)
+{
+  auto fail = [&](std::string const & s)
+  {
+    if (why)
+      *why = s;
+    return false;
+  };
+  if (tree.Empty() || tree.directions != params.directions || tree.cellSizes != params.cellSizes ||
+      tree.root >= tree.nodes.size())
+    return fail("partition tree made with other parameters");
+  size_t const levels = params.cellSizes.size();
+  p = {};
+  p.cell.assign(levels, std::vector<uint32_t>(g.n, kNone));
+  p.numCells.assign(levels, 0);
+  std::vector<VertexId> all(g.n);
+  for (uint32_t v = 0; v < g.n; ++v)
+    all[v] = v;
+  // Iterative walk; empty subtrees get no cell ids.
+  std::vector<std::pair<uint32_t, std::vector<VertexId>>> stack;
+  stack.emplace_back(tree.root, std::move(all));
+  uint64_t steps = 0;
+  while (!stack.empty())
+  {
+    auto [node, verts] = std::move(stack.back());
+    stack.pop_back();
+    if (verts.empty())
+      continue;
+    if (node >= tree.nodes.size() || ++steps > 4 * tree.nodes.size() + 16)
+      return fail("damaged partition tree");
+    auto const & nd = tree.nodes[node];
+    for (size_t li = 0; li < levels; ++li)
+    {
+      if (!(nd.closes & (1u << li)))
+        continue;
+      uint32_t const id = p.numCells[li]++;
+      for (VertexId v : verts)
+        p.cell[li][v] = id;
+    }
+    if (nd.dir == PartitionTree::kLeaf)
+      continue;
+    if (nd.dir >= tree.directions)
+      return fail("damaged partition tree");
+    double const a = M_PI * nd.dir / tree.directions;
+    float const c = static_cast<float>(std::cos(a)) * tree.k;
+    float const s = static_cast<float>(std::sin(a));
+    std::vector<VertexId> left, right;
+    for (VertexId v : verts)
+      (g.lon[v] * c + g.lat[v] * s < nd.threshold ? left : right).push_back(v);
+    std::vector<VertexId>().swap(verts);
+    stack.emplace_back(nd.right, std::move(right));
+    stack.emplace_back(nd.left, std::move(left));
+  }
+  // Every vertex needs a cell at every level, and level-1 cells mustn't grow much (query speed).
+  std::vector<uint32_t> size1(p.numCells[0], 0);
+  for (size_t li = 0; li < levels; ++li)
+    for (uint32_t v = 0; v < g.n; ++v)
+      if (p.cell[li][v] == kNone)
+        return fail("partition tree doesn't cover every road");
+  for (uint32_t v = 0; v < g.n; ++v)
+    ++size1[p.cell[0][v]];
+  uint32_t const biggest = size1.empty() ? 0 : *std::max_element(size1.begin(), size1.end());
+  if (biggest > 2 * params.cellSizes[0])
+    return fail("roads changed too much for the old cells (a cell has " + std::to_string(biggest) + " points)");
+  p.tree = tree;
+  return true;
+}
+
+namespace
+{
+constexpr char kTreeMagic[8] = {'P', 'L', 'U', 'S', 'T', 'R', 'E', '1'};
+}
+
+bool SavePartitionTree(PartitionTree const & t, std::string const & path)
+{
+  std::string const tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out)
+      return false;
+    uint32_t const nNodes = static_cast<uint32_t>(t.nodes.size()), nSizes = static_cast<uint32_t>(t.cellSizes.size());
+    int32_t const dirs = t.directions;
+    out.write(kTreeMagic, sizeof(kTreeMagic));
+    out.write(reinterpret_cast<char const *>(&nNodes), 4);
+    out.write(reinterpret_cast<char const *>(&t.root), 4);
+    out.write(reinterpret_cast<char const *>(&t.k), 4);
+    out.write(reinterpret_cast<char const *>(&dirs), 4);
+    out.write(reinterpret_cast<char const *>(&nSizes), 4);
+    out.write(reinterpret_cast<char const *>(t.cellSizes.data()), nSizes * 4);
+    out.write(reinterpret_cast<char const *>(t.nodes.data()), static_cast<std::streamsize>(nNodes * sizeof(PartitionTree::Node)));
+    if (!out)
+      return false;
+  }
+  return std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+bool LoadPartitionTree(std::string const & path, PartitionTree & t)
+{
+  std::ifstream in(path, std::ios::binary);
+  char magic[8];
+  uint32_t nNodes = 0, nSizes = 0;
+  int32_t dirs = 0;
+  t = {};
+  if (!in.read(magic, 8) || std::memcmp(magic, kTreeMagic, 8) != 0)
+    return false;
+  in.read(reinterpret_cast<char *>(&nNodes), 4);
+  in.read(reinterpret_cast<char *>(&t.root), 4);
+  in.read(reinterpret_cast<char *>(&t.k), 4);
+  in.read(reinterpret_cast<char *>(&dirs), 4);
+  in.read(reinterpret_cast<char *>(&nSizes), 4);
+  if (!in || nSizes > 16 || nNodes > (1u << 26))
+    return false;
+  t.directions = dirs;
+  t.cellSizes.resize(nSizes);
+  in.read(reinterpret_cast<char *>(t.cellSizes.data()), nSizes * 4);
+  t.nodes.resize(nNodes);
+  in.read(reinterpret_cast<char *>(t.nodes.data()), static_cast<std::streamsize>(nNodes * sizeof(PartitionTree::Node)));
+  if (!in)
+  {
+    t = {};
+    return false;
+  }
+  return true;
 }
 
 // Customization -----------------------------------------------------------------------------------

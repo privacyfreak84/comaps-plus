@@ -65,6 +65,17 @@ std::vector<DownloadedMap> DownloadedMaps(uint32_t avoidMask)
   return maps;
 }
 
+// Partition splits per map, kept across map versions so that a map update reuses the cells.
+std::string TreeDir()
+{
+  return base::JoinPath(GetPlatform().WritableDir(), "plus_overlay");
+}
+
+std::string TreePath(std::string const & countryId)
+{
+  return base::JoinPath(TreeDir(), countryId + ".tree");
+}
+
 // The writable directory and its map version subdirectories.
 std::set<std::string> MapDirs()
 {
@@ -158,11 +169,14 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(
   if (needBase)
   {
     g_buildingAvoidMask = 0;
+    if (Platform::MkDirChecked(TreeDir()))
+      o.partitionTreePath = TreePath(id);
     jint const code =
         report(plus_overlay::BuildOverlayFile(map->localFile, parentGetter, map->overlayPath, o), "overlay");
     if (code != 0)
       return code;
   }
+  o.partitionTreePath.clear();
   if (NeedsAvoidBuild(*map, mask))
   {
     g_buildingAvoidMask = mask;
@@ -214,6 +228,15 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDelete
   size_t deleted = 0;
   for (auto const & d : MapDirs())
     deleted += plus_overlay::DeleteOrphanedOverlayFiles(d, keepMask);
+  // Partition splits of maps that are no longer downloaded.
+  std::set<std::string> downloaded;
+  for (auto const & m : DownloadedMaps(0))
+    downloaded.insert(m.countryId);
+  Platform::FilesList trees;
+  Platform::GetFilesByExt(TreeDir(), ".tree", trees);
+  for (auto const & t : trees)
+    if (downloaded.count(t.substr(0, t.size() - 5)) == 0 && Platform::RemoveFileIfExists(base::JoinPath(TreeDir(), t)))
+      ++deleted;
   if (deleted)
     LOG(LINFO, ("Comaps++ overlay: deleted", deleted, "files of removed or updated maps"));
   return static_cast<jint>(deleted);

@@ -16,6 +16,7 @@
 #include <limits>
 #include <utility>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace plus_overlay
@@ -68,13 +69,43 @@ struct PartitionParams
   std::function<void(double)> progress;
 };
 
+// The geometric splits of a partition, so that a later version of the same map (new feature ids,
+// mostly the same roads) can be divided into the same cells without searching for cuts again.
+struct PartitionTree
+{
+  static constexpr uint8_t kLeaf = 0xFF;
+  struct Node
+  {
+    uint8_t dir = kLeaf;  // projection direction index, kLeaf for a level-1 cell
+    uint8_t closes = 0;   // bit li: this node is a cell of level li
+    uint16_t reserved = 0;
+    float threshold = 0;  // projected value < threshold: left child
+    uint32_t left = 0, right = 0;
+  };
+  static_assert(sizeof(Node) == 16, "");
+  std::vector<Node> nodes;
+  uint32_t root = 0;
+  float k = 1;  // cos(mean latitude): x = lon * k
+  int directions = 0;
+  std::vector<uint32_t> cellSizes;
+
+  bool Empty() const { return nodes.empty(); }
+};
+bool SavePartitionTree(PartitionTree const & t, std::string const & path);
+bool LoadPartitionTree(std::string const & path, PartitionTree & t);
+
 struct Partition
 {
   std::vector<std::vector<uint32_t>> cell;  // cell[level - 1][vertex]
   std::vector<uint32_t> numCells;           // per level
+  PartitionTree tree;                       // set by Bisect
   size_t Levels() const { return cell.size(); }
 };
 Partition Bisect(Graph const & g, PartitionParams const & params);
+// Divides |g| with the splits of |tree| (from Bisect on an earlier version of the same map). False (and
+// |why| set) if the tree doesn't fit |params| or the cells come out too unbalanced; then use Bisect.
+bool ReplayPartition(Graph const & g, PartitionTree const & tree, PartitionParams const & params, Partition & p,
+                     std::string * why = nullptr);
 
 struct LevelOverlay
 {
