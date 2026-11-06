@@ -36,6 +36,12 @@ public class NavigationSettingsFragment extends BaseXmlSettingsFragment
     initAutoZoomPrefsCallbacks();
     initAndroidAutoSupportPrefsCallback();
     initAutoRerouteCallback();
+    final TwoStatePreference showEngine = getPreference("pref_plus_show_engine");
+    showEngine.setChecked(PlusOverlaySettings.isShowEngine(requireContext()));
+    showEngine.setOnPreferenceChangeListener((preference, value) -> {
+      PlusOverlaySettings.setShowEngine(requireContext(), (boolean) value);
+      return true;
+    });
   }
 
   @Override

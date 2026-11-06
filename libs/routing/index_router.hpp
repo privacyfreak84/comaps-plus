@@ -140,7 +140,11 @@ private:
                                     RouterDelegate const & delegate, Route & route);
   // Comaps++: answers a car subroute from the per-map overlay files (for the current avoid options) if
   // every map the search reaches has one; false means "use the normal search".
-  bool TryPlusOverlay(IndexGraphStarter & starter, std::vector<Segment> & subroute);
+  // NoError: answered; RouteNotFound: the overlay is complete and there is no route; any other code
+  // (NeedMoreMaps used as "not applicable"): use the normal search.
+  RouterResultCode TryPlusOverlay(IndexGraphStarter & starter, std::vector<Segment> & subroute);
+  // Why the normal search ran for some leg of the route being calculated (empty: it didn't).
+  std::string m_plusNormalReason;
 public:
   // Comaps++ tests: the last CalculateRoute rejoined the previous route (AdjustRoute) instead of a new search.
   bool PlusLastWasAdjusted() const { return m_plusLastWasAdjusted; }

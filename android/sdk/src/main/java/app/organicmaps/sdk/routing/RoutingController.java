@@ -115,6 +115,9 @@ public class RoutingController
       if (mContainer != null)
         mContainer.refreshNavigationController();
 
+      if (sOnRouteResult != null && mLastRouterType == Router.Vehicle)
+        sOnRouteResult.onCarRouteResult(resultCode);
+
       if (mLastResultCode == ResultCodes.NO_ERROR || resultCode == ResultCodes.NEED_MORE_MAPS)
       {
         onBuiltRoute();
@@ -141,6 +144,20 @@ public class RoutingController
       });
     }
   };
+
+  // Comaps++: told about every car routing result (the app can show which router answered).
+  public interface CarRouteResultListener
+  {
+    void onCarRouteResult(int resultCode);
+  }
+
+  @Nullable
+  private static CarRouteResultListener sOnRouteResult;
+
+  public static void setOnCarRouteResult(@Nullable CarRouteResultListener listener)
+  {
+    sOnRouteResult = listener;
+  }
 
   private void onBuiltRoute()
   {

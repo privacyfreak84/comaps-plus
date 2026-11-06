@@ -6,6 +6,7 @@
 
 #include "routing/plus_overlay/overlay_builder.hpp"
 #include "routing/plus_overlay/overlay_file.hpp"
+#include "routing/plus_overlay/overlay_router.hpp"
 
 #include "routing/routing_options.hpp"
 
@@ -14,6 +15,8 @@
 
 #include "platform/local_country_file.hpp"
 #include "platform/platform.hpp"
+
+#include "geometry/mercator.hpp"
 
 #include "base/file_name_utils.hpp"
 #include "base/logging.hpp"
@@ -40,6 +43,7 @@ struct DownloadedMap
   int64_t version = 0;
   std::string overlayPath;
   std::string avoidPath;  // for the current avoid options (empty without)
+  m2::RectD rect;         // the map's bounds (mercator)
 };
 
 uint32_t CurrentAvoidMask()
@@ -60,7 +64,8 @@ std::vector<DownloadedMap> DownloadedMaps(uint32_t avoidMask)
     auto const & lf = info->GetLocalFile();
     auto const mwmPath = lf.GetPath(MapFileType::Map);
     maps.push_back({lf.GetCountryName(), lf, info->GetVersion(), plus_overlay::OverlayPathForMap(mwmPath),
-                    avoidMask ? plus_overlay::AvoidOverlayPathForMap(mwmPath, avoidMask) : std::string()});
+                    avoidMask ? plus_overlay::AvoidOverlayPathForMap(mwmPath, avoidMask) : std::string(),
+                    info->m_bordersRect});
   }
   return maps;
 }
@@ -108,14 +113,37 @@ bool NeedsAvoidBuild(DownloadedMap const & m, uint32_t avoidMask)
 extern "C"
 {
 // Downloaded maps whose overlay file is missing or was built for another map version / build parameters.
-JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeMapsToBuild(JNIEnv * env, jclass)
+// Most useful first: the map you are in, then the nearest ones (without a position: smallest first).
+JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeMapsToBuild(JNIEnv * env, jclass,
+                                                                                         jboolean hasPosition,
+                                                                                         jdouble lat, jdouble lon)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
-  std::vector<std::string> ids;
   uint32_t const mask = CurrentAvoidMask();
+  m2::PointD const here = mercator::FromLatLon(lat, lon);
+  std::vector<std::pair<double, std::string>> todo;
   for (auto const & m : DownloadedMaps(mask))
-    if (NeedsBaseBuild(m) || NeedsAvoidBuild(m, mask))
-      ids.push_back(m.countryId);
+  {
+    if (!NeedsBaseBuild(m) && !NeedsAvoidBuild(m, mask))
+      continue;
+    double key = 0;
+    if (hasPosition)
+    {
+      if (!m.rect.IsPointInside(here))
+        key = mercator::DistanceOnEarth(here, m.rect.Center());
+    }
+    else
+    {
+      uint64_t size = 0;
+      Platform::GetFileSizeByFullPath(m.localFile.GetPath(MapFileType::Map), size);
+      key = static_cast<double>(size);
+    }
+    todo.emplace_back(key, m.countryId);
+  }
+  std::sort(todo.begin(), todo.end());
+  std::vector<std::string> ids;
+  for (auto const & [k, id] : todo)
+    ids.push_back(id);
   return jni::ToJavaStringArray(env, ids);
 }
 
@@ -241,6 +269,22 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDelete
     LOG(LINFO, ("Comaps++ overlay: deleted", deleted, "files of removed or updated maps"));
   return static_cast<jint>(deleted);
 }
+// {engine, seconds, reason} of the last car route: engine is "none", "fast", "rejoin" or "normal".
+JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeLastEngine(JNIEnv * env, jclass)
+{
+  auto const r = plus_overlay::GetLastEngineReport();
+  char const * engine = "none";
+  switch (r.engine)
+  {
+  case plus_overlay::EngineReport::Engine::None: engine = "none"; break;
+  case plus_overlay::EngineReport::Engine::Overlay: engine = "fast"; break;
+  case plus_overlay::EngineReport::Engine::Rejoin: engine = "rejoin"; break;
+  case plus_overlay::EngineReport::Engine::Normal: engine = "normal"; break;
+  }
+  std::vector<std::string> const out{engine, std::to_string(r.seconds), r.reason};
+  return jni::ToJavaStringArray(env, out);
+}
+
 JNIEXPORT jlong JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeStorageBytes(JNIEnv *, jclass)
 {
   uint64_t bytes = 0;

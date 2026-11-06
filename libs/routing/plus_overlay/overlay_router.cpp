@@ -16,6 +16,7 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <unordered_map>
@@ -23,6 +24,24 @@
 
 namespace plus_overlay
 {
+namespace
+{
+std::mutex g_reportMutex;
+EngineReport g_report;
+}  // namespace
+
+void SetLastEngineReport(EngineReport const & r)
+{
+  std::lock_guard<std::mutex> lock(g_reportMutex);
+  g_report = r;
+}
+
+EngineReport GetLastEngineReport()
+{
+  std::lock_guard<std::mutex> lock(g_reportMutex);
+  return g_report;
+}
+
 namespace
 {
 using routing::Segment;

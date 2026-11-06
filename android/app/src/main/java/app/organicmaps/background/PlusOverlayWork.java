@@ -93,7 +93,7 @@ public class PlusOverlayWork extends Worker
     }
 
     PlusOverlay.nativeDeleteOrphans(PlusOverlaySettings.isKeepAll(mContext));
-    if (PlusOverlay.nativeMapsToBuild().length == 0)
+    if (mapsToBuild().length == 0)
       return Result.success();
 
     int built = 0;
@@ -105,7 +105,7 @@ public class PlusOverlayWork extends Worker
       while (!isStopped())
       {
         String next = null;
-        for (String id : PlusOverlay.nativeMapsToBuild())
+        for (String id : mapsToBuild())
         {
           if (!attempted.contains(id))
           {
@@ -162,6 +162,16 @@ public class PlusOverlayWork extends Worker
     if (!isStopped() && (built > 0 || failed > 0))
       notifyResult(built, failed);
     return Result.success();
+  }
+
+  // Maps that need building, the one you are in and the nearest first.
+  @NonNull
+  private String[] mapsToBuild()
+  {
+    final android.location.Location loc = MwmApplication.from(mContext).getLocationHelper().getSavedLocation();
+    if (loc == null)
+      return PlusOverlay.nativeMapsToBuild(false, 0, 0);
+    return PlusOverlay.nativeMapsToBuild(true, loc.getLatitude(), loc.getLongitude());
   }
 
   @Override

@@ -23,6 +23,37 @@ public final class PlusOverlaySettings
 {
   private static final String KEY_KEEP_ALL = "plus_overlay_keep_all_avoid";
   private static final String KEY_ASKED = "plus_overlay_storage_asked";
+  private static final String KEY_SHOW_ENGINE = "plus_show_engine";
+
+  public static boolean isShowEngine(@NonNull Context context)
+  {
+    return MwmApplication.prefs(context).getBoolean(KEY_SHOW_ENGINE, false);
+  }
+
+  public static void setShowEngine(@NonNull Context context, boolean show)
+  {
+    MwmApplication.prefs(context).edit().putBoolean(KEY_SHOW_ENGINE, show).apply();
+  }
+
+  /** After a car route: which router answered (only when the user turned this on). */
+  public static void maybeShowEngine(@NonNull Context context, int resultCode)
+  {
+    if (!isShowEngine(context))
+      return;
+    final String[] r = PlusOverlay.nativeLastEngine();
+    if (r.length < 3)
+      return;
+    final String secs = String.format(java.util.Locale.US, "%.1f", Double.parseDouble(r[1]));
+    final String text;
+    switch (r[0])
+    {
+    case "fast": text = context.getString(R.string.plus_engine_fast, secs); break;
+    case "rejoin": text = context.getString(R.string.plus_engine_rejoin, secs); break;
+    case "normal": text = context.getString(R.string.plus_engine_normal, secs, r[2]); break;
+    default: return;
+    }
+    android.widget.Toast.makeText(context, text, android.widget.Toast.LENGTH_LONG).show();
+  }
 
   private PlusOverlaySettings() {}
 

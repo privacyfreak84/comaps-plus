@@ -21,7 +21,7 @@ public final class PlusOverlay
    * that lack the overlay for the current avoid options.
    */
   @NonNull
-  public static native String[] nativeMapsToBuild();
+  public static native String[] nativeMapsToBuild(boolean hasPosition, double lat, double lon);
 
   /**
    * Builds what one map lacks (base overlay file, then the one for the current avoid options); blocks for
@@ -51,6 +51,10 @@ public final class PlusOverlay
    * settings on, the last ones are kept).
    */
   public static native int nativeDeleteOrphans(boolean keepAllAvoid);
+
+  /** {engine, seconds, reason} of the last car route; engine: "none", "fast", "rejoin" or "normal". */
+  @NonNull
+  public static native String[] nativeLastEngine();
 
   /** Bytes used by all overlay files. */
   public static native long nativeStorageBytes();

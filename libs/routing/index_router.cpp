@@ -359,6 +359,27 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
   {
     SCOPE_GUARD(featureRoadGraphClear, [this] { ClearState(); });
     m_plusLastWasAdjusted = false;
+    m_plusNormalReason.clear();
+    base::Timer plusTimer;
+    auto const publishReport = [this, &plusTimer]()
+    {
+      if (m_vehicleType != VehicleType::Car)
+        return;
+      plus_overlay::EngineReport r;
+      r.seconds = plusTimer.ElapsedSeconds();
+      r.engine = plus_overlay::EngineReport::Engine::Overlay;
+      if (m_plusLastWasAdjusted)
+      {
+        r.engine = plus_overlay::EngineReport::Engine::Rejoin;
+      }
+      else if (!m_plusNormalReason.empty())
+      {
+        r.engine = plus_overlay::EngineReport::Engine::Normal;
+        r.reason = m_plusNormalReason;
+      }
+      plus_overlay::SetLastEngineReport(r);
+    };
+    SCOPE_GUARD(plusReport, publishReport);
 
     if (adjustToPrevRoute && m_lastRoute && m_lastFakeEdges && finalPoint == m_lastRoute->GetFinish())
     {
@@ -688,8 +709,16 @@ RouterResultCode IndexRouter::CalculateSubroute(Checkpoints const & checkpoints,
 {
   subroute.clear();
 
-  if (!guidesActive && TryPlusOverlay(starter, subroute))
-    return RouterResultCode::NoError;
+  if (!guidesActive)
+  {
+    auto const code = TryPlusOverlay(starter, subroute);
+    if (code == RouterResultCode::NoError || code == RouterResultCode::RouteNotFound)
+      return code;
+  }
+  else
+  {
+    m_plusNormalReason = "guide tracks";
+  }
 
   SetupAlgorithmMode(starter, guidesActive);
 
@@ -709,17 +738,23 @@ RouterResultCode IndexRouter::CalculateSubroute(Checkpoints const & checkpoints,
   UNREACHABLE();
 }
 
-bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & subroute)
+RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & subroute)
 {
+  auto const notApplicable = [this](std::string const & why)
+  {
+    if (m_plusNormalReason.empty())
+      m_plusNormalReason = why;
+    return RouterResultCode::NeedMoreMaps;
+  };
   if (m_vehicleType != VehicleType::Car)
-    return false;
+    return RouterResultCode::NeedMoreMaps;
   static bool const disabled = []
   {
     char const * e = std::getenv("COMAPS_PLUS_OVERLAY");
     return e && std::string(e) == "0";
   }();
   if (disabled)
-    return false;
+    return notApplicable("overlay switched off (COMAPS_PLUS_OVERLAY=0)");
   // With avoid options each map also needs its cliques for exactly those options (built in the
   // background next to the base file); a map without them counts as having no overlay.
   auto const avoidMask = static_cast<uint32_t>(RoutingOptions::LoadOptionsFromSettings(m_vehicleType).GetOptions());
@@ -742,7 +777,7 @@ bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & 
                     avoidMask, avoidMask ? plus_overlay::AvoidOverlayPathForMap(mwmPath, avoidMask) : std::string()});
   }
   if (maps.empty())
-    return false;
+    return notApplicable("no maps");
   // Files are opened only for the maps a query reaches. If the route may pass through a map whose
   // overlay isn't built yet (or is stale), FindPath says so and the normal search answers.
   m_plusOverlay->SetMaps(maps);
@@ -764,14 +799,21 @@ bool IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, vector<Segment> & 
     LOG(LINFO, ("Comaps++ overlay route (avoid options", avoidMask, "):", stats.ms, "ms,", stats.settled, "settled,", stats.baseScans,
                 "edge lists,", stats.mapsUsed, "maps, weight", stats.weight, "; phases ms: ends", stats.fakeMs, "seeds",
                 stats.seedMs, "search", stats.searchMs, "unpack", stats.unpackMs));
-    return true;
+    return RouterResultCode::NoError;
   }
-  std::string why = result == plus_overlay::OverlayRouter::Result::NoRoute ? std::string("no route") : stats.reason;
+  subroute.clear();
+  if (result == plus_overlay::OverlayRouter::Result::NoRoute)
+  {
+    // The overlay holds every road of every map the search reached: the normal search would explore the
+    // same roads (slowly) and find nothing either.
+    LOG(LINFO, ("Comaps++ overlay: no route"));
+    return RouterResultCode::RouteNotFound;
+  }
+  std::string why = stats.reason;
   if (stats.hasMissingMap)
     why += " (" + m_numMwmIds->GetFile(stats.missingMap).GetName() + ")";
   LOG(LINFO, ("Comaps++ overlay:", why, "- using the normal search"));
-  subroute.clear();
-  return false;
+  return notApplicable(why);
 }
 
 RouterResultCode IndexRouter::CalculateSubrouteJointsMode(IndexGraphStarter & starter, RouterDelegate const & delegate,

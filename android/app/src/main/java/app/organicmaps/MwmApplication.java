@@ -157,6 +157,8 @@ public class MwmApplication extends Application implements Application.ActivityL
       // and for the avoid options whenever they change.
       PlusOverlayWork.enqueue(this);
       app.organicmaps.sdk.routing.RoutingOptions.setOnChangedListener(() -> PlusOverlayWork.enqueue(this));
+      app.organicmaps.sdk.routing.RoutingController.setOnCarRouteResult(
+          code -> app.organicmaps.background.PlusOverlaySettings.maybeShowEngine(this, code));
       onComplete.run();
     });
   }

@@ -25,6 +25,23 @@ class IndexGraphStarter;
 
 namespace plus_overlay
 {
+// Which engine answered the last car route, for the app's diagnostics (any thread).
+struct EngineReport
+{
+  enum class Engine
+  {
+    None,     // no car route yet
+    Overlay,  // every leg from the overlay files
+    Rejoin,   // CoMaps' short rejoin search after leaving the route (AdjustRoute)
+    Normal,   // CoMaps' normal search for at least one leg
+  };
+  Engine engine = Engine::None;
+  std::string reason;  // why the normal search ran
+  double seconds = 0;
+};
+void SetLastEngineReport(EngineReport const & r);
+EngineReport GetLastEngineReport();
+
 struct OverlayMap
 {
   routing::NumMwmId id = 0;

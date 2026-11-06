@@ -28,6 +28,13 @@
     android:persistent="false"
     android:title="@string/plus_overlay_storage_pref_title"
     app:singleLineTitle="false" />
+  <SwitchPreferenceCompat
+    android:key="pref_plus_show_engine"
+    android:persistent="false"
+    android:title="@string/plus_show_engine_title"
+    android:summary="@string/plus_show_engine_summary"
+    android:widgetLayout="@layout/preference_switch"
+    app:singleLineTitle="false" />
 
   <SwitchPreferenceCompat
     android:key="@string/pref_3d"
