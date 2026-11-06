@@ -107,3 +107,23 @@ Still needed:
 - A method to find alternatives that are actually different and still reasonable, not the best route with one small detour. Which method fits CoMaps' road graph and the prepared cells is not decided yet. Since a long route now takes a few seconds, a few extra searches per request are affordable.
 - Showing the alternatives on the map and in the route panel, and switching between them.
 - Keeping rerouting on the route the user picked.
+
+## 8. Less storage space and memory used by maps
+
+Status: not started.
+
+Maps take a lot of space on the phone, and the fast routes add to it. Measured with India maps (version 261004):
+
+| Map | Map file | Route data | Extra per avoid mix (tolls) |
+|---|---|---|---|
+| Uttar Pradesh | 201 MB | 108.7 MB | 68.2 MB |
+| Maharashtra | 165 MB | 56.8 MB | 31.7 MB |
+| Madhya Pradesh | 134 MB | 36.0 MB | 19.0 MB |
+
+Preparing the route data for Uttar Pradesh needs close to 1 GB of memory at its peak.
+
+Still needed:
+
+- Measuring where the space goes inside the map files and the route data, and how much memory the app uses while showing maps and routing.
+- Choosing what to shrink from those measurements. Nothing is decided yet.
+- Any change to the route data format should land before the first release, while no one but the developer has to prepare maps again.

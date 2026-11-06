@@ -89,6 +89,7 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 5. Remove links to CoMaps (website, donations and so on), keeping it in the credits.
 6. A new package name, app name and icon throughout the app.
 7. Several route options to choose from, as in Google Maps.
+8. Less storage space and memory used by maps on the phone.
 
 Details, status and what each item needs: [ROADMAP.md](ROADMAP.md).
 
