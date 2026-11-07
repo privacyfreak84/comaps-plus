@@ -107,20 +107,27 @@ Still needed:
 
 ## 8. Less storage space and memory used by maps
 
-Status: not started.
+Status: done, for the parts Comaps++ controls.
 
-Maps take a lot of space on the phone, and the fast routes add to it. Measured with India maps (version 261004):
+Sizes on the phone, maps version 261101 (all in decimal MB; the earlier toll figures for Maharashtra and Madhya Pradesh are from maps 261004):
 
-| Map | Map file | Route data | Extra per avoid mix (tolls) |
+| Map | Map file | Route data before / now | Avoid tolls before / now |
 |---|---|---|---|
-| Uttar Pradesh | 201 MB | 108.7 MB | 68.2 MB |
-| Maharashtra | 165 MB | 56.8 MB | 31.7 MB |
-| Madhya Pradesh | 134 MB | 36.0 MB | 19.0 MB |
+| Uttar Pradesh | 200.9 MB | 114.1 / 91.6 MB | 71.5 / 11.1 MB |
+| Maharashtra | 165.7 MB | 59.8 / 46.2 MB | 33.2 / 5.9 MB |
+| Madhya Pradesh | 134.2 MB | 37.8 / 29.0 MB | 19.9 / 2.8 MB |
+| Berlin | 111.7 MB | 8.6 / 6.7 MB | 3.5 / 0.7 MB (motorways) |
 
-Preparing the route data for Uttar Pradesh needs about 800 MB of memory at its peak.
+Done:
 
-Still needed:
+- Route data about 20% smaller, with the same routes: each vertex's cell is stored as runs of equal cells (Uttar Pradesh 17 MB to 3 MB), and which vertices are cell boundaries is read from the boundary lists already in the file instead of a byte per vertex (8.5 MB).
+- Avoid-setting data about 85% smaller: it stores only the cells whose stored times differ from the normal route data. Avoiding dirt roads changes more cells (38.6 MB for Uttar Pradesh).
+- Preparation memory: Uttar Pradesh route data 960 MB to about 800 MB at the peak (with roadmap item 2), avoid-setting data 830 MB to 770 MB.
+- Memory while routing, measured: Lucknow to Pune peaks at about 650 MB with Comaps++, against about 2.2 GB for CoMaps' own search.
+- The new file layout makes the app prepare every map once more after updating.
 
-- Measuring where the space goes inside the map files and the route data, and how much memory the app uses while showing maps and routing.
-- Choosing what to shrink from those measurements. Nothing is decided yet.
-- Any change to the route data format should land before the first release, while no one but the developer has to prepare maps again.
+Not done, and why:
+
+- The map files themselves come from CoMaps' servers in CoMaps' format. Making them smaller would mean generating and hosting maps, which this project doesn't do.
+- The stored travel times are now about 70% of the route data, as 4-byte numbers. Storing them in 2 bytes would save roughly another third of the route data, but rounds the stored times, so routes could differ from CoMaps' by a few seconds. Optional, if the space matters more than exact matching.
+- Most of the memory while routing is CoMaps' road graph, which CoMaps loads whole for each map a route touches. Loading it in parts would mean reworking CoMaps' own routing code.

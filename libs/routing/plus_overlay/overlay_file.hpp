@@ -37,8 +37,8 @@ namespace plus_overlay
 //   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
 //   cliques wrong; that is the only code change that makes the app rebuild every file.
 // - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
-constexpr uint32_t kFileFormatVersion = 4;  // 4: special vertices section
-constexpr uint32_t kMinReadableFormatVersion = 3;
+constexpr uint32_t kFileFormatVersion = 5;  // 4: special vertices; 5: smaller layout (see kMinReadable...)
+constexpr uint32_t kMinReadableFormatVersion = 5;  // 5: run-length cells, no role bytes, delta avoid files
 constexpr uint32_t kRoutingDataVersion = 2;  // 2: time-dependent edges, penalty units in cliques
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
@@ -165,7 +165,34 @@ public:
     uint64_t const * bits = nullptr;      // per cell, per entry row: ceil(exits / 64) words
     float const * values = nullptr;
     std::vector<uint64_t> wordOff;        // numCells + 1: first word of each cell
+    // With an avoid-option file attached, the cells whose cliques differ from these: per cell, kNoAlt or
+    // the cell's index in the avoid file's arrays (rows and words of its changed cells, in cell order).
+    std::vector<uint32_t> altCell;
+    uint32_t const * altRowRank = nullptr;
+    uint64_t const * altBits = nullptr;
+    float const * altValues = nullptr;
+    std::vector<uint32_t> altRowOff;   // per changed cell: its first row in altRowRank
+    std::vector<uint64_t> altWordOff;  // per changed cell: its first word in altBits
   };
+  static constexpr uint32_t kNoAlt = 0xFFFFFFFFu;
+
+  // One cell's clique rows: rowRank by the cell's entry row (values before it, as an index into values),
+  // bits from the cell's first word.
+  struct CellCliques
+  {
+    uint32_t const * rowRank;
+    uint64_t const * bits;
+    float const * values;
+  };
+  static CellCliques CliquesOf(Level const & L, uint32_t cell)
+  {
+    if (!L.altCell.empty() && L.altCell[cell] != kNoAlt)
+    {
+      uint32_t const k = L.altCell[cell];
+      return {L.altRowRank + L.altRowOff[k], L.altBits + L.altWordOff[k], L.altValues};
+    }
+    return {L.rowRank + L.entryOff[cell], L.bits + L.wordOff[cell], L.values};
+  }
 
   // Null (and |error| set) if the file is missing, damaged or doesn't match the expected map version
   // or build parameters. expectMwmVersion/expectParamsHash of 0 skip that check.
@@ -232,16 +259,34 @@ public:
   ViaWayAutomaton const * Automaton() const { return m_automaton.get(); }
 
   // Partition and roles.
+  // Level-1 cells are stored as runs: consecutive vertices mostly share a cell.
+  uint32_t Cell1(uint32_t v) const
+  {
+    uint64_t const upTo = ~uint64_t(0) >> (63 - (v & 63));  // bits 0..v of the word
+    uint32_t const run =
+        m_runRank[v >> 6] + static_cast<uint32_t>(__builtin_popcountll(m_runStarts[v >> 6] & upTo)) - 1;
+    return m_cell16 ? reinterpret_cast<uint16_t const *>(m_runCells)[run]
+                    : reinterpret_cast<uint32_t const *>(m_runCells)[run];
+  }
   uint32_t Cell(size_t li, uint32_t v) const
   {
-    uint32_t c = m_cell16 ? reinterpret_cast<uint16_t const *>(m_cell1)[v]
-                          : reinterpret_cast<uint32_t const *>(m_cell1)[v];
+    uint32_t c = Cell1(v);
     for (size_t k = 1; k <= li; ++k)
       c = m_parents[k][c];
     return c;
   }
-  bool IsEntry(size_t li, uint32_t v) const { return (m_roles[v] >> (2 * li)) & 1; }
-  bool IsExit(size_t li, uint32_t v) const { return (m_roles[v] >> (2 * li + 1)) & 1; }
+  bool IsEntry(size_t li, uint32_t v) const
+  {
+    auto const & L = m_levels[li];
+    uint32_t const c = Cell(li, v);
+    return std::binary_search(L.entries + L.entryOff[c], L.entries + L.entryOff[c + 1], v);
+  }
+  bool IsExit(size_t li, uint32_t v) const
+  {
+    auto const & L = m_levels[li];
+    uint32_t const c = Cell(li, v);
+    return std::binary_search(L.exits + L.exitOff[c], L.exits + L.exitOff[c + 1], v);
+  }
   uint32_t EntryIdx(size_t li, uint32_t cell, uint32_t v) const;
   uint32_t ExitIdx(size_t li, uint32_t cell, uint32_t v) const;
 
@@ -267,13 +312,14 @@ public:
     uint32_t const i = EntryIdx(li, cell, v);
     if (i >= L.entryOff[cell + 1] - L.entryOff[cell] || L.entries[L.entryOff[cell] + i] != v)
       return;  // not an entry of that cell: damaged file
-    uint64_t const row = L.wordOff[cell] + i * wpr;
-    uint64_t idx = L.rowRank[L.entryOff[cell] + i];
+    auto const cc = CliquesOf(L, cell);
+    uint64_t const row = i * wpr;
+    uint64_t idx = cc.rowRank[i];
     uint32_t const * exits = L.exits + L.exitOff[cell];
     for (uint64_t k = 0; k < wpr; ++k)
-      for (uint64_t w = L.bits[row + k]; w != 0; w &= w - 1)
+      for (uint64_t w = cc.bits[row + k]; w != 0; w &= w - 1)
       {
-        float const v = L.values[idx++];
+        float const v = cc.values[idx++];
         if (IsUsableWeight(v))
           CallClique(f, exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], v);
       }
@@ -292,18 +338,19 @@ public:
     uint64_t const k = j / 64, bit = j % 64;
     uint64_t const below = (uint64_t(1) << bit) - 1;
     uint32_t const * entries = L.entries + L.entryOff[cell];
+    auto const cc = CliquesOf(L, cell);
     for (uint64_t i = 0; i < nEn; ++i)
     {
-      uint64_t const row = L.wordOff[cell] + i * wpr;
-      uint64_t const word = L.bits[row + k];
+      uint64_t const row = i * wpr;
+      uint64_t const word = cc.bits[row + k];
       if (!((word >> bit) & 1))
         continue;
-      uint64_t idx = L.rowRank[L.entryOff[cell] + i];
+      uint64_t idx = cc.rowRank[i];
       for (uint64_t q = 0; q < k; ++q)
-        idx += static_cast<uint64_t>(__builtin_popcountll(L.bits[row + q]));
+        idx += static_cast<uint64_t>(__builtin_popcountll(cc.bits[row + q]));
       idx += static_cast<uint64_t>(__builtin_popcountll(word & below));
-      if (IsUsableWeight(L.values[idx]))
-        CallClique(f, entries[i], L.values[idx]);
+      if (IsUsableWeight(cc.values[idx]))
+        CallClique(f, entries[i], cc.values[idx]);
     }
   }
 
@@ -347,9 +394,11 @@ private:
   uint32_t m_numWords = 0;
   uint32_t const * m_copyOrig = nullptr;
   uint32_t const * m_copyState = nullptr;
-  uint8_t const * m_cell1 = nullptr;  // uint16 or uint32 per vertex
+  uint64_t const * m_runStarts = nullptr;  // bit per vertex: a run of equal level-1 cells starts here
+  uint32_t const * m_runRank = nullptr;    // per word of m_runStarts: runs started before it
+  uint8_t const * m_runCells = nullptr;    // uint16 or uint32 per run: its level-1 cell
+  uint64_t m_numRuns = 0;
   std::vector<uint32_t const *> m_parents;  // [li] for li >= 1: level-(li-1) cell -> level-li cell
-  uint8_t const * m_roles = nullptr;
   FileTransition const * m_transitions = nullptr;
   std::vector<uint32_t> m_special;
   bool m_timeDependent = false;

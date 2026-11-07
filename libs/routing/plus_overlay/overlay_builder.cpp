@@ -727,8 +727,10 @@ void PartitionFromFile(MappedOverlay const & base, Partition & p, Overlay & ov)
     L.entries.assign(F.entries, F.entries + F.entryOff[F.numCells]);
     L.exits.assign(F.exits, F.exits + F.exitOff[F.numCells]);
     L.role.assign(n, 0);
-    for (uint32_t v = 0; v < n; ++v)
-      L.role[v] = static_cast<uint8_t>((base.IsEntry(li, v) ? 1 : 0) | (base.IsExit(li, v) ? 2 : 0));
+    for (uint32_t v : L.entries)
+      L.role[v] |= 1;
+    for (uint32_t v : L.exits)
+      L.role[v] |= 2;
     L.matOff.assign(F.numCells + 1, 0);
     for (uint32_t c = 0; c < F.numCells; ++c)
       L.matOff[c + 1] = L.matOff[c] + (L.entryOff[c + 1] - L.entryOff[c]) * (L.exitOff[c + 1] - L.exitOff[c]);
@@ -787,6 +789,14 @@ BuildResult BuildAvoidCliquesFile(platform::LocalCountryFile const & localFileIn
       std::ostringstream os;
       os << "shortcuts in " << Since(t0) << " s, " << Mem();
       rep.Log(os.str());
+    }
+    // Writing needs only the cliques: free the graph and the cells first (peak memory). The file check
+    // below compares against them.
+    if (!options.checkFile)
+    {
+      lg = LeanGraph();
+      part = Partition();
+      ReleaseFreedMemory();
     }
 
     if (!WriteAvoidCliquesFile(result.path, *base, avoidMask, ov, &result.error))

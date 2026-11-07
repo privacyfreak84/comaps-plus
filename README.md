@@ -40,12 +40,16 @@ Storage, per map:
 
 | Map | Map file | Route data | Extra for one avoid mix (tolls) |
 |---|---|---|---|
-| Uttar Pradesh | 201 MB | 108.8 MB | 68.2 MB |
-| Maharashtra | 165 MB | 57.1 MB | 31.7 MB |
-| Madhya Pradesh | 134 MB | 36.1 MB | 19.0 MB |
-| Berlin | 107 MB | 8.3 MB | 3.3 MB (motorways) |
+| Uttar Pradesh | 200.9 MB | 91.6 MB | 11.1 MB |
+| Maharashtra | 165.7 MB | 46.2 MB | 5.9 MB |
+| Madhya Pradesh | 134.2 MB | 29.0 MB | 2.8 MB |
+| Berlin | 111.7 MB | 6.7 MB | 0.7 MB (motorways) |
+
+An avoid mix stores only the parts of the network it changes, so its size depends on the settings: avoiding dirt roads, which are common in India, takes 38.6 MB for Uttar Pradesh.
 
 Preparation time and peak memory on the 2-core test VM: Uttar Pradesh about 1.5 minutes and 800 MB, Maharashtra 1 minute and 550 MB, Madhya Pradesh 35 s and 375 MB, Berlin 6 s and about 120 MB. On a test phone, preparation ran in the background without Android closing the app and without the app lagging.
+
+Memory while routing: for Lucknow to Pune the whole router process on the test VM peaked at about 650 MB, against about 2.2 GB for CoMaps' own search, with the same arrival time. Most of the 650 MB is CoMaps' road graph for the three maps, which CoMaps loads whole.
 
 ### How the routes were checked
 
@@ -54,6 +58,7 @@ The point of the overlay is speed without different routes, so every change was 
 - 13 routes of 108 to 1,218 km across Uttar Pradesh, Madhya Pradesh and Maharashtra: identical arrival times.
 - 327 generated routes in 12 groups (state borders, bridges and tunnels, dead ends, small islands, one-way streets, ramps, restricted access, roundabouts, random pairs, the longest possible pairs, and 20 hand-picked routes such as the Mumbai to Pune expressway ghats and the Bandra-Worli sea link): the same outcome in all 327 (routed or not), no crash or hang. Where both routed, arrival times matched within a minute except on two routes. On one, Comaps++ found a route more than a minute quicker. On the other, CoMaps' route arrives 64 s sooner but scores worse by CoMaps' own measure, which adds penalties for roads with restricted access.
 - 24 routes with avoid settings, 6 routes with 1 to 3 stops, 110 reroutes: same arrival times.
+- After the storage changes (roadmap item 8): the 10 long Indian routes, with and without tolls, and 386 German routes gave the same arrival times as before, except two German routes that changed by 4 and 7 seconds.
 - Inside one map, 100 random routes against a plain shortest-path search: no differences.
 - Outside India, 776 generated routes in Berlin with Brandenburg (386) and in Tyrol, Salzburg and Vorarlberg (390), with the clock set to Monday 08:30, including 40 routes per region that start on a time-restricted road: the same outcome in all 776, and arrival times within a minute except on 5 routes. The 40 time-restricted routes in Germany were also run at Sunday 03:00 and Friday 17:30. Avoiding motorways, 39 German border routes: all within a minute.
 
@@ -91,7 +96,7 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 5. Remove links to CoMaps (website, donations and so on), keeping it in the credits.
 6. A new package name, app name and icon throughout the app.
 7. Several route options to choose from, as in Google Maps.
-8. Less storage space and memory used by maps on the phone.
+8. Less storage space and memory used by maps on the phone. Done for the route data; the map files come from CoMaps.
 
 Details, status and what each item needs: [ROADMAP.md](ROADMAP.md).
 
