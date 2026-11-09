@@ -10,7 +10,8 @@
 //   - the nested partition (level-1 cell per vertex, parent tables above);
 //   - per vertex a role byte (entry/exit of its cell, two bits per level);
 //   - per level: entries/exits of every cell and the entry x exit cliques, sparse: one bit per
-//     (entry, exit) pair and the finite values as float32 (about a third of the pairs are unreachable);
+//     (entry, exit) pair (about a third of the pairs are unreachable) and the finite values as 16-bit
+//     steps of a per-cell scale, plus a byte of penalty units per value in cells that have any;
 //   - the map's border transitions (OSM way id + segment index), used to join maps at query time.
 // The header carries the map version and a hash of the build parameters; a file whose map version or
 // parameters don't match is treated as missing and rebuilt.
@@ -37,8 +38,8 @@ namespace plus_overlay
 //   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
 //   cliques wrong; that is the only code change that makes the app rebuild every file.
 // - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
-constexpr uint32_t kFileFormatVersion = 5;  // 4: special vertices; 5: smaller layout (see kMinReadable...)
-constexpr uint32_t kMinReadableFormatVersion = 5;  // 5: run-length cells, no role bytes, delta avoid files
+constexpr uint32_t kFileFormatVersion = 6;  // 4: special vertices; 5: smaller layout; 6: 16-bit clique values
+constexpr uint32_t kMinReadableFormatVersion = 6;  // 6: 16-bit clique values, per-cell scales, penalty bytes
 constexpr uint32_t kRoutingDataVersion = 2;  // 2: time-dependent edges, penalty units in cliques
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
@@ -105,41 +106,13 @@ bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t p
 // Header only: |path| is an avoid-option file for the base file with |baseBuildId| and |avoidMask|.
 bool AvoidCliquesFileMatches(std::string const & path, uint64_t baseBuildId, uint32_t avoidMask);
 
-// A clique value carries, in its 3 lowest mantissa bits, the penalty units (dynamic_edges.hpp) of the
-// path it stands for, saturated at 7, so a search can tell travel time from penalties. Costs at most
-// 7 ulp of precision (0.06 s at a day's worth of seconds).
-inline float EncodeCliqueValue(double w, uint32_t penaltyUnits)
-{
-  float f = static_cast<float>(w);
-  uint32_t b;
-  std::memcpy(&b, &f, sizeof(b));
-  b = (b & ~7u) | std::min<uint32_t>(penaltyUnits, 7);
-  std::memcpy(&f, &b, sizeof(b));
-  return f;
-}
-inline float CliqueWeight(float v)
-{
-  uint32_t b;
-  std::memcpy(&b, &v, sizeof(b));
-  b &= ~7u;
-  std::memcpy(&v, &b, sizeof(b));
-  return v;
-}
-inline uint32_t CliquePenaltyUnits(float v)
-{
-  uint32_t b;
-  std::memcpy(&b, &v, sizeof(b));
-  return b & 7u;
-}
-// Calls f(vertex, weight) or f(vertex, weight, penalty units), whichever |f| takes.
-template <class F>
-void CallClique(F && f, uint32_t vertex, float stored)
-{
-  if constexpr (std::is_invocable_v<F, uint32_t, float, uint32_t>)
-    f(vertex, CliqueWeight(stored), CliquePenaltyUnits(stored));
-  else
-    f(vertex, CliqueWeight(stored));
-}
+// Clique values are stored per cell as travel time in 16-bit steps of the cell's scale (its largest time
+// / 65535, so at most half a step of rounding: under a second for any cell whose paths take less than
+// 18 hours), plus the path's penalty units (dynamic_edges.hpp) as a byte, saturated at 255. The value a
+// search uses is time + units * kCliquePenaltyS, as before.
+constexpr float kCliquePenaltyS = 1800.0f;  // == kPenaltyUnitS (checked in overlay_file.cpp)
+constexpr uint32_t kMaxCliqueSteps = 65535;
+constexpr uint32_t kMaxCliquePenaltyUnits = 255;
 
 class MappedOverlay;
 // Cliques computed with avoid options (|avoidMask|, RoutingOptions bits) for the vertices, partition and
@@ -163,14 +136,20 @@ public:
     uint32_t const * exits = nullptr;
     uint32_t const * rowRank = nullptr;   // per entry: values before its row
     uint64_t const * bits = nullptr;      // per cell, per entry row: ceil(exits / 64) words
-    float const * values = nullptr;
+    uint16_t const * values = nullptr;    // steps of the cell's scale
+    uint8_t const * penalty = nullptr;    // penalty units per value of the cells that have any
+    uint32_t const * penaltyOff = nullptr;  // numCells + 1: first penalty byte of each cell (none if equal)
+    float const * scale = nullptr;        // per cell: seconds per step
     std::vector<uint64_t> wordOff;        // numCells + 1: first word of each cell
     // With an avoid-option file attached, the cells whose cliques differ from these: per cell, kNoAlt or
     // the cell's index in the avoid file's arrays (rows and words of its changed cells, in cell order).
     std::vector<uint32_t> altCell;
     uint32_t const * altRowRank = nullptr;
     uint64_t const * altBits = nullptr;
-    float const * altValues = nullptr;
+    uint16_t const * altValues = nullptr;
+    uint8_t const * altPenalty = nullptr;
+    uint32_t const * altPenaltyOff = nullptr;  // per changed cell + 1
+    float const * altScale = nullptr;  // per changed cell
     std::vector<uint32_t> altRowOff;   // per changed cell: its first row in altRowRank
     std::vector<uint64_t> altWordOff;  // per changed cell: its first word in altBits
   };
@@ -182,16 +161,38 @@ public:
   {
     uint32_t const * rowRank;
     uint64_t const * bits;
-    float const * values;
+    uint16_t const * values;
+    uint8_t const * penalty;  // the cell's own penalty bytes, from its first value; null: no penalties
+    uint64_t firstValue;      // index of the cell's first value
+    float scale;
+    uint32_t Units(uint64_t idx) const { return penalty ? penalty[idx - firstValue] : 0; }
+    float Time(uint64_t idx) const { return static_cast<float>(values[idx]) * scale; }
+    // What a search adds: travel time plus penalties.
+    float Weight(uint64_t idx) const { return Time(idx) + static_cast<float>(Units(idx)) * kCliquePenaltyS; }
   };
   static CellCliques CliquesOf(Level const & L, uint32_t cell)
   {
     if (!L.altCell.empty() && L.altCell[cell] != kNoAlt)
     {
       uint32_t const k = L.altCell[cell];
-      return {L.altRowRank + L.altRowOff[k], L.altBits + L.altWordOff[k], L.altValues};
+      uint32_t const * rr = L.altRowRank + L.altRowOff[k];
+      bool const pen = L.altPenaltyOff[k + 1] > L.altPenaltyOff[k];
+      return {rr, L.altBits + L.altWordOff[k], L.altValues, pen ? L.altPenalty + L.altPenaltyOff[k] : nullptr,
+              L.entryOff[cell + 1] > L.entryOff[cell] ? rr[0] : 0, L.altScale[k]};
     }
-    return {L.rowRank + L.entryOff[cell], L.bits + L.wordOff[cell], L.values};
+    uint32_t const * rr = L.rowRank + L.entryOff[cell];
+    bool const pen = L.penaltyOff[cell + 1] > L.penaltyOff[cell];
+    return {rr, L.bits + L.wordOff[cell], L.values, pen ? L.penalty + L.penaltyOff[cell] : nullptr,
+            L.entryOff[cell + 1] > L.entryOff[cell] ? rr[0] : 0, L.scale[cell]};
+  }
+  // Calls f(vertex, weight) or f(vertex, weight, penalty units), whichever |f| takes.
+  template <class F>
+  static void CallClique(F && f, uint32_t vertex, CellCliques const & cc, uint64_t idx)
+  {
+    if constexpr (std::is_invocable_v<F, uint32_t, float, uint32_t>)
+      f(vertex, cc.Weight(idx), cc.Units(idx));
+    else
+      f(vertex, cc.Weight(idx));
   }
 
   // Null (and |error| set) if the file is missing, damaged or doesn't match the expected map version
@@ -290,9 +291,9 @@ public:
   uint32_t EntryIdx(size_t li, uint32_t cell, uint32_t v) const;
   uint32_t ExitIdx(size_t li, uint32_t cell, uint32_t v) const;
 
-  // A stored clique weight is finite and >= 0 unless the file was damaged on storage; a damaged value is
-  // skipped, so it can't make a search loop (a negative cycle) or poison distances. Bit test, because
-  // the build uses -ffast-math (NaN comparisons may be folded away).
+  // A cell scale is finite and >= 0 unless the file was damaged on storage; files with a damaged scale are
+  // rejected when opened, so a search can't loop (a negative cycle) or get poisoned distances. Bit test,
+  // because the build uses -ffast-math (NaN comparisons may be folded away).
   static bool IsUsableWeight(float w)
   {
     uint32_t b;
@@ -302,6 +303,8 @@ public:
 
   // Clique weight from entry #i to exit #j of |cell| (>= 1e29 when unreachable).
   float Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) const;
+  // Seconds per stored step in |cell| (the rounding of its values is at most half of it).
+  float CellScale(size_t li, uint32_t cell) const { return CliquesOf(m_levels[li], cell).scale; }
   // f(exit vertex, weight) for every exit of |cell| reachable from its entry |v|.
   template <class F>
   void ForEachFromEntry(size_t li, uint32_t cell, uint32_t v, F && f) const
@@ -318,11 +321,7 @@ public:
     uint32_t const * exits = L.exits + L.exitOff[cell];
     for (uint64_t k = 0; k < wpr; ++k)
       for (uint64_t w = cc.bits[row + k]; w != 0; w &= w - 1)
-      {
-        float const v = cc.values[idx++];
-        if (IsUsableWeight(v))
-          CallClique(f, exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], v);
-      }
+        CallClique(f, exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], cc, idx++);
   }
   // f(entry vertex, weight) for every entry of |cell| that reaches its exit |v|.
   template <class F>
@@ -349,8 +348,7 @@ public:
       for (uint64_t q = 0; q < k; ++q)
         idx += static_cast<uint64_t>(__builtin_popcountll(cc.bits[row + q]));
       idx += static_cast<uint64_t>(__builtin_popcountll(word & below));
-      if (IsUsableWeight(cc.values[idx]))
-        CallClique(f, entries[i], cc.values[idx]);
+      CallClique(f, entries[i], cc, idx);
     }
   }
 

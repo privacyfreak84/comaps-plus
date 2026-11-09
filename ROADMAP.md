@@ -113,15 +113,16 @@ Sizes on the phone, maps version 261101 (all in decimal MB; the earlier toll fig
 
 | Map | Map file | Route data before / now | Avoid tolls before / now |
 |---|---|---|---|
-| Uttar Pradesh | 200.9 MB | 114.1 / 91.6 MB | 71.5 / 11.1 MB |
-| Maharashtra | 165.7 MB | 59.8 / 46.2 MB | 33.2 / 5.9 MB |
-| Madhya Pradesh | 134.2 MB | 37.8 / 29.0 MB | 19.9 / 2.8 MB |
-| Berlin | 111.7 MB | 8.6 / 6.7 MB | 3.5 / 0.7 MB (motorways) |
+| Uttar Pradesh | 200.9 MB | 114.1 / 63.8 MB | 71.5 / 7.7 MB |
+| Maharashtra | 165.7 MB | 59.8 / 33.9 MB | 33.2 / 3.6 MB |
+| Madhya Pradesh | 134.2 MB | 37.8 / 21.5 MB | 19.9 / 1.9 MB |
+| Berlin | 111.7 MB | 8.6 / 6.0 MB | 3.5 / 0.6 MB (motorways) |
 
 Done:
 
 - Route data about 20% smaller, with the same routes: each vertex's cell is stored as runs of equal cells (Uttar Pradesh 17 MB to 3 MB), and which vertices are cell boundaries is read from the boundary lists already in the file instead of a byte per vertex (8.5 MB).
-- Avoid-setting data about 85% smaller: it stores only the cells whose stored times differ from the normal route data. Avoiding dirt roads changes more cells (38.6 MB for Uttar Pradesh).
+- Avoid-setting data about 85% smaller: it stores only the cells whose stored times differ from the normal route data. Avoiding dirt roads changes more cells (24.1 MB for Uttar Pradesh).
+- Stored travel times in 2 bytes instead of 4: each cell stores its times as steps of its own scale (its longest time divided by 65,535), which rounds a stored time by at most half a second in the tested maps. Penalties for time-restricted roads get one more byte per value, but only in cells that have such roads. Indian route data is 26 to 30% smaller, avoid data 31 to 39%; German and Austrian route data only 9 to 17%, because most of their cells have time-restricted roads. Arrival times: no change on the 10 long Indian routes; changes of at most 1.1 s on 36 of 386 German routes and two of about 7 s (one faster, one slower); at most 0.1 s on 8 of 390 Austrian routes. Search times didn't change. Damaged scales or penalty offsets are rejected when a file is opened.
 - Preparation memory: Uttar Pradesh route data 960 MB to about 800 MB at the peak (with roadmap item 2), avoid-setting data 830 MB to 770 MB.
 - Memory while routing, measured: Lucknow to Pune peaks at about 650 MB with Comaps++, against about 2.2 GB for CoMaps' own search.
 - The new file layout makes the app prepare every map once more after updating.
@@ -129,7 +130,6 @@ Done:
 Not done, and why:
 
 - The map files themselves come from CoMaps' servers in CoMaps' format. Making them smaller would mean generating and hosting maps, which this project doesn't do.
-- The stored travel times are now about 70% of the route data, as 4-byte numbers. Storing them in 2 bytes would save roughly another third of the route data, but rounds the stored times, so routes could differ from CoMaps' by a few seconds. Optional, if the space matters more than exact matching.
 - Most of the memory while routing is CoMaps' road graph, which CoMaps loads whole for each map a route touches. Loading it in parts would mean reworking CoMaps' own routing code.
 
 ## 9. The same changes in the iOS and desktop apps

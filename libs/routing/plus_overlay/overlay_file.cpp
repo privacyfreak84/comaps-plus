@@ -1,5 +1,7 @@
 #include "routing/plus_overlay/overlay_file.hpp"
 
+#include "routing/plus_overlay/dynamic_edges.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <random>
@@ -48,7 +50,10 @@ enum LevelSection : uint32_t
   kExits,         // u32, per cell ascending
   kRowRank,       // u32 per entry: finite clique values before its row (in the level)
   kBits,          // u64: per cell, entry rows of ceil(exits / 64) words; bit set = finite
-  kValues,        // float32: the finite clique values, row by row
+  kValues,        // u16: the finite clique values, row by row, in steps of the cell's scale
+  kScale,         // float32 per cell (avoid files: per changed cell): seconds per step
+  kPenalty,       // u8 per value of the cells that have penalties: penalty units
+  kPenaltyOff,    // u32 per cell + 1 (avoid files: per changed cell + 1): first byte in kPenalty
   kLevelSections
 };
 
@@ -85,13 +90,17 @@ struct Header
 };
 #pragma pack(pop)
 
-// Every row's rank equals the values before it, and all values are used: row reads stay in bounds.
+// Every row's rank equals the values before it, and all values are used: row reads stay in bounds. Each
+// cell's penalty bytes are none or one per value.
 bool CliquesConsistent(MappedOverlay::Level const & L, uint32_t const * rowRank, uint64_t const * bits,
-                       uint64_t nValues)
+                       uint64_t nValues, uint32_t const * penaltyOff, uint64_t nPenalty)
 {
   uint64_t seen = 0, row = 0;
+  if (penaltyOff[0] != 0)
+    return false;
   for (uint32_t c = 0; c < L.numCells; ++c)
   {
+    uint64_t const cellFirst = seen;
     uint64_t const nEn = L.entryOff[c + 1] - L.entryOff[c];
     uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
     uint64_t const wpr = (nEx + 63) / 64;
@@ -105,8 +114,11 @@ bool CliquesConsistent(MappedOverlay::Level const & L, uint32_t const * rowRank,
       for (uint64_t k = 0; k < wpr; ++k)
         seen += static_cast<uint64_t>(__builtin_popcountll(bits[w0 + k]));
     }
+    uint64_t const pen = uint64_t(penaltyOff[c + 1]) - penaltyOff[c];
+    if (penaltyOff[c + 1] < penaltyOff[c] || (pen != 0 && pen != seen - cellFirst))
+      return false;
   }
-  return seen == nValues;
+  return seen == nValues && penaltyOff[L.numCells] == nPenalty;
 }
 
 bool IsReadableVersion(uint32_t v) { return v >= kMinReadableFormatVersion && v <= kFileFormatVersion; }
@@ -149,38 +161,88 @@ uint64_t BuildParamsHash(std::vector<uint32_t> const & cellSizes, double minBala
 
 namespace
 {
-// Sparse cliques of one level: a bit per (entry, exit), rows word-aligned, and the finite values in row order.
-bool EncodeCliques(LevelOverlay const & L, uint32_t numCells, std::vector<uint32_t> & rowRank,
-                   std::vector<uint64_t> & bits, std::vector<float> & values, std::string * error)
+static_assert(kCliquePenaltyS == kPenaltyUnitS, "");
+
+// Sparse cliques of one level: a bit per (entry, exit), rows word-aligned, and the finite values in row order
+// as steps of a per-cell scale, with their penalty units (penalty empty if all are zero).
+struct EncodedCliques
 {
-  rowRank.clear();
-  bits.clear();
-  values.clear();
-  rowRank.reserve(L.entries.size());
+  std::vector<uint32_t> rowRank;
+  std::vector<uint64_t> bits;
+  std::vector<uint16_t> values;
+  std::vector<uint8_t> penalty;      // the cells with penalties only
+  std::vector<uint32_t> penaltyOff;  // numCells + 1
+  std::vector<float> scale;  // per cell
+  std::vector<uint64_t> cellValue;  // numCells + 1: first value of each cell
+};
+
+bool EncodeCliques(LevelOverlay const & L, uint32_t numCells, EncodedCliques & e, std::string * error)
+{
+  e = {};
+  e.rowRank.reserve(L.entries.size());
+  e.scale.reserve(numCells);
+  e.cellValue.reserve(numCells + 1);
+  std::vector<double> time;
+  std::vector<uint8_t> cellPenalty;
   for (uint32_t c = 0; c < numCells; ++c)
   {
+    e.cellValue.push_back(e.values.size());
+    e.penaltyOff.push_back(static_cast<uint32_t>(e.penalty.size()));
+    cellPenalty.clear();
+    bool anyPenalty = false;
     uint64_t const nEn = L.entryOff[c + 1] - L.entryOff[c], nEx = L.exitOff[c + 1] - L.exitOff[c];
     uint64_t const wpr = (nEx + 63) / 64;
+    // Travel time of each finite value (the weight without its penalties), and the cell's largest.
+    time.clear();
+    double maxTime = 0;
+    for (uint64_t q = 0; q < nEn * nEx; ++q)
+    {
+      double const w = L.mat[L.matOff[c] + q];
+      if (w >= kInf)
+        continue;
+      uint32_t const k = std::min<uint32_t>(L.matK.empty() ? 0 : L.matK[L.matOff[c] + q], kMaxCliquePenaltyUnits);
+      double const t = std::max(0.0, w - k * double(kCliquePenaltyS));
+      time.push_back(t);
+      maxTime = std::max(maxTime, t);
+    }
+    float const scale = static_cast<float>(maxTime / kMaxCliqueSteps);
+    e.scale.push_back(scale);
+    size_t ti = 0;
     for (uint64_t i = 0; i < nEn; ++i)
     {
-      if (values.size() > 0xFFFFFFFFULL)
+      if (e.values.size() > 0xFFFFFFFFULL)
       {
         SetError(error, "too many clique values in one level");
         return false;
       }
-      rowRank.push_back(static_cast<uint32_t>(values.size()));
-      uint64_t const w0 = bits.size();
-      bits.resize(w0 + wpr, 0);
+      e.rowRank.push_back(static_cast<uint32_t>(e.values.size()));
+      uint64_t const w0 = e.bits.size();
+      e.bits.resize(w0 + wpr, 0);
       for (uint64_t j = 0; j < nEx; ++j)
       {
-        double const w = L.mat[L.matOff[c] + i * nEx + j];
-        if (w >= kInf)
+        uint64_t const q = i * nEx + j;
+        if (L.mat[L.matOff[c] + q] >= kInf)
           continue;
-        bits[w0 + j / 64] |= uint64_t(1) << (j % 64);
-        values.push_back(EncodeCliqueValue(w, L.matK.empty() ? 0 : L.matK[L.matOff[c] + i * nEx + j]));
+        e.bits[w0 + j / 64] |= uint64_t(1) << (j % 64);
+        double const steps = scale > 0 ? time[ti++] / scale : (++ti, 0.0);
+        e.values.push_back(static_cast<uint16_t>(std::min<double>(std::llround(steps), kMaxCliqueSteps)));
+        uint32_t const k = std::min<uint32_t>(L.matK.empty() ? 0 : L.matK[L.matOff[c] + q], kMaxCliquePenaltyUnits);
+        cellPenalty.push_back(static_cast<uint8_t>(k));
+        anyPenalty |= k != 0;
       }
     }
+    if (anyPenalty)
+    {
+      if (e.penalty.size() + cellPenalty.size() > 0xFFFFFFFFULL)
+      {
+        SetError(error, "too many penalty values in one level");
+        return false;
+      }
+      e.penalty.insert(e.penalty.end(), cellPenalty.begin(), cellPenalty.end());
+    }
   }
+  e.cellValue.push_back(e.values.size());
+  e.penaltyOff.push_back(static_cast<uint32_t>(e.penalty.size()));
   return true;
 }
 
@@ -365,19 +427,20 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   {
     auto const & L = ov.levels[li];
     std::vector<uint32_t> eo(L.entryOff.begin(), L.entryOff.end()), xo(L.exitOff.begin(), L.exitOff.end());
-    std::vector<uint32_t> rowRank;
-    std::vector<uint64_t> bits;
-    std::vector<float> values;
-    if (!EncodeCliques(L, p.numCells[li], rowRank, bits, values, error))
+    EncodedCliques e;
+    if (!EncodeCliques(L, p.numCells[li], e, error))
       return false;
     uint32_t const base = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
     putVec(base + kEntryOff, eo);
     putVec(base + kExitOff, xo);
     putVec(base + kEntries, L.entries);
     putVec(base + kExits, L.exits);
-    putVec(base + kRowRank, rowRank);
-    putVec(base + kBits, bits);
-    putVec(base + kValues, values);
+    putVec(base + kRowRank, e.rowRank);
+    putVec(base + kBits, e.bits);
+    putVec(base + kValues, e.values);
+    putVec(base + kScale, e.scale);
+    putVec(base + kPenalty, e.penalty);
+    putVec(base + kPenaltyOff, e.penaltyOff);
   }
   return w.Finish(error);
 }
@@ -416,37 +479,44 @@ bool WriteAvoidCliquesFile(std::string const & path, MappedOverlay const & base,
   }
   for (size_t li = 0; li < levels; ++li)
   {
-    std::vector<uint32_t> rowRank;
-    std::vector<uint64_t> bits;
-    std::vector<float> values;
-    if (!EncodeCliques(ov.levels[li], h.numCells[li], rowRank, bits, values, error))
+    EncodedCliques e;
+    if (!EncodeCliques(ov.levels[li], h.numCells[li], e, error))
       return false;
-    // Keep only the cells whose cliques differ from the base file's (bit for bit).
+    // Keep only the cells whose cliques differ from the base file's (bits, steps, scale and penalties).
     auto const & B = base.GetLevel(li);
     std::vector<uint32_t> changed, dRowRank;
     std::vector<uint64_t> dBits;
-    std::vector<float> dValues;
+    std::vector<uint16_t> dValues;
+    std::vector<uint8_t> dPenalty;
+    std::vector<uint32_t> dPenaltyOff{0};
+    std::vector<float> dScale;
     uint64_t word = 0;
     for (uint32_t c = 0; c < B.numCells; ++c)
     {
       uint64_t const nEn = B.entryOff[c + 1] - B.entryOff[c];
       uint64_t const words = nEn * ((B.exitOff[c + 1] - B.exitOff[c] + 63) / 64);
-      uint64_t const v0 = nEn ? rowRank[B.entryOff[c]] : 0;
-      uint64_t const v1 = nEn ? (c + 1 < B.numCells && B.entryOff[c + 1] < B.entryOff[B.numCells]
-                                     ? rowRank[B.entryOff[c + 1]]
-                                     : values.size())
-                              : 0;
+      uint64_t const v0 = e.cellValue[c], v1 = e.cellValue[c + 1];
       auto const bc = MappedOverlay::CliquesOf(B, c);
-      bool same = std::equal(bits.begin() + word, bits.begin() + word + words, bc.bits);
-      if (same && nEn)
-        same = std::memcmp(values.data() + v0, bc.values + bc.rowRank[0], (v1 - v0) * sizeof(float)) == 0;
+      bool same = std::equal(e.bits.begin() + word, e.bits.begin() + word + words, bc.bits);
+      if (same && v1 > v0)
+      {
+        uint64_t const b0 = bc.rowRank[0];
+        same = e.scale[c] == bc.scale &&
+               std::equal(e.values.begin() + v0, e.values.begin() + v1, bc.values + b0);
+        bool const pen = e.penaltyOff[c + 1] > e.penaltyOff[c];
+        for (uint64_t q = 0; same && q < v1 - v0; ++q)
+          same = (pen ? e.penalty[e.penaltyOff[c] + q] : 0u) == bc.Units(b0 + q);
+      }
       if (!same)
       {
         changed.push_back(c);
         for (uint64_t i = 0; i < nEn; ++i)
-          dRowRank.push_back(static_cast<uint32_t>(dValues.size() + rowRank[B.entryOff[c] + i] - v0));
-        dBits.insert(dBits.end(), bits.begin() + word, bits.begin() + word + words);
-        dValues.insert(dValues.end(), values.begin() + v0, values.begin() + v1);
+          dRowRank.push_back(static_cast<uint32_t>(dValues.size() + e.rowRank[B.entryOff[c] + i] - v0));
+        dBits.insert(dBits.end(), e.bits.begin() + word, e.bits.begin() + word + words);
+        dValues.insert(dValues.end(), e.values.begin() + v0, e.values.begin() + v1);
+        dScale.push_back(e.scale[c]);
+        dPenalty.insert(dPenalty.end(), e.penalty.begin() + e.penaltyOff[c], e.penalty.begin() + e.penaltyOff[c + 1]);
+        dPenaltyOff.push_back(static_cast<uint32_t>(dPenalty.size()));
       }
       word += words;
     }
@@ -455,6 +525,9 @@ bool WriteAvoidCliquesFile(std::string const & path, MappedOverlay const & base,
     w.PutVec(sec + kRowRank, dRowRank);
     w.PutVec(sec + kBits, dBits);
     w.PutVec(sec + kValues, dValues);
+    w.PutVec(sec + kScale, dScale);
+    w.PutVec(sec + kPenalty, dPenalty);
+    w.PutVec(sec + kPenaltyOff, dPenaltyOff);
   }
   return w.Finish(error);
 }
@@ -696,22 +769,27 @@ bool MappedOverlay::Parse(std::string * error)
     L.exits = reinterpret_cast<uint32_t const *>(sec(base + kExits));
     L.rowRank = reinterpret_cast<uint32_t const *>(sec(base + kRowRank));
     L.bits = reinterpret_cast<uint64_t const *>(sec(base + kBits));
-    L.values = reinterpret_cast<float const *>(sec(base + kValues));
+    L.values = reinterpret_cast<uint16_t const *>(sec(base + kValues));
+    L.penalty = sec(base + kPenalty);
+    L.penaltyOff = reinterpret_cast<uint32_t const *>(sec(base + kPenaltyOff));
+    L.scale = reinterpret_cast<float const *>(sec(base + kScale));
     L.wordOff.assign(L.numCells + 1, 0);
     for (uint32_t c = 0; c < L.numCells; ++c)
     {
       uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
       L.wordOff[c + 1] = L.wordOff[c] + uint64_t(L.entryOff[c + 1] - L.entryOff[c]) * ((nEx + 63) / 64);
     }
-    uint64_t const nEntries = L.entryOff[L.numCells], nValues = count(base + kValues, 4);
+    uint64_t const nEntries = L.entryOff[L.numCells], nValues = count(base + kValues, 2);
     if (L.wordOff[L.numCells] != count(base + kBits, 8) || count(base + kEntries, 4) != nEntries ||
-        count(base + kExits, 4) != L.exitOff[L.numCells] || count(base + kRowRank, 4) != nEntries)
+        count(base + kExits, 4) != L.exitOff[L.numCells] || count(base + kRowRank, 4) != nEntries ||
+        count(base + kScale, 4) != L.numCells || count(base + kPenaltyOff, 4) != L.numCells + 1ULL)
     {
       SetError(error, "bad level sizes");
       return false;
     }
     // Every row's values must lie inside the values section.
-    if (!CliquesConsistent(L, L.rowRank, L.bits, nValues))
+    if (!CliquesConsistent(L, L.rowRank, L.bits, nValues, L.penaltyOff, count(base + kPenalty, 1)) ||
+        !std::all_of(L.scale, L.scale + L.numCells, IsUsableWeight))
     {
       SetError(error, "bad clique values");
       return false;
@@ -820,7 +898,10 @@ bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidM
     std::vector<uint64_t> wordOff;
     uint32_t const * rowRank;
     uint64_t const * bits;
-    float const * values;
+    uint16_t const * values;
+    uint8_t const * penalty;
+    uint32_t const * penaltyOff;
+    float const * scale;
   };
   std::vector<Alt> alt(m_levels.size());
   for (size_t li = 0; li < m_levels.size(); ++li)
@@ -829,17 +910,27 @@ bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidM
     uint32_t const base = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
     auto & A = alt[li];
     if (h.numCells[li] != L.numCells || h.size[base + kEntries] % 4 || h.size[base + kRowRank] % 4 ||
-        h.size[base + kBits] % 8 || h.size[base + kValues] % 4)
+        h.size[base + kBits] % 8 || h.size[base + kValues] % 2 || h.size[base + kScale] % 4)
     {
       SetError(error, "avoid-option file has other level sizes");
       return false;
     }
     auto const * changed = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kEntries]);
     uint64_t const nChanged = h.size[base + kEntries] / 4, nRows = h.size[base + kRowRank] / 4;
-    uint64_t const nWords = h.size[base + kBits] / 8, nValues = h.size[base + kValues] / 4;
+    uint64_t const nWords = h.size[base + kBits] / 8, nValues = h.size[base + kValues] / 2;
     A.rowRank = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kRowRank]);
     A.bits = reinterpret_cast<uint64_t const *>(mp.data + h.offset[base + kBits]);
-    A.values = reinterpret_cast<float const *>(mp.data + h.offset[base + kValues]);
+    A.values = reinterpret_cast<uint16_t const *>(mp.data + h.offset[base + kValues]);
+    A.penalty = mp.data + h.offset[base + kPenalty];
+    A.penaltyOff = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kPenaltyOff]);
+    A.scale = reinterpret_cast<float const *>(mp.data + h.offset[base + kScale]);
+    if (h.size[base + kScale] / 4 != nChanged || h.size[base + kPenaltyOff] != 4 * (nChanged + 1) ||
+        A.penaltyOff[0] != 0 || A.penaltyOff[nChanged] != h.size[base + kPenalty] ||
+        !std::all_of(A.scale, A.scale + nChanged, IsUsableWeight))
+    {
+      SetError(error, "bad clique values");
+      return false;
+    }
     A.cell.assign(L.numCells, kNoAlt);
     uint64_t row = 0, word = 0, seen = 0;
     for (uint64_t k = 0; k < nChanged; ++k)
@@ -859,6 +950,7 @@ bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidM
         return false;
       }
       A.cell[c] = static_cast<uint32_t>(k);
+      uint64_t const cellFirst = seen;
       A.rowOff.push_back(static_cast<uint32_t>(row));
       A.wordOff.push_back(word);
       for (uint64_t i = 0; i < nEn; ++i, ++row)
@@ -878,6 +970,12 @@ bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidM
           seen += static_cast<uint64_t>(__builtin_popcountll(A.bits[w0 + q]));
       }
       word += nEn * wpr;
+      uint64_t const pen = uint64_t(A.penaltyOff[k + 1]) - A.penaltyOff[k];
+      if (A.penaltyOff[k + 1] < A.penaltyOff[k] || (pen != 0 && pen != seen - cellFirst))
+      {
+        SetError(error, "bad clique values");
+        return false;
+      }
     }
     if (row != nRows || word != nWords || seen != nValues)
     {
@@ -894,6 +992,9 @@ bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidM
     L.altRowRank = alt[li].rowRank;
     L.altBits = alt[li].bits;
     L.altValues = alt[li].values;
+    L.altPenalty = alt[li].penalty;
+    L.altPenaltyOff = alt[li].penaltyOff;
+    L.altScale = alt[li].scale;
   }
   std::swap(m_avoidFile.fd, mp.fd);
   std::swap(m_avoidFile.data, mp.data);
@@ -983,7 +1084,7 @@ float MappedOverlay::Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) co
   for (uint64_t k = 0; k < j / 64; ++k)
     idx += static_cast<uint64_t>(__builtin_popcountll(cc.bits[row + k]));
   idx += static_cast<uint64_t>(__builtin_popcountll(word & ((uint64_t(1) << (j % 64)) - 1)));
-  return IsUsableWeight(cc.values[idx]) ? CliqueWeight(cc.values[idx]) : 1e30f;
+  return cc.Weight(idx);
 }
 
 uint32_t MappedOverlay::ExitIdx(size_t li, uint32_t cell, uint32_t v) const

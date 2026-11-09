@@ -812,7 +812,7 @@ BuildResult BuildAvoidCliquesFile(platform::LocalCountryFile const & localFileIn
     if (options.checkFile)
     {
       uint64_t bad = 0;
-      double maxRel = 0;
+      double maxAbs = 0;
       for (size_t li = 0; li < part.Levels(); ++li)
       {
         auto const & M = ov.levels[li];
@@ -828,12 +828,18 @@ BuildResult BuildAvoidCliquesFile(platform::LocalCountryFile const & localFileIn
               if (inf0 != inf1)
                 ++bad;
               else if (!inf0)
-                maxRel = std::max(maxRel, std::abs(want - got) / std::max(1.0, want));
+              {
+                // Stored as steps of the cell's scale: off by at most half a step (plus float rounding).
+                double const err = std::abs(want - got);
+                maxAbs = std::max(maxAbs, err);
+                if (err > 0.5 * check->CellScale(li, c) + 1e-4 * std::max(1.0, want))
+                  ++bad;
+              }
             }
         }
       }
       std::ostringstream os;
-      os << "file check: " << bad << " clique mismatches; max relative float32 error " << maxRel;
+      os << "file check: " << bad << " clique mismatches; largest rounding " << maxAbs << " s";
       rep.Log(os.str());
       if (bad != 0)
       {
@@ -1095,7 +1101,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
               mo->IsExit(li, v) != ov.levels[li].IsExit(v))
             ++bad;
       }
-      double maxRel = 0;
+      double maxAbs = 0;
       for (size_t li = 0; li < part.Levels(); ++li)
       {
         auto const & M = ov.levels[li];
@@ -1111,12 +1117,18 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
               if (inf0 != inf1)
                 ++bad;
               else if (!inf0)
-                maxRel = std::max(maxRel, std::abs(want - got) / std::max(1.0, want));
+              {
+                // Stored as steps of the cell's scale: off by at most half a step (plus float rounding).
+                double const err = std::abs(want - got);
+                maxAbs = std::max(maxAbs, err);
+                if (err > 0.5 * mo->CellScale(li, c) + 1e-4 * std::max(1.0, want))
+                  ++bad;
+              }
             }
         }
       }
       std::ostringstream os;
-      os << "file check: " << bad << " mismatches in ids/cells/roles/cliques; max relative float32 error " << maxRel;
+      os << "file check: " << bad << " mismatches in ids/cells/roles/cliques; largest rounding " << maxAbs << " s";
       rep.Log(os.str());
       if (bad != 0)
       {

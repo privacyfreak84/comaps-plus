@@ -12,7 +12,7 @@
     <string name="plus_overlay_storage_current" translatable="false">Only for my current avoid settings (recommended)</string>
     <string name="plus_overlay_storage_current_text" translatable="false">Uses the least space. When you switch to a different mix of avoid settings, the phone prepares it again for the maps your route goes through, about a minute per map. Until then that route is a close estimate, and it updates by itself when the data is ready.</string>
     <string name="plus_overlay_storage_all" translatable="false">For every mix of avoid settings I use</string>
-    <string name="plus_overlay_storage_all_text" translatable="false">Switching back to settings you\'ve used before is instant, but every mix takes extra space: from a few percent of each map\'s size (tolls) to about a fifth (dirt roads).</string>
+    <string name="plus_overlay_storage_all_text" translatable="false">Switching back to settings you\'ve used before is instant, but every mix takes extra space: from a few percent of each map\'s size (tolls) to about an eighth (dirt roads).</string>
     <string name="plus_overlay_storage_used" translatable="false">Fast-route data now uses %s.</string>
     <string name="plus_overlay_storage_later" translatable="false">You can change this any time in Settings → Navigation → Fast routes.</string>
     <string name="plus_overlay_storage_pref_title" translatable="false">Fast routes with avoid settings</string>
