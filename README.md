@@ -23,14 +23,16 @@ Short trips were already quick, so the gain is in long ones. In maps with time-r
 
 ### What happens on the phone
 
-- After you download or update a map, a background job prepares its route data. A notification shows progress and has a Cancel button. The job also runs when the app starts, to catch anything missed.
+- After you download or update a map, a background job prepares its route data. A notification shows progress and has a Cancel button. The job also runs when the app starts, to catch anything missed, and after a reboot even if the app isn't opened.
+- The job doesn't wait for a charged battery or free storage, and doesn't give up on a map. If Android stops a preparation (for example for memory), it is tried again with one thread after the other maps, and from the third time with a growing pause (15 minutes up to 6 hours). A preparation that fails is tried again after 1, 4, 16 minutes and so on, up to 6 hours. A stopped preparation keeps its cell layout, so the next attempt skips the slowest step.
 - Until a map is prepared, car routes through it still work. Comaps++ estimates the part of the route inside that map from CoMaps' border-to-border times and shows a message that the route may be a few minutes off. That map is prepared first, and the route is recalculated by itself when it's ready.
-- Avoid settings (tolls, motorways, ferries, dirt roads, in any mix) work with fast routes. Each mix needs one more, smaller set of data, prepared only for the maps your routes go through. In Settings, Navigation, Fast routes with avoid settings, you choose whether to keep data for your current mix only (less space) or for every mix you use (switching back is instant).
+- Avoid settings (tolls, motorways, ferries, dirt roads, in any mix) work with fast routes, and their routes are exact from the moment you change the settings. Each map's route data records which of these road types every cell contains; for a map without data for your mix, the route goes through the cells with avoided roads road by road. That data, one smaller file per map, is prepared for every downloaded map as soon as you change the mix, the maps your routes use first, and the files of the previous mix are deleted. Until then routes avoiding tolls or motorways take about as long as with the data (0.9 to 3.9 s for the 10 long Indian routes, against 1.0 to 2.0 s), and routes avoiding dirt roads, which are in about half of all cells in India, are much slower (2.5 to 46 s on the test VM).
 - Rerouting after a missed turn goes straight to the fast search. In 110 test reroutes the new route was as quick as a fresh route from the same spot (one was 5 s slower), and took 0.3 to 3.2 seconds.
 - Routes with stops use the fast search for every leg.
 - App updates don't throw the data away. Map updates reuse the previous cell layout, which skips the slowest step: Uttar Pradesh takes 49 s instead of 153 s on the test VM.
-- If a data file turns out to be damaged, the app deletes it and treats that map as not prepared until it is rebuilt.
-- Settings, Navigation shows how many downloaded maps are ready. A test switch there, "Show how each car route was calculated", adds a short message after each route.
+- If a data file turns out to be damaged, the app deletes it and prepares it again; until then the map is treated as not prepared (or, for avoid-setting data, routes there are exact but slower).
+- Car routes don't hand over to CoMaps' old search. Only the stretch inside a map that isn't prepared yet uses CoMaps' search ([roadmap item 10](ROADMAP.md#10-route-data-always-ready-never-comaps-old-search)).
+- Settings, Navigation, Fast routes shows how many downloaded maps are ready (with data for your avoid settings) and how much space the data uses. A test switch there, "Show how each car route was calculated", adds a short message after each route.
 
 Walking and cycling routes use CoMaps' router unchanged. Walking routes take a few seconds even over 75 km. Cycling is slow only for multi-day trips (37 s for 600 km on the test VM), so a cycling overlay is not planned for now.
 
@@ -70,7 +72,8 @@ Two findings along the way. On 2 of 20 test routes in Uttar Pradesh, CoMaps' rou
 - Tested with India, Germany (Berlin, Brandenburg) and Austria (Tyrol, Salzburg, Vorarlberg) maps.
 - Near map borders a few routes differ slightly: in India 1 of 40 border test routes is more than a minute off (78 s). Comaps++ switches between maps only where a road crosses the border; CoMaps can switch at any junction of a road present in both maps. Doing the same was tried: it made long routes about twice as slow and improved 2 of 40 border routes, so it was left out.
 - A route that starts on a road closed at that moment starts on it and leaves it at the nearest junction; CoMaps starts from a neighbouring road instead. In tests this changed 1 of 40 such routes (5 minutes shorter).
-- Preparing a large map needs about 800 MB of memory at its peak (Uttar Pradesh). If Android stops a preparation, it is retried with one thread, up to 3 times.
+- Preparing a large map needs about 800 MB of memory at its peak (Uttar Pradesh). A phone that can never spare that much keeps retrying (with pauses) without finishing, and routes through that map stay estimated.
+- Each new route-data layout makes the app prepare every map again after updating; routes are estimated until it's done. Until there are releases this happens freely; after that, layout changes will keep old files readable.
 - Only the Android app prepares route data. The iOS and desktop apps from CoMaps are still in this repository but haven't been changed or tested.
 - The new messages and settings are in English only.
 
@@ -99,8 +102,8 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 7. Several route options to choose from, as in Google Maps.
 8. Less storage space and memory used by maps on the phone. Done for the route data; the map files come from CoMaps.
 9. The same changes in the iOS and desktop apps.
-10. Route data always ready for every downloaded map, so car routes never fall back to CoMaps' old search.
-11. Simpler avoid settings whose data is always there.
+10. Route data always ready for every downloaded map, so car routes never fall back to CoMaps' old search. Done.
+11. Simpler avoid settings whose data is always there. Done: routes with avoid settings are exact even before their data is ready.
 
 Details, status and what each item needs: [ROADMAP.md](ROADMAP.md).
 

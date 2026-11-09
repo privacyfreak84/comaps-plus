@@ -31,7 +31,7 @@ Done:
 - Long car routes in seconds instead of minutes, with the same routes CoMaps would choose. Measurements and checks are in the [README](README.md#fast-car-routes).
 - Route data prepared on the phone in the background, after downloads, map updates and app start, with progress and Cancel.
 - Routes through maps that aren't prepared yet: estimated, with a message, that map prepared first, the route recalculated by itself afterwards.
-- Avoid settings, with data prepared only for the maps your routes go through, and a choice to keep data for one mix or every mix.
+- Avoid settings, exact with or without their extra data (roadmap item 11).
 - Rerouting, routes with stops, start direction, app updates and map updates, damaged files.
 - Once every map on a route is prepared, the route doesn't use CoMaps' old car search.
 - Roads open only at certain times (access:conditional) are checked for the time the route gets there, not frozen when the map is prepared.
@@ -147,38 +147,41 @@ Needs:
 
 ## 10. Route data always ready, never CoMaps' old search
 
-Status: not started.
+Status: done, for everything the app can control.
 
-The route data is prepared on the phone, not downloaded (the project doesn't host files). The goal is that every downloaded map always has it, so no car route ever falls back to CoMaps' old search.
+The route data is prepared on the phone, not downloaded (the project doesn't host files). Every case found in the code where a map could stay without route data, or a car route could fall back to CoMaps' old search, is handled:
 
-Cases found so far in the code where a map can stay without route data, or a route can fall back:
+| Case | Before | Now |
+|---|---|---|
+| Battery low, storage low | The preparation job waited, possibly for days | Doesn't wait |
+| Android stops a preparation (memory, time limits) | Retried with one thread, given up after 3 times | Retried with one thread after the other maps, never given up; from the third time with a pause of 15 minutes, doubling up to 6 hours |
+| A preparation fails | Not retried until the next app start or map change | Retried after 1, 4, 16 ... minutes, up to 6 hours, while new runs aren't held up |
+| Stopped halfway | Started over | The cell layout (the slowest step) is kept and reused |
+| Phone restarted, app not opened | Waited for the app to be opened | The job starts the app's core itself and continues |
+| No data for the current avoid settings | The map counted as unprepared: estimates, or CoMaps' search | Exact routes on the existing data (item 11) |
+| A data file lists a border crossing CoMaps doesn't know | Whole route on CoMaps' old search | That crossing is skipped (CoMaps can't use it either) |
+| Unpacking a stretch of the route fails | Whole route on CoMaps' old search | That stretch is searched on the roads |
+| Route ends in an unprepared map and the handover point doesn't connect | Whole route on CoMaps' old search | The stretch from the border crossing is searched instead |
 
-- The preparation job waits while the battery is low or storage is low, and Android can postpone it further.
-- A map whose preparation Android stopped 3 times is not tried again.
-- A preparation that fails is counted and not retried in the same run.
-- While a map isn't prepared, routes through it are estimated (item 2), and in some cases fall back to the old search: when the route may pass through such a map in a way the estimate can't cover, when no way into the finish or out of the start map is found, or when unpacking a route fails.
+Tested: with Madhya Pradesh unprepared, all 10 long Indian test routes stayed on the fast search (estimated through Madhya Pradesh), none on CoMaps' old search.
 
-Needs:
+What's left, and why:
 
-- Every one of these cases removed or handled, so the old search is never used for a car route. Where data really can't exist yet (the first minutes after a download), the estimate is used, never the old search.
-- A test for each case, including Android killing the job, low battery, low storage and app updates in the middle of preparation.
-- Lower preparation memory where it makes Android stop the job (about 800 MB at the peak for Uttar Pradesh).
+- A map that isn't prepared yet (just downloaded or updated) is crossed on estimates, and the stretch inside it uses CoMaps' search, until its data is ready (a minute or two per map). This is the design chosen in item 2; preparing on the phone can't be instant.
+- One internal safety net remains: if a stretch can't be unpacked even on the roads, the route goes to CoMaps' search. It means a bug, and it didn't happen in any test.
+- A phone that can never spare the memory for a large map (about 800 MB for Uttar Pradesh) keeps retrying without finishing. Lower preparation memory would be the next step.
+- Cancel in the notification stops preparation until the app starts again or a route needs a map.
 
 ## 11. Simpler avoid settings that always have their data
 
-Status: not started.
+Status: done.
 
-Today the data for avoid settings (tolls, motorways, ferries, dirt roads) is prepared only for the maps a route has gone through with that mix, and only after that route asked for it. In use this often leaves a map without the data, and the route then falls back to CoMaps' old search.
+Done:
 
-Cases found so far in the code:
+- Routes with avoid settings are exact whether or not the extra data for that mix exists. Each map's route data now records which road types (tolls, motorways, ferries, dirt roads) every cell contains. Without the data for the current mix, the search uses the stored times only for cells without any avoided road and goes through the other cells road by road.
+- The data for the current mix is prepared for every downloaded map as soon as the mix changes (maps your routes use first, then the nearest), and the files of other mixes are deleted. The question about keeping data for one mix or every mix, and its setting, are gone.
+- Tested on the 10 long Indian routes and 40 German routes, each without the extra data against with it: tolls avoided, the same arrival times on all 10 (one route took an equally fast path), in 0.9 to 3.9 s against 1.0 to 2.0 s; dirt roads avoided, the same arrival times on all 10, but 2.5 to 46 s against 0.9 to 2.0 s; motorways avoided in Germany, the same on all 40 (two equally fast paths), median 0.50 s against 0.39 s.
 
-- A new mix has no data anywhere until a route asks for it, so the first routes with that mix are not fast.
-- Changing the mix during preparation stops it; the run for the new mix starts over.
-- With "keep data for the current mix only", switching back to an earlier mix starts from nothing again.
-- The cases in item 10 apply to this data too.
+Left as is:
 
-Needs:
-
-- One rule that can't miss: for example, preparing the current mix for every downloaded map as soon as it is chosen. Avoid data is now small (11 MB for Uttar Pradesh with tolls avoided, item 8), so this is affordable.
-- Fewer choices in Settings, if the rule makes the current-mix-or-every-mix choice unnecessary.
-- No fallback to the old search for any mix (item 10).
+- Avoiding dirt roads before their data is ready is slow, because about half of the cells in Indian maps contain dirt roads (55% in Uttar Pradesh, against under 1% for tolls or motorways), and it used about 1.3 GB of memory for the longest test routes on the test VM. The data is prepared right after the setting changes (Uttar Pradesh: about 22 s on the test VM), so this lasts minutes.
