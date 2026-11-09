@@ -43,8 +43,9 @@ import java.util.concurrent.TimeUnit;
  * download or update (and at app start for anything missed). Shows a progress notification with a
  * Cancel button; cancelling stops the running build until the app starts again or a route needs a map.
  * Until a map's base file is built, routes cross that map on estimates (see PlusRouteStatus); maps a
- * route needs are built first. Every downloaded map gets its base file and the file for the current avoid
- * options (routes with avoid options are exact without it, only slower; files for other mixes are deleted).
+ * route needs are built first. Every downloaded map gets its base file. The file for the current avoid
+ * options is built only for the maps routes go through (routes with avoid options are exact without it,
+ * only slower); files for other mixes are deleted.
  *
  * Nothing makes it give up on a map: it doesn't wait for battery or storage, a build the system killed
  * is tried again (with one thread, after the other maps), and failed builds are retried later.
@@ -294,7 +295,8 @@ public class PlusOverlayWork extends Worker
         Logger.i(TAG, "Building the fast-routing overlay for " + countryId + " with " + threads + " threads");
         prefs.edit().putString(KEY_BUILDING, countryId).commit();
         sBuilding = countryId;
-        final int r = PlusOverlay.nativeBuild(countryId, threads, true /* withAvoid */);
+        // Files for the current avoid options only for the maps routes use (sPriority).
+        final int r = PlusOverlay.nativeBuild(countryId, threads, sPriority.contains(countryId));
         sBuilding = null;
         final boolean preempted = sPreempted;
         sPreempted = false;
@@ -348,8 +350,8 @@ public class PlusOverlayWork extends Worker
     return Result.success();
   }
 
-  // Next map to build: those a route needs, then the others (base files before avoid-option files), maps
-  // whose build the system killed last. Every build makes both files a map lacks.
+  // Next map to build: those a route needs (base and avoid-option files), then the base files of the others,
+  // maps whose build the system killed last.
   @Nullable
   private String nextMap(@NonNull Set<String> attempted)
   {
@@ -402,15 +404,14 @@ public class PlusOverlayWork extends Worker
     return MwmApplication.prefs(mContext).getInt(KEY_KILLED_PREFIX + countryId, 0);
   }
 
-  // Maps that need building: base files first, then files for the current avoid options; the map you are
-  // in and the nearest first.
+  // Maps whose base file needs building, the one you are in and the nearest first.
   @NonNull
   private String[] mapsToBuild()
   {
     final android.location.Location loc = MwmApplication.from(mContext).getLocationHelper().getSavedLocation();
     if (loc == null)
-      return PlusOverlay.nativeMapsToBuild(false, 0, 0, true /* withAvoid */);
-    return PlusOverlay.nativeMapsToBuild(true, loc.getLatitude(), loc.getLongitude(), true /* withAvoid */);
+      return PlusOverlay.nativeMapsToBuild(false, 0, 0, false /* withAvoid */);
+    return PlusOverlay.nativeMapsToBuild(true, loc.getLatitude(), loc.getLongitude(), false /* withAvoid */);
   }
 
   @Override

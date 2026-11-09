@@ -44,7 +44,8 @@ public final class PlusRouteStatus
   public static void onCarRoute(@NonNull Context context)
   {
     // Maps used without their file for the current avoid options: the route is exact, the file makes the
-    // next ones faster. Built next, without interrupting another map's build.
+    // next ones faster. Built next (only these maps get avoid-option files), without interrupting another
+    // map's build.
     PlusOverlayWork.prioritize(context, Arrays.asList(PlusOverlay.nativeLastAvoidMaps()), false /* preempt */);
     final String[] r = PlusOverlay.nativeLastEngine();
     sApprox.clear();

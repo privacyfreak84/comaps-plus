@@ -179,9 +179,9 @@ Status: done.
 Done:
 
 - Routes with avoid settings are exact whether or not the extra data for that mix exists. Each map's route data now records which road types (tolls, motorways, ferries, dirt roads) every cell contains. Without the data for the current mix, the search uses the stored times only for cells without any avoided road and goes through the other cells road by road.
-- The data for the current mix is prepared for every downloaded map as soon as the mix changes (maps your routes use first, then the nearest), and the files of other mixes are deleted. The question about keeping data for one mix or every mix, and its setting, are gone.
+- The data for the current mix is prepared only for the maps routes go through, right after the first route that used a map without it, and the files of other mixes are deleted. The question about keeping data for one mix or every mix, and its setting, are gone.
 - Tested on the 10 long Indian routes and 40 German routes, each without the extra data against with it: tolls avoided, the same arrival times on all 10 (one route took an equally fast path), in 0.9 to 3.9 s against 1.0 to 2.0 s; dirt roads avoided, the same arrival times on all 10, but 2.5 to 46 s against 0.9 to 2.0 s; motorways avoided in Germany, the same on all 40 (two equally fast paths), median 0.50 s against 0.39 s.
 
 Left as is:
 
-- Avoiding dirt roads before their data is ready is slow, because about half of the cells in Indian maps contain dirt roads (55% in Uttar Pradesh, against under 1% for tolls or motorways), and it used about 1.3 GB of memory for the longest test routes on the test VM. The data is prepared right after the setting changes (Uttar Pradesh: about 22 s on the test VM), so this lasts minutes.
+- Avoiding dirt roads before their data is ready is slow, because about half of the cells in Indian maps contain dirt roads (55% in Uttar Pradesh, against under 1% for tolls or motorways), and it used about 1.3 GB of memory for the longest test routes on the test VM. The data is prepared right after the first such route through a map (Uttar Pradesh: about 22 s on the test VM), so this affects the first route with a new mix through each map.

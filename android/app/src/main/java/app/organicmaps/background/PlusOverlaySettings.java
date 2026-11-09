@@ -74,7 +74,7 @@ public final class PlusOverlaySettings
     final int maps = MapManager.nativeGetDownloadedCount();
     if (maps <= 0)
       return storage;
-    final int ready = Math.max(0, maps - PlusOverlay.nativeMapsToBuild(false, 0, 0, true /* withAvoid */).length);
+    final int ready = Math.max(0, maps - PlusOverlay.nativeMapsToBuild(false, 0, 0, false /* withAvoid */).length);
     return context.getString(R.string.plus_overlay_ready_count, ready, maps) + "\n" + storage;
   }
 }
