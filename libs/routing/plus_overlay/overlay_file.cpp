@@ -39,6 +39,7 @@ enum Section : uint32_t
   kRunStarts,      // u64 bits, one per vertex: a run of equal level-1 cells starts at this vertex
   kRunRank,        // u32 per kRunStarts word: runs started before that word
   kRunCells,       // u16 (kCell1Is16Bit) or u32 per run: the run's level-1 cell
+  kCellRoads,      // u8 per level-1 cell: RoutingOptions road types inside it (MappedOverlay::CellRoads)
   kLevelBase = 16,  // + kLevelSections * level + LevelSection
 };
 
@@ -423,6 +424,17 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   putVec(kParents, parents);
   putVec(kTransitions, fc.transitions);
   putVec(kSpecial, fc.special);
+  {
+    std::vector<uint8_t> cellRoads(p.numCells[0], 0);
+    if (fc.roads.size() != fc.n)
+    {
+      SetError(error, "road types missing");
+      return false;
+    }
+    for (uint32_t v = 0; v < fc.n; ++v)
+      cellRoads[p.cell[0][v]] |= fc.roads[v];
+    putVec(kCellRoads, cellRoads);
+  }
   for (size_t li = 0; li < levels; ++li)
   {
     auto const & L = ov.levels[li];
@@ -867,6 +879,24 @@ bool MappedOverlay::Parse(std::string * error)
   for (auto const & L : m_levels)
     numCells.push_back(L.numCells);
   m_open = OpenCells(numCells, m_special, [this](size_t li, uint32_t v) { return Cell(li, v); });
+  // Road types per cell: level 1 from the file, each level above as the union of its children.
+  m_cellRoads.assign(m_levels.size(), {});
+  if (count(kCellRoads, 1) != numCells[0])
+  {
+    SetError(error, "bad road types per cell");
+    return false;
+  }
+  m_cellRoads[0].assign(sec(kCellRoads), sec(kCellRoads) + numCells[0]);
+  for (size_t li = 1; li < m_levels.size(); ++li)
+  {
+    m_cellRoads[li].assign(numCells[li], 0);
+    for (uint32_t c = 0; c < numCells[li - 1]; ++c)
+    {
+      uint32_t const parent = m_parents[li][c];
+      if (parent < numCells[li])
+        m_cellRoads[li][parent] |= m_cellRoads[li - 1][c];
+    }
+  }
   return true;
 }
 

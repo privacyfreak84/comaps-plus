@@ -66,11 +66,6 @@ public class NavigationSettingsFragment extends BaseXmlSettingsFragment
     if (key == null)
       return super.onPreferenceTreeClick(preference);
 
-    if (key.equals("pref_plus_overlay_storage"))
-    {
-      PlusOverlaySettings.showDialog(requireContext(), this::updatePlusOverlayStorageSummary);
-      return true;
-    }
     if (key.equals(getString(R.string.pref_tts_screen)))
     {
       getSettingsActivity().stackFragment(VoiceInstructionsSettingsFragment.class,

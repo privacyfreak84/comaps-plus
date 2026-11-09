@@ -92,6 +92,9 @@ struct MapRt
   int64_t version = 0;
   uint32_t avoidMask = 0;
   std::string avoidPath;
+  // Avoid options the attached cliques don't account for (the map's avoid-option file is missing): cells
+  // with any of these road types are searched on their roads instead of their cliques.
+  uint32_t openRoads = 0;
   bool tried = false;
   std::unique_ptr<MappedOverlay> ovl;
   std::string error;
@@ -140,7 +143,8 @@ struct OverlayRouter::Impl
           LOG(LWARNING, ("Comaps++ overlay: damaged file deleted:", mr.avoidPath, mr.error));
           std::remove(mr.avoidPath.c_str());
         }
-        mr.ovl.reset();
+        // Still exact without it: the cells holding avoided road types are searched on their roads.
+        mr.openRoads = mr.avoidMask;
       }
       if (mr.ovl)
       {
@@ -156,14 +160,10 @@ struct OverlayRouter::Impl
     return mr.ovl.get();
   }
 
-  // Set when the search settles a border vertex whose neighbouring map has no usable overlay: the
-  // best route could pass through that map, so the overlay can't answer the query exactly.
-  bool needsMissingMap = false;
-  routing::NumMwmId missingMap = 0;
   std::vector<Segment> twinScratch;
 
   // Twins of a border vertex, found with CoMaps' own cross-map graph (exactly the joins the normal
-  // search makes). Appends overlay keys; a twin in a map without a usable overlay sets needsMissingMap.
+  // search makes). Appends overlay keys; a twin in a map without a usable overlay gets a raw key.
   void Twins(uint32_t m, uint32_t v, Segment const & s, bool outgoing, std::vector<BaseEdge> & out,
              std::vector<std::vector<Segment>> * chains)
   {
@@ -173,10 +173,9 @@ struct OverlayRouter::Impl
     twinScratch.clear();
     if (!starter->GetGraph().GetCrossMwmGraph().IsTransition(s, outgoing))
     {
-      // The file lists a border vertex CoMaps doesn't know: the file doesn't match the map.
+      // The file lists a border vertex CoMaps doesn't know: CoMaps can't cross there either, so neither
+      // does the route.
       LOG(LWARNING, ("Comaps++ overlay: not a border transition in the map:", s, outgoing));
-      needsMissingMap = true;
-      missingMap = s.GetMwmId();
       return;
     }
     starter->GetGraph().GetTwinsInner(s, outgoing, twinScratch);
@@ -345,6 +344,16 @@ struct OverlayRouter::Impl
     if (!graphs[m])
       graphs[m] = &starter->GetGraph().GetIndexGraph(maps[m].id);
     return *graphs[m];
+  }
+
+  // Real segment of a search key (overlay vertex: of its original for via-way copies).
+  Segment SegOfKey(Key k)
+  {
+    if (IsRaw(k))
+      return RawSeg(k);
+    auto const & o = *maps[MapOf(k)].ovl;
+    uint32_t const v = LocalOf(k);
+    return SegOf(MapOf(k), o.IsCopy(v) ? o.CopyOrig(v) : v);
   }
 
   Segment SegOf(uint32_t m, uint32_t local)
@@ -617,7 +626,7 @@ struct OverlayRouter::Impl
     for (size_t li = levels; li-- > 0;)
     {
       uint32_t const c = o.Cell(li, v);
-      if (o.IsOpen(li, c))
+      if (o.IsOpen(li, c) || (o.CellRoads(li, c) & maps[m].openRoads) != 0)
         continue;
       if (mapHasEnd[m])
       {
@@ -932,7 +941,6 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   I.rawSegs.clear();
   I.rawIdx.clear();
   I.approxTouched.clear();
-  I.needsMissingMap = false;
   // Conditional access is checked at the time the route gets there, which only a forward search knows.
   I.forwardOnly = false;
   for (uint32_t m = 0; m < I.maps.size(); ++m)
@@ -1259,12 +1267,6 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       lx.done = true;
       ++stats.settled;
       I.ScanF(x, d, lx.pen, relaxF, tmp);
-      if (I.needsMissingMap)
-      {
-        stats.hasMissingMap = true;
-        stats.missingMap = I.missingMap;
-        return finish(Result::NotApplicable, "the route may pass through a map without an overlay");
-      }
     }
     else
     {
@@ -1276,12 +1278,6 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       lx.done = true;
       ++stats.settled;
       I.ScanB(x, d, relaxB, tmp);
-      if (I.needsMissingMap)
-      {
-        stats.hasMissingMap = true;
-      stats.missingMap = I.missingMap;
-        return finish(Result::NotApplicable, "the route may pass through a map without an overlay");
-      }
     }
   }
 
@@ -1380,7 +1376,13 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     {
       size_t const before = path.size();
       if (!I.UnpackHop(a, b, l, path))
-        return finish(Result::NotApplicable, "unpacking failed");
+      {
+        // Shouldn't happen (the hop came from these files and roads). Find that stretch on the roads.
+        path.resize(before);
+        LOG(LWARNING, ("Comaps++ overlay: unpacking a level", int(l), "hop failed, searching it on the roads"));
+        if (!I.RefineInMap(I.SegOfKey(a), I.SegOfKey(b), path, nullptr, MapOf(a) != MapOf(b) || IsRaw(a) || IsRaw(b)))
+          return finish(Result::NotApplicable, "internal error: a stretch of the route can't be unpacked");
+      }
       if (!debug)
         continue;
       bool const fwdHop = F.count(b) && F[b].parent == a;
@@ -1450,9 +1452,20 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
         }
         else
         {
+          // From the handover point; failing that, from the border crossing the search chose; failing
+          // that, the whole route (on CoMaps' search, as when the overlay part is short).
+          std::vector<Segment> const full = path;
           path.resize(j + 1);
           if (!I.RefineInMap(path[j], starter.GetFinishSegment(), path, nullptr, true /* anyMap */))
-            return finish(Result::NotApplicable, "no way into the finish");
+          {
+            path = full;
+            if (!I.RefineInMap(path.back(), starter.GetFinishSegment(), path, nullptr, true /* anyMap */))
+            {
+              if (!whole())
+                return finish(Result::NoRoute, "");
+              done = true;
+            }
+          }
         }
       }
       if (s0.leap && !done)
@@ -1472,11 +1485,27 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
         }
         else
         {
+          // To the handover point; failing that, to the border crossing the search chose; failing that,
+          // the whole route.
           std::vector<Segment> np{starter.GetStartSegment()};
-          if (!I.RefineInMap(starter.GetStartSegment(), path[i], np, nullptr, true /* anyMap */))
-            return finish(Result::NotApplicable, "no way out of the start map");
-          np.insert(np.end(), path.begin() + i + 1, path.end());
-          path = std::move(np);
+          if (I.RefineInMap(starter.GetStartSegment(), path[i], np, nullptr, true /* anyMap */))
+          {
+            np.insert(np.end(), path.begin() + i + 1, path.end());
+            path = std::move(np);
+          }
+          else
+          {
+            np.assign(1, starter.GetStartSegment());
+            if (I.RefineInMap(starter.GetStartSegment(), path[1], np, nullptr, true /* anyMap */))
+            {
+              np.insert(np.end(), path.begin() + 2, path.end());
+              path = std::move(np);
+            }
+            else if (!whole())
+            {
+              return finish(Result::NoRoute, "");
+            }
+          }
         }
       }
     }
@@ -1491,6 +1520,12 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     auto it = I.mapIdx.find(id);
     if (it == I.mapIdx.end() || !I.Ovl(it->second))
       stats.approxMaps.push_back(id);
+  }
+  for (auto const id : used)
+  {
+    auto it = I.mapIdx.find(id);
+    if (it != I.mapIdx.end() && I.Ovl(it->second) && I.maps[it->second].openRoads != 0)
+      stats.noAvoidFileMaps.push_back(id);
   }
   lap(stats.unpackMs);
   return finish(Result::Ok, "");

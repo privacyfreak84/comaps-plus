@@ -38,8 +38,9 @@ namespace plus_overlay
 //   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
 //   cliques wrong; that is the only code change that makes the app rebuild every file.
 // - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
-constexpr uint32_t kFileFormatVersion = 6;  // 4: special vertices; 5: smaller layout; 6: 16-bit clique values
-constexpr uint32_t kMinReadableFormatVersion = 6;  // 6: 16-bit clique values, per-cell scales, penalty bytes
+constexpr uint32_t kFileFormatVersion = 7;  // 5: smaller layout; 6: 16-bit clique values; 7: road types per cell
+constexpr uint32_t kMinReadableFormatVersion = 7;  // 7: road types per cell (routes with avoid options without
+                                                   // their file)
 constexpr uint32_t kRoutingDataVersion = 2;  // 2: time-dependent edges, penalty units in cliques
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
@@ -72,6 +73,9 @@ struct FileContents
   std::vector<FileTransition> transitions;
   std::vector<uint32_t> special;  // sorted (overlay.hpp)
   bool timeDependent = false;     // the map has time-dependent edges (dynamic_edges.hpp)
+  // Per vertex: RoutingOptions road types its edges step onto (written per level-1 cell, see
+  // MappedOverlay::CellRoads).
+  std::vector<uint8_t> roads;
 };
 
 // Hash of what makes two builds comparable (format version, cell sizes, balance, directions).
@@ -357,6 +361,9 @@ public:
   std::vector<uint32_t> const & Special() const { return m_special; }
   bool IsSpecial(uint32_t v) const { return std::binary_search(m_special.begin(), m_special.end(), v); }
   bool IsOpen(size_t li, uint32_t cell) const { return !m_open[li].empty() && m_open[li][cell]; }
+  // RoutingOptions road types (tolls, motorways, ferries, dirt roads) inside |cell|: a cell without any of
+  // the types a route avoids has the same cliques with those avoid options as without them.
+  uint8_t CellRoads(size_t li, uint32_t cell) const { return m_cellRoads[li][cell]; }
   bool HasTimeDependentEdges() const { return m_timeDependent; }
 
   uint32_t NumTransitions() const { return m_numTransitions; }
@@ -401,6 +408,7 @@ private:
   std::vector<uint32_t> m_special;
   bool m_timeDependent = false;
   std::vector<std::vector<uint8_t>> m_open;
+  std::vector<std::vector<uint8_t>> m_cellRoads;  // [level][cell]
   std::vector<Level> m_levels;
   std::unique_ptr<ViaWayAutomaton> m_automaton;
   std::unordered_map<uint64_t, uint32_t> m_copyId;                    // (state << 32 | base) -> copy

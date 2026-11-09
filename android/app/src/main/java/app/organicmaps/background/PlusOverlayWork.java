@@ -17,7 +17,6 @@ import androidx.core.app.NotificationChannelCompat;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
-import androidx.work.Constraints;
 import androidx.work.ExistingWorkPolicy;
 import androidx.work.ForegroundInfo;
 import androidx.work.OneTimeWorkRequest;
@@ -34,6 +33,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -41,23 +41,34 @@ import java.util.concurrent.TimeUnit;
 /**
  * Comaps++: builds the overlay files for fast car routing on the phone, one map at a time, after a map
  * download or update (and at app start for anything missed). Shows a progress notification with a
- * Cancel button; cancelling stops the running build. Until a map's files are built, routes cross that
- * map on estimates (see PlusRouteStatus); maps a route needs are built first. Every downloaded map gets
- * its base file; the file for the current avoid options is built only for maps a route needed it in.
+ * Cancel button; cancelling stops the running build until the app starts again or a route needs a map.
+ * Until a map's base file is built, routes cross that map on estimates (see PlusRouteStatus); maps a
+ * route needs are built first. Every downloaded map gets its base file and the file for the current avoid
+ * options (routes with avoid options are exact without it, only slower; files for other mixes are deleted).
+ *
+ * Nothing makes it give up on a map: it doesn't wait for battery or storage, a build the system killed
+ * is tried again (with one thread, after the other maps), and failed builds are retried later.
  */
 public class PlusOverlayWork extends Worker
 {
   private static final String TAG = PlusOverlayWork.class.getSimpleName();
   private static final String WORK_NAME = "PlusOverlayBuild";
+  private static final String RETRY_WORK_NAME = "PlusOverlayRetry";
   private static final String CHANNEL_ID = "plus_overlay";
   private static final int PROGRESS_NOTIFICATION_ID = 7301;
   private static final int RESULT_NOTIFICATION_ID = 7302;
   private static final int BUILD_THREADS = 2;
   // A build the app didn't live to finish (the system killed it, e.g. for memory): retried with one
-  // thread (less memory), and given up after this many attempts until the map changes.
+  // thread (less memory), after the maps that haven't been killed.
   private static final String KEY_BUILDING = "plus_overlay_building";
   private static final String KEY_KILLED_PREFIX = "plus_overlay_killed_";
-  private static final int MAX_KILLED = 3;
+  private static final String KEY_KILLED_AT_PREFIX = "plus_overlay_killed_at_";
+  // From the third kill on, a map waits before the next try (15 min, doubling, up to 6 h), so a phone that
+  // can't spare the memory isn't kept busy; the map is still tried again.
+  private static final int KILLS_BEFORE_WAIT = 3;
+  // Runs in a row in which a build failed: the next try waits 1, 4, 16, 64 minutes ... up to 6 hours.
+  private static final String KEY_FAILED_RUNS = "plus_overlay_failed_runs";
+  private static final long MAX_RETRY_DELAY_MIN = 6 * 60;
 
   /** Called on the main thread when a map's fast-route files are ready. */
   public interface MapReadyListener
@@ -91,21 +102,23 @@ public class PlusOverlayWork extends Worker
     final SharedPreferences prefs = MwmApplication.prefs(context);
     final SharedPreferences.Editor edit = prefs.edit();
     for (String key : prefs.getAll().keySet())
-      if (key.startsWith(KEY_KILLED_PREFIX))
+      if (key.startsWith(KEY_KILLED_PREFIX) || key.startsWith(KEY_KILLED_AT_PREFIX))
         edit.remove(key);
     edit.apply();
     enqueue(context);
   }
 
   /**
-   * Builds these maps' files before the others. A build of another map that isn't half done yet is
-   * stopped and done later.
+   * Builds these maps' files (with those for the current avoid options) before the others. With
+   * {@code preempt}, a build of another map that isn't half done yet is stopped and done later.
    */
-  public static void prioritize(@NonNull Context context, @NonNull Collection<String> countryIds)
+  public static void prioritize(@NonNull Context context, @NonNull Collection<String> countryIds, boolean preempt)
   {
+    if (countryIds.isEmpty())
+      return;
     sPriority.addAll(countryIds);
     final String now = sBuilding;
-    if (now != null && !sPriority.contains(now) && PlusOverlay.nativeProgress() < 0.5)
+    if (preempt && now != null && !sPriority.contains(now) && PlusOverlay.nativeProgress() < 0.5)
     {
       Logger.i(TAG, "Pausing the build for " + now + " for a map a route needs");
       sPreempted = true;
@@ -142,35 +155,102 @@ public class PlusOverlayWork extends Worker
    */
   public static void enqueue(@NonNull Context context)
   {
-    final Constraints constraints =
-        new Constraints.Builder().setRequiresBatteryNotLow(true).setRequiresStorageNotLow(true).build();
-    final OneTimeWorkRequest request =
-        new OneTimeWorkRequest.Builder(PlusOverlayWork.class).setConstraints(constraints).build();
+    // No constraints: waiting for a charged battery or free storage could leave maps unprepared for days.
+    final OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(PlusOverlayWork.class).build();
     WorkManager.getInstance(context).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE, request);
+  }
+
+  /**
+   * Another run in |delay| minutes, for failed builds or killed maps waiting their turn (a separate request,
+   * so new runs don't wait for it).
+   */
+  private static void scheduleRetry(@NonNull Context context, long delay)
+  {
+    Logger.i(TAG, "Trying the remaining builds again in " + delay + " min");
+    final OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(Retry.class)
+                                           .setInitialDelay(delay, TimeUnit.MINUTES)
+                                           .build();
+    WorkManager.getInstance(context).enqueueUniqueWork(RETRY_WORK_NAME, ExistingWorkPolicy.REPLACE, request);
+  }
+
+  /** Queues a build run (PlusOverlayWork) when it fires. */
+  public static class Retry extends Worker
+  {
+    public Retry(@NonNull Context context, @NonNull WorkerParameters params)
+    {
+      super(context, params);
+    }
+
+    @NonNull
+    @Override
+    public Result doWork()
+    {
+      enqueue(getApplicationContext());
+      return Result.success();
+    }
+  }
+
+  // Started without the app (after a reboot, or the system restarting the work): start the core here, as
+  // Android Auto does, so the maps get prepared without waiting for the app to be opened.
+  private boolean ensureCore()
+  {
+    final MwmApplication app = MwmApplication.from(mContext);
+    if (app.getOrganicMaps().arePlatformAndCoreInitialized())
+      return true;
+    final CountDownLatch done = new CountDownLatch(1);
+    new Handler(Looper.getMainLooper()).post(() -> {
+      try
+      {
+        if (!app.initOrganicMaps(done::countDown))
+          done.countDown();
+      }
+      catch (Exception e)
+      {
+        Logger.e(TAG, "Can't start the core for building", e);
+        done.countDown();
+      }
+    });
+    try
+    {
+      done.await(2, TimeUnit.MINUTES);
+    }
+    catch (InterruptedException e)
+    {
+      Thread.currentThread().interrupt();
+    }
+    return app.getOrganicMaps().arePlatformAndCoreInitialized();
   }
 
   @NonNull
   @Override
   public Result doWork()
   {
-    if (!MwmApplication.from(mContext).getOrganicMaps().arePlatformAndCoreInitialized())
+    if (!ensureCore())
     {
-      // Started without the app (e.g. after a reboot): the app queues a run again once it starts.
-      Logger.i(TAG, "Core is not initialized, will run when the app starts");
+      // The app queues a run again once it starts.
+      Logger.w(TAG, "Core is not initialized, will run when the app starts");
       return Result.success();
     }
 
-    PlusOverlay.nativeDeleteOrphans(PlusOverlaySettings.isKeepAll(mContext));
+    PlusOverlay.nativeDeleteOrphans(false /* keepAllAvoid */);
     final SharedPreferences prefs = MwmApplication.prefs(mContext);
     final String killed = prefs.getString(KEY_BUILDING, null);
     if (killed != null)
     {
       final int n = prefs.getInt(KEY_KILLED_PREFIX + killed, 0) + 1;
       Logger.w(TAG, "The build for " + killed + " didn't finish last time (" + n + ")");
-      prefs.edit().remove(KEY_BUILDING).putInt(KEY_KILLED_PREFIX + killed, n).apply();
+      prefs.edit()
+          .remove(KEY_BUILDING)
+          .putInt(KEY_KILLED_PREFIX + killed, n)
+          .putLong(KEY_KILLED_AT_PREFIX + killed, System.currentTimeMillis())
+          .apply();
     }
     if (nextMap(new HashSet<>()) == null)
+    {
+      if (mKilledWaitMs > 0)
+        scheduleRetry(mContext, Math.max(1, mKilledWaitMs / 60_000L + 1));
       return Result.success();
+    }
 
     int built = 0;
     int failed = 0;
@@ -214,7 +294,7 @@ public class PlusOverlayWork extends Worker
         Logger.i(TAG, "Building the fast-routing overlay for " + countryId + " with " + threads + " threads");
         prefs.edit().putString(KEY_BUILDING, countryId).commit();
         sBuilding = countryId;
-        final int r = PlusOverlay.nativeBuild(countryId, threads, sPriority.contains(countryId));
+        final int r = PlusOverlay.nativeBuild(countryId, threads, true /* withAvoid */);
         sBuilding = null;
         final boolean preempted = sPreempted;
         sPreempted = false;
@@ -234,7 +314,7 @@ public class PlusOverlayWork extends Worker
         sPriority.remove(countryId);
         if (r == PlusOverlay.BUILD_OK || r == PlusOverlay.BUILD_UP_TO_DATE)
         {
-          prefs.edit().remove(KEY_KILLED_PREFIX + countryId).apply();
+          prefs.edit().remove(KEY_KILLED_PREFIX + countryId).remove(KEY_KILLED_AT_PREFIX + countryId).apply();
           if (r == PlusOverlay.BUILD_OK)
             ++built;
           final MapReadyListener listener = sMapReady;
@@ -252,10 +332,24 @@ public class PlusOverlayWork extends Worker
 
     if (!isStopped() && (built > 0 || failed > 0))
       notifyResult(built, failed);
+    if (failed > 0)
+    {
+      final int runs = prefs.getInt(KEY_FAILED_RUNS, 0) + 1;
+      prefs.edit().putInt(KEY_FAILED_RUNS, runs).apply();
+      scheduleRetry(mContext, Math.min(MAX_RETRY_DELAY_MIN, (long) Math.pow(4, Math.min(runs - 1, 6))));
+    }
+    else
+    {
+      if (!isStopped())
+        prefs.edit().remove(KEY_FAILED_RUNS).apply();
+      if (mKilledWaitMs > 0)
+        scheduleRetry(mContext, Math.max(1, mKilledWaitMs / 60_000L + 1));
+    }
     return Result.success();
   }
 
-  // Next map to build: those a route needs (base and avoid-option files), then the base files of the others.
+  // Next map to build: those a route needs, then the others (base files before avoid-option files), maps
+  // whose build the system killed last. Every build makes both files a map lacks.
   @Nullable
   private String nextMap(@NonNull Set<String> attempted)
   {
@@ -268,13 +362,39 @@ public class PlusOverlayWork extends Worker
     {
       if (!PlusOverlay.nativeNeedsBuild(id))
         sPriority.remove(id);
-      else if (!attempted.contains(id) && killedCount(id) < MAX_KILLED)
+      else if (!attempted.contains(id))
         return id;
     }
+    String killed = null;
     for (String id : mapsToBuild())
-      if (!attempted.contains(id) && killedCount(id) < MAX_KILLED)
+    {
+      if (attempted.contains(id))
+        continue;
+      if (killedCount(id) == 0)
         return id;
-    return null;
+      final long wait = killedWaitMs(id);
+      if (wait > 0)
+      {
+        mKilledWaitMs = mKilledWaitMs == 0 ? wait : Math.min(mKilledWaitMs, wait);
+        continue;
+      }
+      if (killed == null)
+        killed = id;
+    }
+    return killed;
+  }
+
+  // Shortest wait of a killed map skipped in this run (0: none).
+  private long mKilledWaitMs = 0;
+
+  private long killedWaitMs(@NonNull String countryId)
+  {
+    final int kills = killedCount(countryId);
+    if (kills < KILLS_BEFORE_WAIT)
+      return 0;
+    final long pause = Math.min(MAX_RETRY_DELAY_MIN, 15L << Math.min(kills - KILLS_BEFORE_WAIT, 5)) * 60_000L;
+    final long at = MwmApplication.prefs(mContext).getLong(KEY_KILLED_AT_PREFIX + countryId, 0);
+    return Math.max(0, at + pause - System.currentTimeMillis());
   }
 
   private int killedCount(@NonNull String countryId)
@@ -282,14 +402,15 @@ public class PlusOverlayWork extends Worker
     return MwmApplication.prefs(mContext).getInt(KEY_KILLED_PREFIX + countryId, 0);
   }
 
-  // Maps that need building, the one you are in and the nearest first.
+  // Maps that need building: base files first, then files for the current avoid options; the map you are
+  // in and the nearest first.
   @NonNull
   private String[] mapsToBuild()
   {
     final android.location.Location loc = MwmApplication.from(mContext).getLocationHelper().getSavedLocation();
     if (loc == null)
-      return PlusOverlay.nativeMapsToBuild(false, 0, 0);
-    return PlusOverlay.nativeMapsToBuild(true, loc.getLatitude(), loc.getLongitude());
+      return PlusOverlay.nativeMapsToBuild(false, 0, 0, true /* withAvoid */);
+    return PlusOverlay.nativeMapsToBuild(true, loc.getLatitude(), loc.getLongitude(), true /* withAvoid */);
   }
 
   @Override

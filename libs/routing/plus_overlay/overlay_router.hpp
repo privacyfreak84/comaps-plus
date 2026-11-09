@@ -39,6 +39,7 @@ struct EngineReport
   };
   Engine engine = Engine::None;
   std::vector<std::string> approxMaps;  // Approximate: those maps (country ids)
+  std::vector<std::string> avoidMaps;   // maps the route used without their avoid-option file
   std::string reason;  // why the normal search ran
   double seconds = 0;
 };
@@ -51,7 +52,8 @@ struct OverlayMap
   std::string path;        // the map's overlay file
   int64_t mwmVersion = 0;  // the downloaded map's version; the file must have been built for it
   // With avoid options (avoidMask != 0): the map's avoid-option cliques for that mask, which must
-  // belong to |path| (AvoidOverlayPathForMap). Without that file the map counts as having no overlay.
+  // belong to |path| (AvoidOverlayPathForMap). Without that file routes are still exact: the cells that
+  // hold avoided road types are searched on their roads (slower for options that touch many cells).
   uint32_t avoidMask = 0;
   std::string avoidPath;
 };
@@ -93,9 +95,9 @@ public:
     // Maps without a usable overlay the route crosses: there it follows CoMaps' border-to-border times
     // (like CoMaps' long-route mode), so the route is approximate until their files are built.
     std::vector<routing::NumMwmId> approxMaps;
+    // Maps the route uses whose avoid-option file is missing (exact, but slower until it is built).
+    std::vector<routing::NumMwmId> noAvoidFileMaps;
     std::string reason;  // why NotApplicable
-    bool hasMissingMap = false;        // NotApplicable because the route may pass through a map
-    routing::NumMwmId missingMap = 0;  // without a usable overlay file: this one
   };
 
   // |path| starts with starter.GetStartSegment() and ends with starter.GetFinishSegment().

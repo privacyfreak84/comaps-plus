@@ -125,6 +125,10 @@ struct LeanGraph
   uint32_t baseN = 0;
   Graph g;                       // forward edges + lat/lon
   std::vector<uint8_t> interior; // per edge: the chain behind it passed at least one non-kept segment
+  // Per base vertex: RoutingOptions road types (tolls, motorways, ...) of the roads its edges step onto,
+  // chains included. A cell whose vertices have none of the avoided types has the same cliques with and
+  // without those avoid options (FileContents::roads).
+  std::vector<uint8_t> roads;
   // Base vertices the search must be able to stand on at any level: ends of time-dependent edges.
   std::vector<uint32_t> allLevels;
   uint64_t rawSlots = 0, rawValid = 0, rawEdges = 0, dynamicEdges = 0;
@@ -339,6 +343,9 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   g.fwdW.reserve(guess);
   lg.interior.reserve(guess);
   g.fwdK.reserve(guess);
+  lg.roads.reserve(kn);
+  auto roadBits = [&ig](routing::Segment const & x)
+  { return static_cast<uint8_t>(ig.GetRoadGeometry(x.GetFeatureId()).GetRoutingOptions().GetOptions()); };
   struct Out
   {
     uint32_t to;
@@ -365,6 +372,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
     edges.clear();
     ig.GetEdgeList(s, true, true, edges);
     tmp.clear();
+    uint8_t roads = 0;
     for (auto const & e : edges)
     {
       routing::Segment x = e.GetTarget();
@@ -372,6 +380,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         continue;  // evaluated by the router at the time the route gets there
       double w = e.GetWeight().GetIntegratedWeight();
       uint32_t k = PenaltyUnits(e.GetWeight());
+      roads |= roadBits(x);
       uint8_t inner = 0;
       uint32_t xs = lg.Slot(x);
       bool ok = true;
@@ -389,6 +398,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         w += chainEdges[0].GetWeight().GetIntegratedWeight();
         k += PenaltyUnits(chainEdges[0].GetWeight());
         x = chainEdges[0].GetTarget();
+        roads |= roadBits(x);
         xs = lg.Slot(x);
       }
       if (!ok || xs == v)
@@ -409,6 +419,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
       lg.interior.push_back(tmp[i].interior);
     }
     g.fwdOff[cu + 1] = g.fwdTo.size();
+    lg.roads.push_back(roads);
   });
   CHECK_EQUAL(lg.origId.size(), kn, ());
   std::vector<uint8_t>().swap(outdeg);
@@ -989,6 +1000,10 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     if (!result.reusedCells)
       part = Bisect(g, pp);
     rep.CheckCancelled();
+    // Kept right away: if this build is stopped later (the system stopping the app, a full storage), the
+    // next attempt replays these cells instead of dividing the map again (the slowest step).
+    if (!options.partitionTreePath.empty() && !result.reusedCells && !SavePartitionTree(part.tree, options.partitionTreePath))
+      rep.Log("couldn't save the partition tree to " + options.partitionTreePath);
     double const partSec = Since(t0);
     {
       std::ostringstream os;
@@ -1074,6 +1089,9 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     };
     fc.special = special;
     fc.timeDependent = lg.dynamicEdges > 0;
+    fc.roads.resize(g.n);
+    for (uint32_t v = 0; v < g.n; ++v)
+      fc.roads[v] = lg.roads[v < lg.baseN ? v : lg.copyOrig[v - lg.baseN]];
     addTransitions(enters, enterOsm, true);
     addTransitions(exits, exitOsm, false);
     if (!WriteOverlayFile(result.path, fc, part, ov, &result.error))
@@ -1085,8 +1103,6 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       return result;
     }
     result.fileBytes = mo->FileBytes();
-    if (!options.partitionTreePath.empty() && !result.reusedCells && !SavePartitionTree(part.tree, options.partitionTreePath))
-      rep.Log("couldn't save the partition tree to " + options.partitionTreePath);
 
     if (options.checkFile)
     {

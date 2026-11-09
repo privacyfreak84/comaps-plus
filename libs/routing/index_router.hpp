@@ -149,6 +149,7 @@ private:
   std::string m_plusNormalReason;
   // Maps the route crossed approximately (no overlay file yet).
   std::vector<std::string> m_plusApproxMaps;
+  std::vector<std::string> m_plusAvoidMaps;  // used without their avoid-option file (exact, slower)
 public:
   // Comaps++ tests: the last CalculateRoute rejoined the previous route (AdjustRoute) instead of a new search.
   bool PlusLastWasAdjusted() const { return m_plusLastWasAdjusted; }

@@ -361,6 +361,7 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
     m_plusLastWasAdjusted = false;
     m_plusNormalReason.clear();
     m_plusApproxMaps.clear();
+    m_plusAvoidMaps.clear();
     base::Timer plusTimer;
     auto const publishReport = [this, &plusTimer]()
     {
@@ -368,6 +369,7 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
         return;
       plus_overlay::EngineReport r;
       r.seconds = plusTimer.ElapsedSeconds();
+      r.avoidMaps = m_plusAvoidMaps;
       r.engine = plus_overlay::EngineReport::Engine::Overlay;
       if (m_plusLastWasAdjusted)
       {
@@ -772,8 +774,8 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
     return RouterResultCode::NeedMoreMaps;
   if (PlusOverlayDisabled())
     return notApplicable("overlay switched off (COMAPS_PLUS_OVERLAY=0)");
-  // With avoid options each map also needs its cliques for exactly those options (built in the
-  // background next to the base file); a map without them counts as having no overlay.
+  // With avoid options a map's avoid-option file (built in the background next to the base file) makes
+  // routes faster; without it they are still exact (OverlayMap).
   auto const avoidMask = static_cast<uint32_t>(RoutingOptions::LoadOptionsFromSettings(m_vehicleType).GetOptions());
 
   if (!m_plusOverlay)
@@ -849,6 +851,14 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
     }
     if (!stats.approxMaps.empty())
       LOG(LINFO, ("Comaps++ overlay: approximate through", m_plusApproxMaps, "(overlay not built yet)"));
+    for (auto const id : stats.noAvoidFileMaps)
+    {
+      auto const name = m_numMwmIds->GetFile(id).GetName();
+      if (std::find(m_plusAvoidMaps.begin(), m_plusAvoidMaps.end(), name) == m_plusAvoidMaps.end())
+        m_plusAvoidMaps.push_back(name);
+    }
+    if (!stats.noAvoidFileMaps.empty())
+      LOG(LINFO, ("Comaps++ overlay: no avoid-option file yet for", m_plusAvoidMaps, "(cells with avoided roads searched on their roads)"));
     return RouterResultCode::NoError;
   }
   subroute.clear();
@@ -860,8 +870,6 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
     return RouterResultCode::RouteNotFound;
   }
   std::string why = stats.reason;
-  if (stats.hasMissingMap)
-    why += " (" + m_numMwmIds->GetFile(stats.missingMap).GetName() + ")";
   LOG(LINFO, ("Comaps++ overlay:", why, "- using the normal search"));
   return notApplicable(why);
 }

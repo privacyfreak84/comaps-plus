@@ -4,7 +4,7 @@ import androidx.annotation.NonNull;
 
 /**
  * Comaps++: per-map overlay files that make long car routes fast. The router uses a map's file once
- * it exists and matches the downloaded map version; until then it uses the normal search.
+ * it exists and matches the downloaded map version; until then it crosses that map on estimates.
  */
 public final class PlusOverlay
 {
@@ -18,10 +18,11 @@ public final class PlusOverlay
 
   /**
    * Downloaded maps whose base overlay file is missing or stale (map updated, or built by another
-   * version). Files for avoid options are built only for maps a route needs.
+   * version), nearest first; with {@code withAvoid}, then those lacking the file for the current avoid
+   * options.
    */
   @NonNull
-  public static native String[] nativeMapsToBuild(boolean hasPosition, double lat, double lon);
+  public static native String[] nativeMapsToBuild(boolean hasPosition, double lat, double lon, boolean withAvoid);
 
   /** Whether a map lacks its base file or the file for the current avoid options. */
   public static native boolean nativeNeedsBuild(@NonNull String countryId);
@@ -61,6 +62,13 @@ public final class PlusOverlay
    */
   @NonNull
   public static native String[] nativeLastEngine();
+
+  /**
+   * Maps the last car route used without their file for the current avoid options: the route is exact,
+   * but faster once that file is built.
+   */
+  @NonNull
+  public static native String[] nativeLastAvoidMaps();
 
   /** Builds the current route again (from the current position when navigating); main thread only. */
   public static native void nativeRefreshRoute();
