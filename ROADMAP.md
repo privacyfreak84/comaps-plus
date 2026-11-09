@@ -131,3 +131,54 @@ Not done, and why:
 - The map files themselves come from CoMaps' servers in CoMaps' format. Making them smaller would mean generating and hosting maps, which this project doesn't do.
 - The stored travel times are now about 70% of the route data, as 4-byte numbers. Storing them in 2 bytes would save roughly another third of the route data, but rounds the stored times, so routes could differ from CoMaps' by a few seconds. Optional, if the space matters more than exact matching.
 - Most of the memory while routing is CoMaps' road graph, which CoMaps loads whole for each map a route touches. Loading it in parts would mean reworking CoMaps' own routing code.
+
+## 9. The same changes in the iOS and desktop apps
+
+Status: not started.
+
+Everything in items 1 to 8 is built and tested in the Android app only. The router itself is shared C++ code, so the iOS and desktop apps would already use fast routes if the route data were on the device, but nothing in those apps prepares it.
+
+Needs:
+
+- Preparing route data on the device: after downloads, map updates and app start, as on Android. On iOS that means a background processing task, which iOS runs when it chooses (usually while charging); on desktop a background thread.
+- The same status messages, Settings entries and avoid-setting choices as on Android, in both apps.
+- The other items (avoided places, route options, update checker, rebranding) in both apps as they are done.
+- Testing both apps, which so far haven't been built with Comaps++'s changes.
+
+## 10. Route data always ready, never CoMaps' old search
+
+Status: not started.
+
+The route data is prepared on the phone, not downloaded (the project doesn't host files). The goal is that every downloaded map always has it, so no car route ever falls back to CoMaps' old search.
+
+Cases found so far in the code where a map can stay without route data, or a route can fall back:
+
+- The preparation job waits while the battery is low or storage is low, and Android can postpone it further.
+- A map whose preparation Android stopped 3 times is not tried again.
+- A preparation that fails is counted and not retried in the same run.
+- While a map isn't prepared, routes through it are estimated (item 2), and in some cases fall back to the old search: when the route may pass through such a map in a way the estimate can't cover, when no way into the finish or out of the start map is found, or when unpacking a route fails.
+
+Needs:
+
+- Every one of these cases removed or handled, so the old search is never used for a car route. Where data really can't exist yet (the first minutes after a download), the estimate is used, never the old search.
+- A test for each case, including Android killing the job, low battery, low storage and app updates in the middle of preparation.
+- Lower preparation memory where it makes Android stop the job (about 800 MB at the peak for Uttar Pradesh).
+
+## 11. Simpler avoid settings that always have their data
+
+Status: not started.
+
+Today the data for avoid settings (tolls, motorways, ferries, dirt roads) is prepared only for the maps a route has gone through with that mix, and only after that route asked for it. In use this often leaves a map without the data, and the route then falls back to CoMaps' old search.
+
+Cases found so far in the code:
+
+- A new mix has no data anywhere until a route asks for it, so the first routes with that mix are not fast.
+- Changing the mix during preparation stops it; the run for the new mix starts over.
+- With "keep data for the current mix only", switching back to an earlier mix starts from nothing again.
+- The cases in item 10 apply to this data too.
+
+Needs:
+
+- One rule that can't miss: for example, preparing the current mix for every downloaded map as soon as it is chosen. Avoid data is now small (11 MB for Uttar Pradesh with tolls avoided, item 8), so this is affordable.
+- Fewer choices in Settings, if the rule makes the current-mix-or-every-mix choice unnecessary.
+- No fallback to the old search for any mix (item 10).

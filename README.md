@@ -97,6 +97,9 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 6. A new package name, app name and icon throughout the app.
 7. Several route options to choose from, as in Google Maps.
 8. Less storage space and memory used by maps on the phone. Done for the route data; the map files come from CoMaps.
+9. The same changes in the iOS and desktop apps.
+10. Route data always ready for every downloaded map, so car routes never fall back to CoMaps' old search.
+11. Simpler avoid settings whose data is always there.
 
 Details, status and what each item needs: [ROADMAP.md](ROADMAP.md).
 
