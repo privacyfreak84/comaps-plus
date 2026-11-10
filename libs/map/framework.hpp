@@ -225,6 +225,7 @@ protected:
 
   df::DrapeApi m_drapeApi;
   size_t m_plusAvoidLines = 0;  // lines PlusShowAvoidPlaces added to m_drapeApi
+  kml::TrackId m_plusAvoidTrack = kml::kInvalidTrackId;  // saved route whose avoided places are drawn
 
   bool m_isRenderingEnabled;
 
@@ -322,9 +323,11 @@ public:
   void SwitchToUsingVehicleStyle(bool const shouldUseVehicleStyle);
 
   df::DrapeApi & GetDrapeApi() { return m_drapeApi; }
-  // Comaps++: draws the enabled avoided roads and places (routing/plus_avoid_places.hpp) on the map; call
-  // after the list changes.
+  // Comaps++: draws in red the current route's avoided roads and places (routing/plus_avoid_places.hpp), and
+  // those of the saved route (track) being viewed. Called when either changes.
   void PlusShowAvoidPlaces();
+  // The saved route (track) selected on the map, or kml::kInvalidTrackId.
+  void PlusShowTrackAvoidPlaces(kml::TrackId trackId);
 
   /// \returns true if there're unsaved changes in map with |countryId| and false otherwise.
   /// \note It works for group and leaf node.

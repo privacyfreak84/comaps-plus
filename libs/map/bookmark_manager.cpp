@@ -1178,7 +1178,7 @@ std::string BookmarkManager::GenerateSavedRouteName(std::string const & from, st
 }
 
 kml::TrackId BookmarkManager::SaveRoute(std::vector<geometry::PointWithAltitude> points, std::string const & from,
-                                        std::string const & to)
+                                        std::string const & to, kml::Properties properties)
 {
   CHECK(!points.empty(), ("Route points should not be empty"));
 
@@ -1187,6 +1187,7 @@ kml::TrackId BookmarkManager::SaveRoute(std::vector<geometry::PointWithAltitude>
   trackData.m_geometry.m_timestamps.emplace_back();
 
   kml::SetDefaultStr(trackData.m_name, GenerateSavedRouteName(from, to));
+  trackData.m_properties = std::move(properties);
 
   kml::ColorData colorData;
   colorData.m_rgba = GenerateTrackRecordingColor().GetRGBA();

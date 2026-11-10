@@ -24,12 +24,6 @@
 
   <!-- Comaps++ -->
   <Preference
-    android:key="pref_plus_avoid_places"
-    android:persistent="false"
-    android:title="@string/plus_avoid_list_title"
-    app:icon="@drawable/ic_avoid_place"
-    app:singleLineTitle="false" />
-  <Preference
     android:key="pref_plus_overlay_storage"
     android:persistent="false"
     android:title="@string/plus_overlay_storage_pref_title"

@@ -1,8 +1,10 @@
 #pragma once
 
-// Comaps++ roadmap item 1: roads and areas the user chose to keep out of car routes.
+// Comaps++ roadmap item 1: roads and areas the user chose to keep out of the current car route.
 //
-// Nothing is prepared for them. Each car route looks up the road segments a place covers in the maps
+// They belong to that route only: kept in memory while the route exists (RoutingManager clears them when
+// the route is closed), saved with it when the route is saved (as a track, or for restoring after a restart)
+// and never stored on their own. Nothing is prepared for them. Each car route looks up the road segments a place covers in the maps
 // (PlusResolveAvoidPlaces in IndexRouter) and leaves them out of the road graph (IndexGraph). The fast-route
 // search treats the map cells holding those segments like cells it has no times for and searches their
 // roads (overlay_router.cpp), so routes stay exact.
@@ -18,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,15 +47,13 @@ struct Place
   double lat = 0;
   double lon = 0;
   uint32_t radiusM = 0;  // Area only
-  bool enabled = true;
-  // Shown in the list. For a road: its name or number, preferred over a nearer road when the road is
-  // looked up again in a later route or map version. For an area: the settlement's name, if any.
+  // For a road: its name or number, preferred over a nearer road when the road is looked up again (in a
+  // recalculation, a restored route or a later map version). For an area: the settlement's name, if any.
   std::string name;
 
   bool operator==(Place const & o) const
   {
-    return kind == o.kind && lat == o.lat && lon == o.lon && radiusM == o.radiusM && enabled == o.enabled &&
-           name == o.name;
+    return kind == o.kind && lat == o.lat && lon == o.lon && radiusM == o.radiusM && name == o.name;
   }
 };
 
@@ -64,15 +65,20 @@ constexpr double kRoadPickRadiusM = 50.0;
 // get there (or leave from there) anyway.
 constexpr double kCheckpointMarginM = 30.0;
 
-// The saved list (settings key PlusAvoidPlaces), safe from any thread.
+// The current car route's avoided places, safe from any thread. Desktop tools and tests can start the
+// list from the environment (COMAPS_PLUS_AVOID_PLACES, Serialize format).
 std::vector<Place> GetPlaces();
-// Replaces and saves the list.
+// Replaces the list (in memory only). Calls the change listener if it changed.
 void SetPlaces(std::vector<Place> const & places);
-// Changes whenever the list changes.
-uint64_t Generation();
+void ClearPlaces();
+// Called on the caller's thread after the list changes (the map redraws the places).
+void SetChangeListener(std::function<void()> listener);
 
 std::string Serialize(std::vector<Place> const & places);
 bool Deserialize(std::string const & s, std::vector<Place> & places);
+
+// Key of a saved route's (track's) avoided places in its KML properties, Serialize format.
+inline constexpr char kTrackPropertyKey[] = "comaps_plus_avoid";
 
 // A car road near a point.
 struct RoadNearby
@@ -115,6 +121,11 @@ struct Tapped
 std::optional<Place> RouteAvoidOption(Route const & route, std::vector<m2::PointD> const & checkpoints,
                                       Tapped const & tapped, DataSource const & dataSource,
                                       VehicleModelFactoryInterface & models);
+
+// Index in |places| of the place |point| (mercator) lies in: within an area's radius, or within kOnRouteM
+// of an avoided road. Lets the user tap a place drawn in red and stop avoiding it.
+std::optional<size_t> PlaceAt(std::vector<Place> const & places, m2::PointD const & point,
+                              DataSource const & dataSource, VehicleModelFactoryInterface & models);
 
 // Road segments left out of car routes in one map: feature id -> segment indices, ascending (empty: every
 // segment of the feature).

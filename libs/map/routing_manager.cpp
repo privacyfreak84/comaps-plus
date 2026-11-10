@@ -16,6 +16,7 @@
 #include "routing/following_info.hpp"
 #include "routing/index_router.hpp"
 #include "routing/maxspeeds.hpp"
+#include "routing/plus_avoid_places.hpp"
 #include "routing/route.hpp"
 #include "routing/routing_callbacks.hpp"
 #include "routing/routing_settings.hpp"
@@ -79,6 +80,8 @@ std::string_view constexpr kRouterTypeKey = "router";
 double constexpr kRouteScaleMultiplier = 1.5;
 
 string const kRoutePointsFile = "route_points.dat";
+// Comaps++: the avoided places of the route saved in kRoutePointsFile (plus_avoid::Serialize format).
+string const kPlusRouteAvoidFile = "plus_route_avoid.dat";
 
 uint32_t constexpr kInvalidTransactionId = 0;
 
@@ -1036,6 +1039,8 @@ void RoutingManager::CloseRouting(bool removeRoutePoints)
   {
     m_bmManager->GetEditSession().ClearGroup(UserMark::Type::ROUTING);
     CancelRecommendation(Recommendation::RebuildAfterPointsLoading);
+    // Comaps++: the route is gone, and its avoided places with it.
+    routing::plus_avoid::ClearPlaces();
   }
 }
 
@@ -1361,7 +1366,11 @@ kml::TrackId RoutingManager::SaveRoute()
   std::string const from = GetNameFromPoint(routePoints.front());
   std::string const to = GetNameFromPoint(routePoints.back());
 
-  return m_bmManager->SaveRoute(std::move(junctions), from, to);
+  // Comaps++: the track keeps the route's avoided places; they're drawn while it's selected.
+  kml::Properties properties;
+  if (auto const avoid = routing::plus_avoid::GetPlaces(); !avoid.empty())
+    properties[routing::plus_avoid::kTrackPropertyKey] = routing::plus_avoid::Serialize(avoid);
+  return m_bmManager->SaveRoute(std::move(junctions), from, to, std::move(properties));
 }
 
 bool RoutingManager::DisableFollowMode()
@@ -1676,8 +1685,30 @@ void RoutingManager::LoadRoutePoints(LoadRouteHandler const & handler)
       return;
     }
 
-    GetPlatform().RunTask(Platform::Thread::Gui, [this, handler, points = std::move(points)]() mutable
+    // Comaps++: the saved route's avoided places, if it had any.
+    std::vector<routing::plus_avoid::Place> avoid;
     {
+      auto const avoidFile = GetPlatform().SettingsPathForFile(kPlusRouteAvoidFile);
+      if (GetPlatform().IsFileExistsByFullPath(avoidFile))
+      {
+        try
+        {
+          string avoidData;
+          ReaderPtr<Reader>(GetPlatform().GetReader(avoidFile)).ReadAsString(avoidData);
+          routing::plus_avoid::Deserialize(avoidData, avoid);
+        }
+        catch (RootException const & ex)
+        {
+          LOG(LWARNING, ("Loading the route's avoided places failed:", ex.Msg()));
+        }
+        FileWriter::DeleteFileX(avoidFile);
+      }
+    }
+
+    GetPlatform().RunTask(Platform::Thread::Gui,
+                          [this, handler, points = std::move(points), avoid = std::move(avoid)]() mutable
+    {
+      routing::plus_avoid::SetPlaces(avoid);
       ASSERT(m_bmManager != nullptr, ());
       // If we have found my position and the saved route used the user's position, we use my position as start point.
       bool routeUsedPosition = false;
@@ -1724,7 +1755,9 @@ void RoutingManager::SaveRoutePoints()
     return;
   }
 
-  GetPlatform().RunTask(Platform::Thread::File, [points = std::move(points)]()
+  GetPlatform().RunTask(Platform::Thread::File,
+                        [points = std::move(points), avoid = routing::plus_avoid::Serialize(
+                                                         routing::plus_avoid::GetPlaces())]()
   {
     try
     {
@@ -1736,6 +1769,22 @@ void RoutingManager::SaveRoutePoints()
     catch (RootException const & ex)
     {
       LOG(LWARNING, ("Saving road points failed:", ex.Msg()));
+    }
+    // Comaps++: the route's avoided places go with it.
+    auto const avoidFile = GetPlatform().SettingsPathForFile(kPlusRouteAvoidFile);
+    if (avoid.empty())
+    {
+      FileWriter::DeleteFileX(avoidFile);
+      return;
+    }
+    try
+    {
+      FileWriter writer(avoidFile);
+      writer.Write(avoid.c_str(), avoid.length());
+    }
+    catch (RootException const & ex)
+    {
+      LOG(LWARNING, ("Saving the route's avoided places failed:", ex.Msg()));
     }
   });
 }
@@ -1786,13 +1835,18 @@ void RoutingManager::OnExtrapolatedLocationUpdate(location::GpsInfo const & info
 
 void RoutingManager::DeleteSavedRoutePoints()
 {
-  if (!HasSavedRoutePoints())
+  auto const avoidFile = GetPlatform().SettingsPathForFile(kPlusRouteAvoidFile);
+  bool const hasAvoid = GetPlatform().IsFileExistsByFullPath(avoidFile);
+  if (!HasSavedRoutePoints() && !hasAvoid)
     return;
 
   GetPlatform().RunTask(Platform::Thread::File, []()
   {
     auto const fileName = GetPlatform().SettingsPathForFile(kRoutePointsFile);
     FileWriter::DeleteFileX(fileName);
+    auto const avoidFile = GetPlatform().SettingsPathForFile(kPlusRouteAvoidFile);
+    if (GetPlatform().IsFileExistsByFullPath(avoidFile))
+      FileWriter::DeleteFileX(avoidFile);
   });
 }
 

@@ -475,9 +475,6 @@
       android:name="app.organicmaps.settings.RoutingOptionsActivity"
       android:label="@string/routing_options_title"/>
     <activity
-      android:name="app.organicmaps.settings.PlusAvoidPlacesActivity"
-      android:label="@string/plus_avoid_list_title"/>
-    <activity
         android:name="app.organicmaps.MapPlaceholderActivity"/>
     <activity
         android:name="app.organicmaps.car.screens.permissions.RequestPermissionsActivity"/>
