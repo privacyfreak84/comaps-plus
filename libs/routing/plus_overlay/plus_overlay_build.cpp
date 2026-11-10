@@ -27,8 +27,6 @@ DEFINE_uint32(threads, 2, "Threads for partition and shortcuts.");
 DEFINE_string(out, "", "Overlay file to write (empty: next to the map, <map>.plusovl).");
 DEFINE_bool(check_file, false, "Read the written file back and compare it with what was built.");
 DEFINE_double(cancel_after_s, 0, "Test cancellation: cancel the build after this many seconds (0: never).");
-DEFINE_int32(avoid_mask, 0, "Build the avoid-option cliques for these RoutingOptions bits (2 toll, 4 motorway, "
-                            "8 ferry, 16 dirt) instead of the base file; needs the base file.");
 DEFINE_string(partition_tree, "", "Partition splits kept across map versions: reused if the file exists, "
                                   "written after a full partition.");
 DEFINE_bool(cleanup, false, "Only delete overlay files whose map is gone (and interrupted builds) in the version "
@@ -45,7 +43,7 @@ int main(int argc, char ** argv)
   if (FLAGS_cleanup)
   {
     std::cout << "deleted "
-              << plus_overlay::DeleteOrphanedOverlayFiles(dir, FLAGS_avoid_mask > 0 ? FLAGS_avoid_mask : -1)
+              << plus_overlay::DeleteOrphanedOverlayFiles(dir)
               << " files\n";
     return 0;
   }
@@ -85,11 +83,7 @@ int main(int argc, char ** argv)
   std::cout << "== Comaps++ overlay build: " << FLAGS_mwm << " v" << FLAGS_mwm_version << ", " << FLAGS_threads
             << " threads\n";
   auto const parentGetter = [cpg](std::string const & id) { return (*cpg)(id); };
-  auto const r = FLAGS_avoid_mask > 0
-                     ? plus_overlay::BuildAvoidCliquesFile(localFile, parentGetter,
-                                                           static_cast<uint32_t>(FLAGS_avoid_mask), "" /* base */,
-                                                           FLAGS_out, o)
-                     : plus_overlay::BuildOverlayFile(localFile, parentGetter, FLAGS_out, o);
+  auto const r = plus_overlay::BuildOverlayFile(localFile, parentGetter, FLAGS_out, o);
   switch (r.status)
   {
   case plus_overlay::BuildResult::Status::Ok:

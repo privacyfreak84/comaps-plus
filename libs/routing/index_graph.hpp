@@ -6,6 +6,7 @@
 #include "routing/geometry.hpp"
 #include "routing/joint.hpp"
 #include "routing/joint_index.hpp"
+#include "routing/plus_avoid_places.hpp"
 #include "routing/joint_segment.hpp"
 #include "routing/restrictions_serialization.hpp"
 #include "routing/road_access.hpp"
@@ -94,6 +95,15 @@ public:
 
   // Comaps++: the overlay needs the conditional-access tables (time-dependent edges).
   RoadAccess const & GetRoadAccess() const { return m_roadAccess; }
+
+  // Comaps++: road segments of avoided places (plus_avoid_places.hpp). Edges onto them are left out
+  // wherever avoid options apply (useRoutingOptions).
+  void SetPlusBlocked(std::shared_ptr<plus_avoid::Blocked const> blocked) { m_plusBlocked = std::move(blocked); }
+  std::shared_ptr<plus_avoid::Blocked const> const & GetPlusBlocked() const { return m_plusBlocked; }
+  bool IsPlusBlocked(uint32_t featureId, uint32_t segmentIdx) const
+  {
+    return m_plusBlocked && m_plusBlocked->IsBlocked(featureId, segmentIdx);
+  }
 
   RoadAccess::Type GetAccessType(Segment const & segment) const
   {
@@ -225,6 +235,7 @@ private:
   RoadAccess m_roadAccess;
   RoadPenalty m_roadPenalty;
   RoutingOptions m_avoidRoutingOptions;
+  std::shared_ptr<plus_avoid::Blocked const> m_plusBlocked;
   bool m_isLeftHandTraffic;
 
   std::function<time_t()> m_currentTimeGetter = []() { return GetCurrentTimestamp(); };

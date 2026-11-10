@@ -361,7 +361,7 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
     m_plusLastWasAdjusted = false;
     m_plusNormalReason.clear();
     m_plusApproxMaps.clear();
-    m_plusAvoidMaps.clear();
+    PlusResolveAvoidPlaces(checkpoints);
     base::Timer plusTimer;
     auto const publishReport = [this, &plusTimer]()
     {
@@ -369,7 +369,7 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
         return;
       plus_overlay::EngineReport r;
       r.seconds = plusTimer.ElapsedSeconds();
-      r.avoidMaps = m_plusAvoidMaps;
+      r.avoidPlaces = m_plusAvoidPlacesUsed;
       r.engine = plus_overlay::EngineReport::Engine::Overlay;
       if (m_plusLastWasAdjusted)
       {
@@ -774,8 +774,7 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
     return RouterResultCode::NeedMoreMaps;
   if (PlusOverlayDisabled())
     return notApplicable("overlay switched off (COMAPS_PLUS_OVERLAY=0)");
-  // With avoid options a map's avoid-option file (built in the background next to the base file) makes
-  // routes faster; without it they are still exact (OverlayMap).
+  // Avoid options need no file of their own (OverlayMap).
   auto const avoidMask = static_cast<uint32_t>(RoutingOptions::LoadOptionsFromSettings(m_vehicleType).GetOptions());
 
   if (!m_plusOverlay)
@@ -793,7 +792,7 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
       continue;
     auto const mwmPath = localFile.GetPath(MapFileType::Map);
     maps.push_back({m_numMwmIds->GetId(countryFile), plus_overlay::OverlayPathForMap(mwmPath), info->GetVersion(),
-                    avoidMask, avoidMask ? plus_overlay::AvoidOverlayPathForMap(mwmPath, avoidMask) : std::string()});
+                    avoidMask});
   }
   if (maps.empty())
     return notApplicable("no maps");
@@ -851,14 +850,21 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
     }
     if (!stats.approxMaps.empty())
       LOG(LINFO, ("Comaps++ overlay: approximate through", m_plusApproxMaps, "(overlay not built yet)"));
-    for (auto const id : stats.noAvoidFileMaps)
+    if (!m_plusBlocked.empty())
     {
-      auto const name = m_numMwmIds->GetFile(id).GetName();
-      if (std::find(m_plusAvoidMaps.begin(), m_plusAvoidMaps.end(), name) == m_plusAvoidMaps.end())
-        m_plusAvoidMaps.push_back(name);
+      size_t onBlocked = 0;
+      for (auto const & sg : subroute)
+      {
+        if (IndexGraphStarter::IsFakeSegment(sg))
+          continue;
+        auto const it = m_plusBlocked.find(sg.GetMwmId());
+        if (it != m_plusBlocked.end() && it->second->IsBlocked(sg.GetFeatureId(), sg.GetSegmentIdx()))
+          ++onBlocked;
+      }
+      LOG(onBlocked == 0 ? LINFO : LERROR, ("Comaps++ overlay: avoided places,", stats.blockedCells,
+                                            "level-1 cells searched on their roads,", onBlocked,
+                                            "route segments in avoided places"));
     }
-    if (!stats.noAvoidFileMaps.empty())
-      LOG(LINFO, ("Comaps++ overlay: no avoid-option file yet for", m_plusAvoidMaps, "(cells with avoided roads searched on their roads)"));
     return RouterResultCode::NoError;
   }
   subroute.clear();
@@ -1287,6 +1293,8 @@ unique_ptr<WorldGraph> IndexRouter::MakeWorldGraph()
   auto indexGraphLoader = IndexGraphLoader::Create(
       m_vehicleType == VehicleType::Transit ? VehicleType::Pedestrian : m_vehicleType, m_loadAltitudes,
       m_vehicleModelFactory, m_estimator, m_dataSource, routingOptions, m_currentTimeGetter);
+  if (!m_plusBlocked.empty())
+    indexGraphLoader->SetPlusBlocked(m_plusBlocked);
 
   if (m_vehicleType != VehicleType::Transit)
   {
@@ -1300,6 +1308,79 @@ unique_ptr<WorldGraph> IndexRouter::MakeWorldGraph()
   auto transitGraphLoader = TransitGraphLoader::Create(m_dataSource, m_estimator);
   return make_unique<TransitWorldGraph>(std::move(crossMwmGraph), std::move(indexGraphLoader),
                                         std::move(transitGraphLoader), m_estimator);
+}
+
+void IndexRouter::PlusResolveAvoidPlaces(Checkpoints const & checkpoints)
+{
+  m_plusBlocked.clear();
+  m_plusAvoidPlacesUsed = 0;
+  if (m_vehicleType != VehicleType::Car)
+    return;
+  auto const places = plus_avoid::GetPlaces();
+  if (places.empty())
+    return;
+  base::Timer timer;
+  // Per map and feature: (every segment, the segments of areas).
+  std::unordered_map<NumMwmId, std::unordered_map<uint32_t, std::pair<bool, std::vector<uint32_t>>>> blocked;
+  for (auto const & place : places)
+  {
+    if (!place.enabled)
+      continue;
+    bool const area = place.kind == plus_avoid::Place::Kind::Area;
+    double const radius = area ? std::clamp<double>(place.radiusM, plus_avoid::kMinAreaRadiusM,
+                                                    plus_avoid::kMaxAreaRadiusM)
+                               : plus_avoid::kRoadPickRadiusM;
+    m2::PointD const center = mercator::FromLatLon(place.lat, place.lon);
+    // A place at a start, finish or stop doesn't apply: the route has to go there anyway.
+    bool nearEnd = false;
+    if (area)
+      for (auto const & pt : checkpoints.GetPoints())
+        nearEnd = nearEnd || mercator::DistanceOnEarth(pt, center) <= radius + plus_avoid::kCheckpointMarginM;
+    if (nearEnd)
+      continue;
+
+    auto roads = plus_avoid::FindRoads(m_dataSource.GetDataSource(), *m_vehicleModelFactory, center, radius);
+    if (!area)
+    {
+      std::vector<plus_avoid::RoadNearby> picked;
+      for (size_t i : plus_avoid::PickRoad(roads, place.name))
+        picked.push_back(std::move(roads[i]));
+      for (auto const & pt : checkpoints.GetPoints())
+        for (auto const & r : picked)
+          nearEnd = nearEnd || plus_avoid::DistanceToPolyline(pt, r.points) <= plus_avoid::kCheckpointMarginM;
+      roads = nearEnd ? std::vector<plus_avoid::RoadNearby>() : std::move(picked);
+    }
+
+    bool used = false;
+    for (auto const & r : roads)
+    {
+      auto const & countryFile = r.id.m_mwmId.GetInfo()->GetLocalFile().GetCountryFile();
+      if (!m_numMwmIds->ContainsFile(countryFile))
+        continue;
+      used = true;
+      auto & f = blocked[m_numMwmIds->GetId(countryFile)][r.id.m_index];
+      if (area)
+        f.second.insert(f.second.end(), r.segsWithin.begin(), r.segsWithin.end());
+      else
+        f.first = true;  // every segment
+    }
+    if (used)
+      ++m_plusAvoidPlacesUsed;
+  }
+  for (auto & [mwm, features] : blocked)
+  {
+    plus_avoid::Blocked b;
+    for (auto & [f, entry] : features)
+    {
+      auto & [all, segs] = entry;
+      std::sort(segs.begin(), segs.end());
+      segs.erase(std::unique(segs.begin(), segs.end()), segs.end());
+      b.features[f] = all ? std::vector<uint32_t>() : std::move(segs);
+    }
+    m_plusBlocked[mwm] = std::make_shared<plus_avoid::Blocked const>(std::move(b));
+  }
+  LOG(LINFO, ("Comaps++ avoided places:", m_plusAvoidPlacesUsed, "of", places.size(), "apply,", m_plusBlocked.size(),
+              "maps, in", timer.ElapsedSeconds(), "s"));
 }
 
 int IndexRouter::PlusSnap(m2::PointD const & start, m2::PointD const & finish, FakeEnding & startEnding,

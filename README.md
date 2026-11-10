@@ -26,11 +26,12 @@ Short trips were already quick, so the gain is in long ones. In maps with time-r
 - After you download or update a map, a background job prepares its route data. A notification shows progress and has a Cancel button. The job also runs when the app starts, to catch anything missed, and after a reboot even if the app isn't opened.
 - The job doesn't wait for a charged battery or free storage, and doesn't give up on a map. If Android stops a preparation (for example for memory), it is tried again with one thread after the other maps, and from the third time with a growing pause (15 minutes up to 6 hours). A preparation that fails is tried again after 1, 4, 16 minutes and so on, up to 6 hours. A stopped preparation keeps its cell layout, so the next attempt skips the slowest step.
 - Until a map is prepared, car routes through it still work. Comaps++ estimates the part of the route inside that map from CoMaps' border-to-border times and shows a message that the route may be a few minutes off. That map is prepared first, and the route is recalculated by itself when it's ready.
-- Avoid settings (tolls, motorways, ferries, dirt roads, in any mix) work with fast routes, and their routes are exact from the moment you change the settings. Each map's route data records which of these road types every cell contains; for a map without data for your mix, the route goes through the cells with avoided roads road by road. That data, one smaller file per map, is prepared only for the maps your routes go through, right after the first route with that mix, and the files of the previous mix are deleted. Until then routes avoiding tolls or motorways take about as long as with the data (0.9 to 3.9 s for the 10 long Indian routes, against 1.0 to 2.0 s), and routes avoiding dirt roads, which are in about half of all cells in India, are much slower (2.5 to 46 s on the test VM).
+- Avoid settings (tolls, motorways, ferries, dirt roads, in any mix) need nothing prepared, and their routes are exact from the moment you change the settings. The route data records, for every cell, which of these road types its stored travel times rely on. A route avoiding one of those types goes through such a cell road by road, with the avoided roads left out; every other cell keeps its stored times. On the test VM, 8 routes across Uttar Pradesh took 1.0 to 1.2 s without avoid settings, 1.1 to 1.6 s avoiding tolls, 1.1 to 2.0 s avoiding motorways and 1.2 to 3.5 s avoiding dirt roads. Routes across two maps that avoid dirt roads are slower (about 10 s for three routes from Uttar Pradesh into Madhya Pradesh, against 2.6 to 3.2 s), because the largest cells all rely on some dirt road.
+- You can also keep car routes away from a road or an area you choose ([roadmap item 1](ROADMAP.md#1-avoid-specific-roads-and-places)). Tap a place on the map, or long-press anywhere, then Avoid (it may be under More): either the road at that point, or everything within 100 m to 5 km of it. Nothing is prepared for this either: each route looks up the road segments a place covers (a few milliseconds) and searches the cells holding them road by road. Settings, Navigation, Avoided roads and places lists them, and lets you switch each one off, see it on the map, resize an area or delete it; the avoid settings screen links there too. A place doesn't apply to a route that starts, ends or stops in it. If no route is left, the "no route" message says the avoided places may be the reason.
 - Rerouting after a missed turn goes straight to the fast search. In 110 test reroutes the new route was as quick as a fresh route from the same spot (one was 5 s slower), and took 0.3 to 3.2 seconds.
 - Routes with stops use the fast search for every leg.
 - App updates don't throw the data away. Map updates reuse the previous cell layout, which skips the slowest step: Uttar Pradesh takes 49 s instead of 153 s on the test VM.
-- If a data file turns out to be damaged, the app deletes it and prepares it again; until then the map is treated as not prepared (or, for avoid-setting data, routes there are exact but slower).
+- If a data file turns out to be damaged, the app deletes it and prepares it again; until then the map is treated as not prepared.
 - Car routes don't hand over to CoMaps' old search. Only the stretch inside a map that isn't prepared yet uses CoMaps' search ([roadmap item 10](ROADMAP.md#10-route-data-always-ready-never-comaps-old-search)).
 - Settings, Navigation, Fast routes shows how many downloaded maps are ready and how much space the data uses. A test switch there, "Show how each car route was calculated", adds a short message after each route.
 
@@ -40,14 +41,14 @@ Walking and cycling routes use CoMaps' router unchanged. Walking routes take a f
 
 Storage, per map:
 
-| Map | Map file | Route data | Extra for one avoid mix (tolls) |
-|---|---|---|---|
-| Uttar Pradesh | 200.9 MB | 63.8 MB | 7.7 MB |
-| Maharashtra | 165.7 MB | 33.9 MB | 3.6 MB |
-| Madhya Pradesh | 134.2 MB | 21.5 MB | 1.9 MB |
-| Berlin | 111.7 MB | 6.0 MB | 0.6 MB (motorways) |
+| Map | Map file | Route data |
+|---|---|---|
+| Uttar Pradesh | 201.0 MB | 65.4 MB |
+| Maharashtra | 165.7 MB | 33.9 MB |
+| Madhya Pradesh | 134.3 MB | 22.0 MB |
+| Berlin | 111.7 MB | 6.0 MB |
 
-An avoid mix stores only the parts of the network it changes, so its size depends on the settings: avoiding dirt roads, which are common in India, takes 24.1 MB for Uttar Pradesh.
+Uttar Pradesh and Madhya Pradesh are maps 261105, with the road types of each cell (about 2.5% of the route data). Maharashtra and Berlin are earlier measurements without them. Avoid settings and avoided places take no extra space; earlier versions stored one more file per map for avoid settings (7.7 MB for Uttar Pradesh avoiding tolls, 24.1 MB avoiding dirt roads), which the app now deletes.
 
 Preparation time and peak memory on the 2-core test VM: Uttar Pradesh about 1.5 minutes and 800 MB, Maharashtra 1 minute and 550 MB, Madhya Pradesh 35 s and 375 MB, Berlin 6 s and about 120 MB. On a test phone, preparation ran in the background without Android closing the app and without the app lagging.
 
@@ -60,6 +61,8 @@ The point of the overlay is speed without different routes, so every change was 
 - 13 routes of 108 to 1,218 km across Uttar Pradesh, Madhya Pradesh and Maharashtra: identical arrival times.
 - 327 generated routes in 12 groups (state borders, bridges and tunnels, dead ends, small islands, one-way streets, ramps, restricted access, roundabouts, random pairs, the longest possible pairs, and 20 hand-picked routes such as the Mumbai to Pune expressway ghats and the Bandra-Worli sea link): the same outcome in all 327 (routed or not), no crash or hang. Where both routed, arrival times matched within a minute except on two routes. On one, Comaps++ found a route more than a minute quicker. On the other, CoMaps' route arrives 64 s sooner but scores worse by CoMaps' own measure, which adds penalties for roads with restricted access.
 - 24 routes with avoid settings, 6 routes with 1 to 3 stops, 110 reroutes: same arrival times.
+- Without avoid-setting files (maps 261105): 8 routes across Uttar Pradesh avoiding tolls, motorways and dirt roads (24 routes) against CoMaps' exact search with the same settings: the same roads on all 24 and the same arrival times, except one route that is 10 s apart with each setting, as it is without avoid settings.
+- Avoided places: the same 8 routes with 8 places on them (4 roads, 4 areas of 250 m to 2 km): all 8 changed, none uses a segment of an avoided place, and they take the same roads as CoMaps' exact search with the same places (one route 10 s apart in arrival time, as without places). Three routes from Uttar Pradesh into Madhya Pradesh with 3 places, with and without avoiding dirt roads: two within 5 s of CoMaps (as without places), one 30 s slower out of 10.8 hours, with its avoided area next to the state border.
 - After the storage changes (roadmap item 8): the 10 long Indian routes, with and without tolls, and 386 German routes gave the same arrival times as before, except two German routes that changed by 4 and 7 seconds.
 - Storing travel times in 2 bytes instead of 4 (roadmap item 8) rounds each stored time by at most half a second. The 10 long Indian routes, with and without tolls, didn't change. Of 386 German routes, 348 didn't change, 36 changed by at most 1.1 s, and two by about 7 s (one faster, one slower). Of 390 Austrian routes, 382 didn't change and 8 changed by at most 0.1 s. Of 40 German routes avoiding motorways, 34 didn't change and 6 changed by at most 0.1 s.
 - Inside one map, 100 random routes against a plain shortest-path search: no differences.
@@ -73,7 +76,7 @@ Two findings along the way. On 2 of 20 test routes in Uttar Pradesh, CoMaps' rou
 - Near map borders a few routes differ slightly: in India 1 of 40 border test routes is more than a minute off (78 s). Comaps++ switches between maps only where a road crosses the border; CoMaps can switch at any junction of a road present in both maps. Doing the same was tried: it made long routes about twice as slow and improved 2 of 40 border routes, so it was left out.
 - A route that starts on a road closed at that moment starts on it and leaves it at the nearest junction; CoMaps starts from a neighbouring road instead. In tests this changed 1 of 40 such routes (5 minutes shorter).
 - Preparing a large map needs about 800 MB of memory at its peak (Uttar Pradesh). A phone that can never spare that much keeps retrying (with pauses) without finishing, and routes through that map stay estimated.
-- Each new route-data layout makes the app prepare every map again after updating; routes are estimated until it's done. Until there are releases this happens freely; after that, layout changes will keep old files readable.
+- Each new route-data layout makes the app prepare every map again after updating. Files in the previous layout keep serving routes meanwhile (since layout 8; avoid settings are slower with them until each map is redone).
 - Only the Android app prepares route data. The iOS and desktop apps from CoMaps are still in this repository but haven't been changed or tested.
 - The new messages and settings are in English only.
 
@@ -93,7 +96,7 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Roadmap
 
-1. Avoid specific roads and places, not only types of road.
+1. Avoid specific roads and places, not only types of road. Done.
 2. Faster navigation. Done.
 3. An update checker and downloader in the app's settings.
 4. Full OpenStreetMap editing, added over time.
@@ -103,7 +106,7 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 8. Less storage space and memory used by maps on the phone. Done for the route data; the map files come from CoMaps.
 9. The same changes in the iOS and desktop apps.
 10. Route data always ready for every downloaded map, so car routes never fall back to CoMaps' old search. Done.
-11. Simpler avoid settings whose data is always there. Done: routes with avoid settings are exact even before their data is ready.
+11. Simpler avoid settings whose data is always there. Done: avoid settings need no data of their own.
 
 Details, status and what each item needs: [ROADMAP.md](ROADMAP.md).
 
@@ -123,15 +126,16 @@ The Release workflow ([.github/workflows/plus-release.yml](.github/workflows/plu
 
 - [libs/routing/plus_overlay/](libs/routing/plus_overlay/): the overlay builder (`overlay_builder`), file format (`overlay_file`), query (`overlay`, `overlay_router`) and turn-restriction handling (`via_way_automaton.hpp`).
 - [libs/routing/index_router.cpp](libs/routing/index_router.cpp): `TryPlusOverlay` hands car routes to the overlay before CoMaps' own search.
-- Android: [PlusOverlay](android/sdk/src/main/java/app/organicmaps/sdk/routing/PlusOverlay.java) (JNI), [PlusOverlayWork](android/app/src/main/java/app/organicmaps/background/PlusOverlayWork.java) (background preparation), [PlusRouteStatus](android/app/src/main/java/app/organicmaps/background/PlusRouteStatus.java) and [PlusOverlaySettings](android/app/src/main/java/app/organicmaps/background/PlusOverlaySettings.java).
+- [libs/routing/plus_avoid_places.hpp](libs/routing/plus_avoid_places.hpp): the avoided roads and places; `IndexRouter::PlusResolveAvoidPlaces` turns them into road segments per route, which `IndexGraph` leaves out.
+- Android: [PlusAvoidPlaces](android/sdk/src/main/java/app/organicmaps/sdk/routing/PlusAvoidPlaces.java) (JNI), [PlusAvoidPlaceDialog](android/app/src/main/java/app/organicmaps/routing/PlusAvoidPlaceDialog.java) (Avoid on the place page) and [PlusAvoidPlacesFragment](android/app/src/main/java/app/organicmaps/settings/PlusAvoidPlacesFragment.java) (the list); [PlusOverlay](android/sdk/src/main/java/app/organicmaps/sdk/routing/PlusOverlay.java) (JNI), [PlusOverlayWork](android/app/src/main/java/app/organicmaps/background/PlusOverlayWork.java) (background preparation), [PlusRouteStatus](android/app/src/main/java/app/organicmaps/background/PlusRouteStatus.java) and [PlusOverlaySettings](android/app/src/main/java/app/organicmaps/background/PlusOverlaySettings.java).
 
-Files are stored next to each map as `<map>.plusovl`, plus `<map>.avoid<mask>.plusovl` for an avoid mix. A file only counts if its map version, build settings and routing data version match. Raise `kRoutingDataVersion` only when a code change makes old files give wrong routes; it forces every user to prepare all maps again.
+Files are stored next to each map as `<map>.plusovl`. A file only counts if its map version, build settings and routing data version match. Raise `kRoutingDataVersion` only when a code change makes old files give wrong routes; it forces every user to prepare all maps again.
 
 ### Desktop tools
 
 Built with the desktop targets:
 
-- `plus_overlay_build`: prepares one map's file, as the phone does (`--mwm`, `--maps_path`, `--resources_path`, `--avoid_mask`, `--check_file`).
+- `plus_overlay_build`: prepares one map's file, as the phone does (`--mwm`, `--maps_path`, `--resources_path`, `--check_file`). It prints how many cells per level rely on each avoidable road type.
 - `plus_overlay_multi`: routes across several maps and compares with CoMaps' router (`--mode=overlay|router|reroute|gen_stress|runtime`).
 - `plus_overlay_tool`: the single-map prototype and its exactness checks.
 - [.plus/bench/run.sh](.plus/bench/run.sh): downloads India state maps and times CoMaps' router on [.plus/bench/routes.txt](.plus/bench/routes.txt); [.plus/bench/profile.sh](.plus/bench/profile.sh) records a perf profile.
@@ -144,6 +148,7 @@ Environment switches for testing:
 | `COMAPS_PLUS_FORCE_JOINTS=1` | Run CoMaps' router in its exact search mode for long routes |
 | `COMAPS_PLUS_MAX_CANDIDATES` | Cap the candidates in CoMaps' long-route search (changes routes; for experiments) |
 | `COMAPS_PLUS_ROAD_CACHE` | Size of CoMaps' road geometry cache |
+| `COMAPS_PLUS_AVOID_PLACES` | Avoided places for the run, in the saved format (`plus_avoid_places.cpp`), instead of the saved list |
 
 ### Other changes from CoMaps
 

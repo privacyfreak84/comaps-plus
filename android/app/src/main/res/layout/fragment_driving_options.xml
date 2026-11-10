@@ -150,5 +150,44 @@
       android:layout_height="match_parent"
       android:padding="@dimen/margin_half_double_plus"/>
   </LinearLayout>
+  <!-- Comaps++: avoided roads and places (roadmap item 1) -->
+  <LinearLayout
+    android:id="@+id/plus_avoid_places_row"
+    android:orientation="horizontal"
+    android:minHeight="@dimen/height_block_base"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="?selectableItemBackground"
+    android:paddingEnd="@dimen/margin_half"
+    android:paddingStart="@dimen/margin_base">
+    <com.google.android.material.imageview.ShapeableImageView
+      android:layout_width="24dp"
+      android:layout_height="24dp"
+      android:layout_gravity="center_vertical"
+      android:layout_marginEnd="@dimen/margin_base_plus"
+      app:srcCompat="@drawable/ic_avoid_place"
+      app:tint="?iconTint" />
+    <LinearLayout
+      android:orientation="vertical"
+      android:layout_width="0dp"
+      android:layout_weight="1"
+      android:layout_height="wrap_content"
+      android:layout_gravity="center_vertical"
+      android:paddingTop="@dimen/margin_half"
+      android:paddingBottom="@dimen/margin_half">
+      <com.google.android.material.textview.MaterialTextView
+        android:text="@string/plus_avoid_list_title"
+        android:textAppearance="?android:attr/textAppearanceMedium"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="?android:attr/textColorPrimary"/>
+      <com.google.android.material.textview.MaterialTextView
+        android:id="@+id/plus_avoid_places_summary"
+        android:textAppearance="?android:attr/textAppearanceSmall"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textColor="?android:attr/textColorSecondary"/>
+    </LinearLayout>
+  </LinearLayout>
 </LinearLayout>
 </androidx.core.widget.NestedScrollView>

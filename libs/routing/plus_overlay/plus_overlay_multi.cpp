@@ -51,6 +51,8 @@ DEFINE_bool(avoid_toll, false, "router mode: set the 'avoid toll roads' option f
 DEFINE_int32(avoid_mask, -1, "router mode: avoid options for the run as RoutingOptions bits (2 toll, 4 motorway, "
                              "8 ferry, 16 dirt); -1: leave the settings alone.");
 DEFINE_double(start_dir_deg, -1, "router mode: start direction (compass degrees, 0 = north); < 0: none.");
+DEFINE_bool(print_points, false, "router mode: print points at 20, 40, 60 and 80% along each route (for avoided "
+                                  "places tests).");
 DEFINE_bool(force_joints, true, "router mode: COMAPS_PLUS_FORCE_JOINTS=1 for the normal search.");
 
 namespace
@@ -758,6 +760,28 @@ int RunRouter(Multi & m)
                 << b << " deg\n";
     }
     double const secs = Since(t0);
+    if (code == routing::RouterResultCode::NoError && FLAGS_print_points)
+    {
+      auto const & poly = route.GetPoly();
+      double total = 0;
+      for (size_t i = 1; i < poly.GetSize(); ++i)
+        total += mercator::DistanceOnEarth(poly.GetPoint(i - 1), poly.GetPoint(i));
+      double run = 0;
+      int next = 1;
+      for (size_t i = 1; i < poly.GetSize() && next < 5; ++i)
+      {
+        run += mercator::DistanceOnEarth(poly.GetPoint(i - 1), poly.GetPoint(i));
+        if (run >= total * next / 5.0)
+        {
+          auto const ll = mercator::ToLatLon(poly.GetPoint(i));
+          std::ostringstream os;
+          os.precision(9);
+          os << ll.m_lat << " " << ll.m_lon;
+          std::cout << "  " << r.name << " point " << next * 20 << "%: " << os.str() << "\n";
+          ++next;
+        }
+      }
+    }
     std::vector<routing::Segment> segs;
     if (code == routing::RouterResultCode::NoError)
       for (auto const & rs : route.GetRouteSegments())

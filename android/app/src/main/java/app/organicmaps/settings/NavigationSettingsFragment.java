@@ -51,6 +51,16 @@ public class NavigationSettingsFragment extends BaseXmlSettingsFragment
     updateVoiceInstructionsPrefsSummary();
     updateRoutingSettingsPrefsSummary();
     updatePlusOverlayStorageSummary();
+    updatePlusAvoidPlacesSummary();
+  }
+
+  private void updatePlusAvoidPlacesSummary()
+  {
+    final Preference pref = getPreference("pref_plus_avoid_places");
+    final int total = app.organicmaps.sdk.routing.PlusAvoidPlaces.load().size();
+    pref.setSummary(total == 0 ? getString(R.string.plus_avoid_list_summary_none)
+                               : getString(R.string.plus_avoid_list_summary,
+                                           app.organicmaps.sdk.routing.PlusAvoidPlaces.enabledCount(), total));
   }
 
   private void updatePlusOverlayStorageSummary()
@@ -66,6 +76,11 @@ public class NavigationSettingsFragment extends BaseXmlSettingsFragment
     if (key == null)
       return super.onPreferenceTreeClick(preference);
 
+    if (key.equals("pref_plus_avoid_places"))
+    {
+      PlusAvoidPlacesActivity.start(requireContext());
+      return true;
+    }
     if (key.equals(getString(R.string.pref_tts_screen)))
     {
       getSettingsActivity().stackFragment(VoiceInstructionsSettingsFragment.class,

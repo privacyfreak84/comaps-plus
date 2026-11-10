@@ -179,13 +179,17 @@ public:
     std::ofstream out(m_path, std::ios::binary | std::ios::trunc);
     m_edges = g.fwdW.size();
     m_hasK = !g.fwdK.empty();
+    m_hasR = !g.fwdR.empty();
     out.write(reinterpret_cast<char const *>(g.fwdW.data()), static_cast<std::streamsize>(m_edges * sizeof(double)));
     if (m_hasK)
       out.write(reinterpret_cast<char const *>(g.fwdK.data()), static_cast<std::streamsize>(m_edges));
+    if (m_hasR)
+      out.write(reinterpret_cast<char const *>(g.fwdR.data()), static_cast<std::streamsize>(m_edges));
     if (!out.good())
       return false;  // keep them in memory
     std::vector<double>().swap(g.fwdW);
     std::vector<uint8_t>().swap(g.fwdK);
+    std::vector<uint8_t>().swap(g.fwdR);
     m_parked = true;
     return true;
   }
@@ -202,6 +206,11 @@ public:
       g.fwdK.resize(m_edges);
       in.read(reinterpret_cast<char *>(g.fwdK.data()), static_cast<std::streamsize>(m_edges));
     }
+    if (m_hasR)
+    {
+      g.fwdR.resize(m_edges);
+      in.read(reinterpret_cast<char *>(g.fwdR.data()), static_cast<std::streamsize>(m_edges));
+    }
     m_parked = false;
     return in.good();
   }
@@ -210,6 +219,7 @@ private:
   std::string m_path;
   uint64_t m_edges = 0;
   bool m_hasK = false;
+  bool m_hasR = false;
   bool m_parked = false;
 };
 
@@ -343,6 +353,8 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   g.fwdW.reserve(guess);
   lg.interior.reserve(guess);
   g.fwdK.reserve(guess);
+  g.fwdR.reserve(guess);
+  g.selfR.reserve(kn);
   lg.roads.reserve(kn);
   auto roadBits = [&ig](routing::Segment const & x)
   { return static_cast<uint8_t>(ig.GetRoadGeometry(x.GetFeatureId()).GetRoutingOptions().GetOptions()); };
@@ -352,6 +364,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
     uint8_t interior;
     double w;
     uint32_t k;
+    uint8_t r;
     bool operator<(Out const & o) const { return std::tie(to, interior, w) < std::tie(o.to, o.interior, o.w); }
   };
   std::vector<Out> tmp;
@@ -369,6 +382,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
     auto const & pt = ig.GetPoint(s, true /* front */);
     g.lat.push_back(static_cast<float>(pt.m_lat));
     g.lon.push_back(static_cast<float>(pt.m_lon));
+    g.selfR.push_back(roadBits(s));
     edges.clear();
     ig.GetEdgeList(s, true, true, edges);
     tmp.clear();
@@ -380,7 +394,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         continue;  // evaluated by the router at the time the route gets there
       double w = e.GetWeight().GetIntegratedWeight();
       uint32_t k = PenaltyUnits(e.GetWeight());
-      roads |= roadBits(x);
+      uint8_t r = roadBits(x);
       uint8_t inner = 0;
       uint32_t xs = lg.Slot(x);
       bool ok = true;
@@ -398,7 +412,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         w += chainEdges[0].GetWeight().GetIntegratedWeight();
         k += PenaltyUnits(chainEdges[0].GetWeight());
         x = chainEdges[0].GetTarget();
-        roads |= roadBits(x);
+        r |= roadBits(x);
         xs = lg.Slot(x);
       }
       if (!ok || xs == v)
@@ -406,7 +420,8 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         ++dropped;
         continue;
       }
-      tmp.push_back({lg.Rank(xs), inner, w, k});
+      roads |= r;
+      tmp.push_back({lg.Rank(xs), inner, w, k, r});
     }
     std::sort(tmp.begin(), tmp.end());
     for (size_t i = 0; i < tmp.size(); ++i)
@@ -416,6 +431,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
       g.fwdTo.push_back(tmp[i].to);
       g.fwdW.push_back(tmp[i].w);
       g.fwdK.push_back(static_cast<uint8_t>(std::min<uint32_t>(tmp[i].k, 255)));
+      g.fwdR.push_back(tmp[i].r);
       lg.interior.push_back(tmp[i].interior);
     }
     g.fwdOff[cu + 1] = g.fwdTo.size();
@@ -480,6 +496,7 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
   std::vector<VertexId> copyTo;
   std::vector<double> copyW;
   std::vector<uint8_t> copyK;
+  std::vector<uint8_t> copyR;
   std::vector<uint8_t> copyInterior;
   for (auto const & [state, v] : copies)
   {
@@ -495,6 +512,7 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
       copyTo.push_back(target);
       copyW.push_back(g.fwdW[e]);
       copyK.push_back(static_cast<uint8_t>(g.FwdK(e)));
+      copyR.push_back(g.FwdR(e));
       copyInterior.push_back(lg.interior[e]);
     }
     copyOff.push_back(copyTo.size());
@@ -522,6 +540,8 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
   g.fwdW.insert(g.fwdW.end(), copyW.begin(), copyW.end());
   if (!g.fwdK.empty())
     g.fwdK.insert(g.fwdK.end(), copyK.begin(), copyK.end());
+  if (!g.fwdR.empty())
+    g.fwdR.insert(g.fwdR.end(), copyR.begin(), copyR.end());
   lg.interior.insert(lg.interior.end(), copyInterior.begin(), copyInterior.end());
   for (auto const & [st, v] : copies)
   {
@@ -530,6 +550,8 @@ void LeanExpandViaWay(LeanGraph & lg, std::vector<std::vector<uint32_t>> const &
       g.lat.push_back(g.lat[v]);
       g.lon.push_back(g.lon[v]);
     }
+    if (!g.selfR.empty())
+      g.selfR.push_back(g.selfR[v]);
     lg.copyOrig.push_back(v);
     lg.copyState.push_back(st);
   }
@@ -591,299 +613,7 @@ struct MapGraph
   }
 };
 
-// The compressed graph of |base| (same vertices: its kept segments and via-way copies, same ids) with the
-// edges of |ig|, which has avoid options applied. Edges onto avoided roads are missing in |ig|, so chains
-// only get shorter: a segment that is a chain interior without options has at most one successor here.
-bool ExtractForBase(routing::IndexGraph & ig, routing::NumMwmId mwmId, MappedOverlay const & base,
-                    std::vector<std::vector<uint32_t>> const & viaWay, LeanGraph & lg, Reporter const & rep,
-                    std::string & error)
-{
-  routing::RoadAccess const & access = ig.GetRoadAccess();
-  auto const t0 = Clock::now();
-  uint32_t const nf = base.NumFeatures();
-  lg.featBase.resize(nf + 1);
-  for (uint32_t f = 0; f <= nf; ++f)
-    lg.featBase[f] = base.FeatBase(f);
-  lg.keptBits.assign(base.KeptBitsData(), base.KeptBitsData() + base.NumKeptWords());
-  lg.keptRank.assign(base.KeptRankData(), base.KeptRankData() + base.NumKeptWords());
-  lg.rawSlots = 2ULL * lg.featBase[nf];
-  uint32_t const kn = base.BaseN();
-  Graph & g = lg.g;
-  g.n = kn;
-  lg.baseN = kn;
-  lg.origId.reserve(kn);
-  g.fwdOff.assign(kn + 1, 0);
-  uint64_t const guess = static_cast<uint64_t>(kn * 2.3) + 1024;
-  g.fwdTo.reserve(guess);
-  g.fwdW.reserve(guess);
-  g.fwdK.reserve(guess);
-  lg.interior.reserve(guess);
-  struct Out
-  {
-    uint32_t to;
-    uint8_t interior;
-    double w;
-    uint32_t k;
-    bool operator<(Out const & o) const { return std::tie(to, interior, w) < std::tie(o.to, o.interior, o.w); }
-  };
-  std::vector<Out> tmp;
-  routing::IndexGraph::SegmentEdgeListT edges, chainEdges;
-  for (uint32_t f = 0; f < nf; ++f)
-  {
-    if ((f & 4095) == 0)
-    {
-      rep.CheckCancelled();
-      rep.Progress(0.6 * f / std::max(1u, nf), "reading roads");
-    }
-    for (uint32_t slot = 2 * lg.featBase[f]; slot < 2 * lg.featBase[f + 1]; ++slot)
-    {
-      if (!lg.Kept(slot))
-        continue;
-      uint32_t const cu = static_cast<uint32_t>(lg.origId.size());
-      if (cu != lg.Rank(slot))
-      {
-        error = "vertex numbering differs from the base file";
-        return false;
-      }
-      lg.origId.push_back(slot);
-      routing::Segment const s(mwmId, f, slot / 2 - lg.featBase[f], slot % 2 == 0);
-      edges.clear();
-      ig.GetEdgeList(s, true, true, edges);
-      tmp.clear();
-      for (auto const & e : edges)
-      {
-        routing::Segment x = e.GetTarget();
-        if (!lg.Has(x) || IsTimeDependentEdge(access, s, x))
-          continue;
-        double w = e.GetWeight().GetIntegratedWeight();
-        uint32_t k = PenaltyUnits(e.GetWeight());
-        uint8_t inner = 0;
-        uint32_t xs = lg.Slot(x);
-        bool ok = true;
-        while (!lg.Kept(xs))
-        {
-          chainEdges.clear();
-          ig.GetEdgeList(x, true, true, chainEdges);
-          if (chainEdges.size() != 1 || !lg.Has(chainEdges[0].GetTarget()))
-          {
-            ok = false;  // dead end (avoided road ahead)
-            break;
-          }
-          inner = 1;
-          w += chainEdges[0].GetWeight().GetIntegratedWeight();
-          k += PenaltyUnits(chainEdges[0].GetWeight());
-          x = chainEdges[0].GetTarget();
-          xs = lg.Slot(x);
-        }
-        if (!ok || xs == slot)
-          continue;
-        tmp.push_back({lg.Rank(xs), inner, w, k});
-      }
-      std::sort(tmp.begin(), tmp.end());
-      for (size_t i = 0; i < tmp.size(); ++i)
-      {
-        if (i > 0 && tmp[i].to == tmp[i - 1].to && tmp[i].interior == tmp[i - 1].interior)
-          continue;
-        g.fwdTo.push_back(tmp[i].to);
-        g.fwdW.push_back(tmp[i].w);
-        g.fwdK.push_back(static_cast<uint8_t>(std::min<uint32_t>(tmp[i].k, 255)));
-        lg.interior.push_back(tmp[i].interior);
-      }
-      g.fwdOff[cu + 1] = g.fwdTo.size();
-    }
-  }
-  if (lg.origId.size() != kn)
-  {
-    error = "vertex count differs from the base file";
-    return false;
-  }
-  LeanExpandViaWay(lg, viaWay, rep);
-  if (g.n != base.NumVertices())
-  {
-    error = "via-way copies differ from the base file";
-    return false;
-  }
-  for (uint32_t v = kn; v < g.n; ++v)
-  {
-    if (lg.copyOrig[v - kn] != base.CopyOrig(v) || lg.copyState[v - kn] != base.CopyState(v))
-    {
-      error = "via-way copies differ from the base file";
-      return false;
-    }
-  }
-  std::ostringstream os;
-  os << "graph with avoid options: " << g.n << " vertices, " << g.NumEdges() << " edges in " << Since(t0) << " s, "
-     << Mem();
-  rep.Log(os.str());
-  return true;
-}
-
-// Partition and cell boundaries as stored in |base|.
-void PartitionFromFile(MappedOverlay const & base, Partition & p, Overlay & ov)
-{
-  size_t const levels = base.Levels();
-  uint32_t const n = base.NumVertices();
-  p.cell.assign(levels, std::vector<uint32_t>(n));
-  p.numCells.assign(levels, 0);
-  ov.levels.assign(levels, {});
-  for (size_t li = 0; li < levels; ++li)
-  {
-    auto const & F = base.GetLevel(li);
-    p.numCells[li] = F.numCells;
-    for (uint32_t v = 0; v < n; ++v)
-      p.cell[li][v] = base.Cell(li, v);
-    auto & L = ov.levels[li];
-    L.entryOff.assign(F.entryOff, F.entryOff + F.numCells + 1);
-    L.exitOff.assign(F.exitOff, F.exitOff + F.numCells + 1);
-    L.entries.assign(F.entries, F.entries + F.entryOff[F.numCells]);
-    L.exits.assign(F.exits, F.exits + F.exitOff[F.numCells]);
-    L.role.assign(n, 0);
-    for (uint32_t v : L.entries)
-      L.role[v] |= 1;
-    for (uint32_t v : L.exits)
-      L.role[v] |= 2;
-    L.matOff.assign(F.numCells + 1, 0);
-    for (uint32_t c = 0; c < F.numCells; ++c)
-      L.matOff[c + 1] = L.matOff[c] + (L.entryOff[c + 1] - L.entryOff[c]) * (L.exitOff[c + 1] - L.exitOff[c]);
-    L.mat.assign(L.matOff[F.numCells], kUnreachable);
-    L.matK.assign(L.matOff[F.numCells], 0);
-  }
-}
 }  // namespace
-
-BuildResult BuildAvoidCliquesFile(platform::LocalCountryFile const & localFileIn,
-                                  routing::VehicleModelFactory::CountryParentNameGetterFn const & countryParentNameGetter,
-                                  uint32_t avoidMask, std::string const & basePathIn, std::string const & outPathIn,
-                                  BuildOptions const & options)
-{
-  auto const tAll = Clock::now();
-  Reporter const rep{options};
-  BuildResult result;
-  platform::LocalCountryFile localFile = localFileIn;
-  localFile.SyncWithDisk();
-  std::string const mwmPath = localFile.GetPath(MapFileType::Map);
-  std::string const basePath = basePathIn.empty() ? OverlayPathForMap(mwmPath) : basePathIn;
-  result.path = outPathIn.empty() ? AvoidOverlayPathForMap(mwmPath, avoidMask) : outPathIn;
-  unsigned const threads = std::max(1u, options.threads);
-  rep.Log("avoid options " + std::to_string(avoidMask) + " for " + localFile.GetCountryName() + " -> " + result.path);
-  try
-  {
-    rep.Progress(0, "loading the map");
-    auto mg = std::make_unique<MapGraph>();
-    if (!mg->Init(localFile, countryParentNameGetter, result.error, avoidMask))
-      return result;
-    result.mwmVersion = mg->mwmVersion;
-    auto const base = MappedOverlay::Open(basePath, mg->mwmVersion, DefaultParamsHash(), &result.error);
-    if (!base)
-    {
-      result.error = "base overlay file: " + result.error;
-      return result;
-    }
-
-    LeanGraph lg;
-    if (!ExtractForBase(*mg->graph, mg->mwmId, *base, mg->viaWay, lg, rep, result.error))
-      return result;
-    std::vector<uint8_t>().swap(lg.interior);
-    mg.reset();
-    rep.CheckCancelled();
-
-    Partition part;
-    Overlay ov;
-    PartitionFromFile(*base, part, ov);
-    rep.CheckCancelled();
-    rep.Progress(0.6, "computing shortcuts");
-    auto const t0 = Clock::now();
-    Customize(lg.g, part, ov, threads, options.cancelled,
-              [&rep](double f) { rep.Progress(0.6 + 0.39 * f, "computing shortcuts"); });
-    rep.CheckCancelled();
-    {
-      std::ostringstream os;
-      os << "shortcuts in " << Since(t0) << " s, " << Mem();
-      rep.Log(os.str());
-    }
-    // Writing needs only the cliques: free the graph and the cells first (peak memory). The file check
-    // below compares against them.
-    if (!options.checkFile)
-    {
-      lg = LeanGraph();
-      part = Partition();
-      ReleaseFreedMemory();
-    }
-
-    if (!WriteAvoidCliquesFile(result.path, *base, avoidMask, ov, &result.error))
-      return result;
-    // Read it back through the router's own path.
-    auto const check = MappedOverlay::Open(basePath, result.mwmVersion, DefaultParamsHash(), &result.error);
-    if (!check || !check->AttachAvoidCliques(result.path, avoidMask, &result.error))
-    {
-      Platform::RemoveFileIfExists(result.path);
-      return result;
-    }
-    result.fileBytes = check->AvoidFileBytes();
-    if (options.checkFile)
-    {
-      uint64_t bad = 0;
-      double maxAbs = 0;
-      for (size_t li = 0; li < part.Levels(); ++li)
-      {
-        auto const & M = ov.levels[li];
-        for (uint32_t c = 0; c < part.numCells[li]; ++c)
-        {
-          uint64_t const nEn = M.entryOff[c + 1] - M.entryOff[c], nEx = M.exitOff[c + 1] - M.exitOff[c];
-          for (uint64_t i = 0; i < nEn; ++i)
-            for (uint64_t j = 0; j < nEx; ++j)
-            {
-              double const want = M.mat[M.matOff[c] + i * nEx + j];
-              float const got = check->Clique(li, c, static_cast<uint32_t>(i), static_cast<uint32_t>(j));
-              bool const inf0 = want >= kInf, inf1 = got >= 1e29f;
-              if (inf0 != inf1)
-                ++bad;
-              else if (!inf0)
-              {
-                // Stored as steps of the cell's scale: off by at most half a step (plus float rounding).
-                double const err = std::abs(want - got);
-                maxAbs = std::max(maxAbs, err);
-                if (err > 0.5 * check->CellScale(li, c) + 1e-4 * std::max(1.0, want))
-                  ++bad;
-              }
-            }
-        }
-      }
-      std::ostringstream os;
-      os << "file check: " << bad << " clique mismatches; largest rounding " << maxAbs << " s";
-      rep.Log(os.str());
-      if (bad != 0)
-      {
-        Platform::RemoveFileIfExists(result.path);
-        result.error = "file check failed";
-        return result;
-      }
-    }
-    uint64_t rss;
-    ReadMem(rss, result.peakRssKb);
-    result.seconds = Since(tAll);
-    result.status = BuildResult::Status::Ok;
-    std::ostringstream os;
-    os << "done: " << (result.fileBytes / 1048576.0) << " MB in " << result.seconds << " s, " << Mem();
-    rep.Log(os.str());
-    rep.Progress(1.0, "done");
-    return result;
-  }
-  catch (Cancelled const &)
-  {
-    result.status = BuildResult::Status::Cancelled;
-    result.error = "cancelled";
-    result.seconds = Since(tAll);
-    rep.Log("cancelled after " + std::to_string(result.seconds) + " s");
-    return result;
-  }
-  catch (std::exception const & e)
-  {
-    result.status = BuildResult::Status::Failed;
-    result.error = e.what();
-    return result;
-  }
-}
 
 BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
                              routing::VehicleModelFactory::CountryParentNameGetterFn const & countryParentNameGetter,
@@ -1046,6 +776,16 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       os << "shortcuts in " << custSec << " s, " << Mem();
       rep.Log(os.str());
     }
+    // Cells whose cliques avoid options make unusable, per level (tolls, motorways, ferries, dirt roads).
+    for (size_t li = 0; li < ov.levels.size() && !ov.levels[li].cellRoads.empty(); ++li)
+    {
+      std::ostringstream os;
+      os << "level " << li + 1 << ": " << part.numCells[li] << " cells, with paths on tolls/motorways/ferries/dirt:";
+      for (uint8_t bit : {2, 4, 8, 16})
+        os << " " << std::count_if(ov.levels[li].cellRoads.begin(), ov.levels[li].cellRoads.end(),
+                                   [bit](uint8_t r) { return (r & bit) != 0; });
+      rep.Log(os.str());
+    }
 
     if (!options.checkFile)
     {
@@ -1054,6 +794,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       std::vector<VertexId>().swap(g.fwdTo);
       std::vector<double>().swap(g.fwdW);
       std::vector<uint8_t>().swap(g.fwdK);
+      std::vector<uint8_t>().swap(g.fwdR);
       ReleaseFreedMemory();
     }
     rep.Progress(0.99, "writing");
@@ -1092,6 +833,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     fc.roads.resize(g.n);
     for (uint32_t v = 0; v < g.n; ++v)
       fc.roads[v] = lg.roads[v < lg.baseN ? v : lg.copyOrig[v - lg.baseN]];
+    fc.selfRoads = g.selfR;
     addTransitions(enters, enterOsm, true);
     addTransitions(exits, exitOsm, false);
     if (!WriteOverlayFile(result.path, fc, part, ov, &result.error))
@@ -1181,7 +923,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
   }
 }
 
-size_t DeleteOrphanedOverlayFiles(std::string const & dir, int64_t keepAvoidMask)
+size_t DeleteOrphanedOverlayFiles(std::string const & dir)
 {
   Platform::FilesList files;
   Platform::GetFilesByExt(dir, kFileExtension, files);
@@ -1192,17 +934,11 @@ size_t DeleteOrphanedOverlayFiles(std::string const & dir, int64_t keepAvoidMask
     std::string stem = path.substr(0, path.size() - std::string(kFileExtension).size());
     // <map>.avoid<mask>.plusovl belongs to <map>.mwm too.
     auto const dot = stem.rfind('.');
-    uint32_t mask = 0;
+    // Avoid-option files (<map>.avoid<mask>.plusovl) are no longer used: avoid options need no file.
     bool const isAvoid = dot != std::string::npos && stem.compare(dot, 6, ".avoid") == 0 && dot + 6 < stem.size() &&
                          stem.find_first_not_of("0123456789", dot + 6) == std::string::npos;
-    if (isAvoid)
-    {
-      mask = static_cast<uint32_t>(std::stoul(stem.substr(dot + 6)));
-      stem.resize(dot);
-    }
     bool const orphan = !Platform::IsFileExistsByFullPath(stem + DATA_FILE_EXTENSION);
-    bool const unwanted = isAvoid && keepAvoidMask >= 0 && mask != static_cast<uint32_t>(keepAvoidMask);
-    if ((orphan || unwanted) && Platform::RemoveFileIfExists(path))
+    if ((orphan || isAvoid) && Platform::RemoveFileIfExists(path))
       ++deleted;
   }
   // Interrupted builds.

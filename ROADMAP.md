@@ -6,21 +6,23 @@ Status words: done, almost done, started (some groundwork exists), not started.
 
 ## 1. Avoid specific roads and places
 
-Status: started.
+Status: done.
 
-CoMaps lets you avoid types of road: tolls, motorways, ferries, dirt roads. The goal is to also avoid one particular road, bridge, junction or area that you pick yourself.
+CoMaps lets you avoid types of road: tolls, motorways, ferries, dirt roads. Comaps++ also keeps car routes away from a road or an area you pick yourself, with nothing prepared for it.
 
-What exists:
+Done:
 
-- The fast routes ([README](README.md#fast-car-routes)) store travel times per map cell. Avoiding a place only changes the cells that contain it, so only those cells and the larger cells above them need new times, not the whole map.
-- A desktop test of exactly that, in `plus_overlay_tool` on Uttar Pradesh: recalculating 57 cells took 0.5 to 0.75 s, and 58 test routes then matched an exact search.
+- On the place page (tap a place, or long-press anywhere on the map), Avoid offers "this road" (the car road at that point, if one is within 50 m; the whole OSM way) or "this area" (every road within 100 m, 250 m, 500 m, 1, 2 or 5 km). The list is in Settings, Navigation, Avoided roads and places, also linked from the avoid settings screen: switch a place off, show it on the map, resize an area, delete it. The current route is recalculated after each change.
+- Places are saved in the core (`PlusAvoidPlaces` in settings), so the iOS and desktop apps can use the same list later. A road is saved as its point and name; each route looks it up again, so it survives map updates.
+- Each car route looks up the road segments a place covers in every loaded map (3 to 13 ms for 3 to 8 places on the test VM) and leaves them out of CoMaps' road graph. The fast search goes through the cells holding those segments road by road, so it stays exact; CoMaps' own search leaves them out as well.
+- Places are never used, not only made slower. A place doesn't apply to a route that starts, ends or stops in it (within 30 m for a road), so the route can still get there.
+- If no route is left, the "no route" message adds that the avoided places may be the reason.
+- Tested: 8 routes across Uttar Pradesh with 8 places on them (4 roads, 4 areas of 250 m to 2 km): every route changed, none uses a segment of a place, and all take the same roads as CoMaps' exact search with the same places (one 10 s apart in arrival time, as without places), in 1.2 to 1.4 s against 3.9 to 53 s for that search. Three routes from Uttar Pradesh into Madhya Pradesh with 3 places, also avoiding dirt roads: no segment of a place used; two within 5 s of CoMaps' search, as without places, and one 30 s slower out of 10.8 hours, its avoided area being next to the state border (see the border note in the [README](README.md#known-limits)).
 
-Still needed:
+Not done:
 
-- Picking what to avoid in the app (for example tapping a road, or marking an area) and keeping that list.
-- Recalculating the affected cells on the phone when the list changes, alongside the avoid-settings data that already exists.
-- A clear message when an avoided place leaves no route at all.
-- Deciding whether an avoided place is never used or only made much slower.
+- The places aren't drawn on the map; Show on map in the list opens the map at a place.
+- The earlier desktop test that recalculated the times of the cells around a place isn't used: leaving those cells to the road-by-road search needs no preparation and costs little for a few places.
 
 ## 2. Faster navigation
 
@@ -178,10 +180,11 @@ Status: done.
 
 Done:
 
-- Routes with avoid settings are exact whether or not the extra data for that mix exists. Each map's route data now records which road types (tolls, motorways, ferries, dirt roads) every cell contains. Without the data for the current mix, the search uses the stored times only for cells without any avoided road and goes through the other cells road by road.
-- The data for the current mix is prepared only for the maps routes go through, right after the first route that used a map without it, and the files of other mixes are deleted. The question about keeping data for one mix or every mix, and its setting, are gone.
-- Tested on the 10 long Indian routes and 40 German routes, each without the extra data against with it: tolls avoided, the same arrival times on all 10 (one route took an equally fast path), in 0.9 to 3.9 s against 1.0 to 2.0 s; dirt roads avoided, the same arrival times on all 10, but 2.5 to 46 s against 0.9 to 2.0 s; motorways avoided in Germany, the same on all 40 (two equally fast paths), median 0.50 s against 0.39 s.
+- Avoid settings need no data of their own any more. Each map's route data records, per cell, which road types (tolls, motorways, ferries, dirt roads) the cell's stored travel times rely on, leaving out each stored path's own start and end. A route avoiding one of those types goes through such a cell road by road; the search also never stands on an entry or exit of a cell that is itself on an avoided road. The files earlier versions prepared per avoid mix are deleted.
+- Recording what the stored times rely on, instead of which road types a cell contains, is what makes this fast. In Uttar Pradesh, of the 49,823 smallest cells, 27,333 contain dirt roads but only 4,032 rely on them; tolls 180 against 63, motorways 343 against 58. The road types of each cell's entries and exits add 1.4 MB to Uttar Pradesh's route data (65.4 MB, maps 261105).
+- Tested on 8 routes across Uttar Pradesh against CoMaps' exact search with the same settings, avoiding tolls, motorways and dirt roads (24 routes): the same roads on all 24 and the same arrival times, except one route that is 10 s apart with each setting, as it is without avoid settings. Times on the test VM: 1.0 to 1.2 s without avoid settings, 1.1 to 1.6 s avoiding tolls, 1.1 to 2.0 s avoiding motorways, 1.2 to 3.5 s avoiding dirt roads. Before (no avoid file yet), avoiding dirt roads took 8.5 to 27 s on the same routes.
+- Route data in the previous layout keeps working; the app prepares it again in the background, and avoid settings are slower with it until then.
 
 Left as is:
 
-- Avoiding dirt roads before their data is ready is slow, because about half of the cells in Indian maps contain dirt roads (55% in Uttar Pradesh, against under 1% for tolls or motorways), and it used about 1.3 GB of memory for the longest test routes on the test VM. The data is prepared right after the first such route through a map (Uttar Pradesh: about 22 s on the test VM), so this affects the first route with a new mix through each map.
+- Routes across two maps that avoid dirt roads take about 10 s (three routes from Uttar Pradesh into Madhya Pradesh, against 2.6 to 3.2 s without), because the largest cells all rely on some dirt road and the search crosses them on smaller cells. Recording this per entry of a cell instead of per cell would let the search keep using the large cells from entries whose stored paths avoid dirt roads.

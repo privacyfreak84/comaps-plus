@@ -10,8 +10,7 @@ import app.organicmaps.sdk.routing.PlusOverlay;
 
 /**
  * Comaps++: the fast-route entries in Settings → Navigation (how many maps are ready, space used, and the
- * test switch that shows how each car route was calculated). Data for avoid settings is kept for the
- * current mix only: routes with any mix are exact without it, so there is nothing to choose.
+ * test switch that shows how each car route was calculated).
  */
 public final class PlusOverlaySettings
 {
@@ -39,17 +38,7 @@ public final class PlusOverlaySettings
     final String text;
     switch (r[0])
     {
-    case "fast":
-    {
-      final String[] avoid = PlusOverlay.nativeLastAvoidMaps();
-      final java.util.List<String> names = new java.util.ArrayList<>();
-      for (String id : avoid)
-        names.add(MapManager.nativeGetName(id));
-      text = names.isEmpty() ? context.getString(R.string.plus_engine_fast, secs)
-                             : context.getString(R.string.plus_engine_fast_noavoid, secs,
-                                                 android.text.TextUtils.join(", ", names));
-      break;
-    }
+    case "fast": text = context.getString(R.string.plus_engine_fast, secs); break;
     case "rejoin": text = context.getString(R.string.plus_engine_rejoin, secs); break;
     case "normal": text = context.getString(R.string.plus_engine_normal, secs, r[2]); break;
     case "approximate": text = context.getString(R.string.plus_engine_approximate, secs); break;
@@ -74,7 +63,7 @@ public final class PlusOverlaySettings
     final int maps = MapManager.nativeGetDownloadedCount();
     if (maps <= 0)
       return storage;
-    final int ready = Math.max(0, maps - PlusOverlay.nativeMapsToBuild(false, 0, 0, false /* withAvoid */).length);
+    final int ready = Math.max(0, maps - PlusOverlay.nativeMapsToBuild(false, 0, 0).length);
     return context.getString(R.string.plus_overlay_ready_count, ready, maps) + "\n" + storage;
   }
 }

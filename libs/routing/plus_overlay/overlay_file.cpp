@@ -39,8 +39,14 @@ enum Section : uint32_t
   kRunStarts,      // u64 bits, one per vertex: a run of equal level-1 cells starts at this vertex
   kRunRank,        // u32 per kRunStarts word: runs started before that word
   kRunCells,       // u16 (kCell1Is16Bit) or u32 per run: the run's level-1 cell
-  kCellRoads,      // u8 per level-1 cell: RoutingOptions road types inside it (MappedOverlay::CellRoads)
+  kCellRoads,      // u8 per level-1 cell: RoutingOptions road types inside it (format 7; read when the three
+                   // sections below are missing)
   kLevelBase = 16,  // + kLevelSections * level + LevelSection
+  // Format 8 on (after the level sections, kLevelBase + kLevelSections * kMaxLevels):
+  kCellPathRoads = 56,  // u8 per cell, level 1 first: road types the cell's clique paths use, leaving out
+                        // each path's own entry and exit (LevelOverlay::cellRoads)
+  kEntryRoads,          // u8 per entry of every cell, level 1 first: road types of the entry's own segment
+  kExitRoads,           // u8 per exit, likewise
 };
 
 enum LevelSection : uint32_t
@@ -435,6 +441,23 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
       cellRoads[p.cell[0][v]] |= fc.roads[v];
     putVec(kCellRoads, cellRoads);
   }
+  if (fc.selfRoads.size() == fc.n &&
+      std::all_of(ov.levels.begin(), ov.levels.end(),
+                  [&](LevelOverlay const & L) { return L.cellRoads.size() == L.entryOff.size() - 1; }))
+  {
+    std::vector<uint8_t> cells, en, ex;
+    for (auto const & L : ov.levels)
+    {
+      cells.insert(cells.end(), L.cellRoads.begin(), L.cellRoads.end());
+      for (VertexId v : L.entries)
+        en.push_back(fc.selfRoads[v]);
+      for (VertexId v : L.exits)
+        ex.push_back(fc.selfRoads[v]);
+    }
+    putVec(kCellPathRoads, cells);
+    putVec(kEntryRoads, en);
+    putVec(kExitRoads, ex);
+  }
   for (size_t li = 0; li < levels; ++li)
   {
     auto const & L = ov.levels[li];
@@ -453,93 +476,6 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
     putVec(base + kScale, e.scale);
     putVec(base + kPenalty, e.penalty);
     putVec(base + kPenaltyOff, e.penaltyOff);
-  }
-  return w.Finish(error);
-}
-
-bool WriteAvoidCliquesFile(std::string const & path, MappedOverlay const & base, uint32_t avoidMask,
-                           Overlay const & ov, std::string * error)
-{
-  size_t const levels = base.Levels();
-  if (ov.levels.size() != levels)
-  {
-    SetError(error, "level count differs from the base file");
-    return false;
-  }
-  Header h;
-  std::memset(&h, 0, sizeof(h));
-  std::memcpy(h.magic, kMagic, sizeof(kMagic));
-  h.formatVersion = kFileFormatVersion;
-  h.numLevels = static_cast<uint32_t>(levels);
-  h.mwmVersion = base.MwmVersion();
-  h.paramsHash = base.ParamsHash();
-  h.baseN = base.BaseN();
-  h.n = base.NumVertices();
-  h.numFeatures = base.NumFeatures();
-  for (size_t li = 0; li < levels; ++li)
-    h.numCells[li] = base.GetLevel(li).numCells;
-  h.flags = kCliquesOnly | kDeltaCliques;
-  h.buildId = NewBuildId();
-  h.baseBuildId = base.BuildId();
-  h.avoidMask = avoidMask;
-
-  SectionWriter w(path, h);
-  if (!w.IsOpen())
-  {
-    SetError(error, "can't create " + path + ".tmp");
-    return false;
-  }
-  for (size_t li = 0; li < levels; ++li)
-  {
-    EncodedCliques e;
-    if (!EncodeCliques(ov.levels[li], h.numCells[li], e, error))
-      return false;
-    // Keep only the cells whose cliques differ from the base file's (bits, steps, scale and penalties).
-    auto const & B = base.GetLevel(li);
-    std::vector<uint32_t> changed, dRowRank;
-    std::vector<uint64_t> dBits;
-    std::vector<uint16_t> dValues;
-    std::vector<uint8_t> dPenalty;
-    std::vector<uint32_t> dPenaltyOff{0};
-    std::vector<float> dScale;
-    uint64_t word = 0;
-    for (uint32_t c = 0; c < B.numCells; ++c)
-    {
-      uint64_t const nEn = B.entryOff[c + 1] - B.entryOff[c];
-      uint64_t const words = nEn * ((B.exitOff[c + 1] - B.exitOff[c] + 63) / 64);
-      uint64_t const v0 = e.cellValue[c], v1 = e.cellValue[c + 1];
-      auto const bc = MappedOverlay::CliquesOf(B, c);
-      bool same = std::equal(e.bits.begin() + word, e.bits.begin() + word + words, bc.bits);
-      if (same && v1 > v0)
-      {
-        uint64_t const b0 = bc.rowRank[0];
-        same = e.scale[c] == bc.scale &&
-               std::equal(e.values.begin() + v0, e.values.begin() + v1, bc.values + b0);
-        bool const pen = e.penaltyOff[c + 1] > e.penaltyOff[c];
-        for (uint64_t q = 0; same && q < v1 - v0; ++q)
-          same = (pen ? e.penalty[e.penaltyOff[c] + q] : 0u) == bc.Units(b0 + q);
-      }
-      if (!same)
-      {
-        changed.push_back(c);
-        for (uint64_t i = 0; i < nEn; ++i)
-          dRowRank.push_back(static_cast<uint32_t>(dValues.size() + e.rowRank[B.entryOff[c] + i] - v0));
-        dBits.insert(dBits.end(), e.bits.begin() + word, e.bits.begin() + word + words);
-        dValues.insert(dValues.end(), e.values.begin() + v0, e.values.begin() + v1);
-        dScale.push_back(e.scale[c]);
-        dPenalty.insert(dPenalty.end(), e.penalty.begin() + e.penaltyOff[c], e.penalty.begin() + e.penaltyOff[c + 1]);
-        dPenaltyOff.push_back(static_cast<uint32_t>(dPenalty.size()));
-      }
-      word += words;
-    }
-    uint32_t const sec = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
-    w.PutVec(sec + kEntries, changed);
-    w.PutVec(sec + kRowRank, dRowRank);
-    w.PutVec(sec + kBits, dBits);
-    w.PutVec(sec + kValues, dValues);
-    w.PutVec(sec + kScale, dScale);
-    w.PutVec(sec + kPenalty, dPenalty);
-    w.PutVec(sec + kPenaltyOff, dPenaltyOff);
   }
   return w.Finish(error);
 }
@@ -567,10 +503,10 @@ bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t p
   return true;
 }
 
-bool AvoidCliquesFileMatches(std::string const & path, uint64_t baseBuildId, uint32_t avoidMask)
+bool OverlayFileIsLatestFormat(std::string const & path)
 {
   Header h;
-  return ReadHeader(path, h) && (h.flags & kCliquesOnly) && h.baseBuildId == baseBuildId && h.avoidMask == avoidMask;
+  return ReadHeader(path, h) && h.formatVersion == kFileFormatVersion;
 }
 
 bool MappedOverlay::Mapping::Open(std::string const & path, std::string * error)
@@ -660,22 +596,6 @@ std::unique_ptr<MappedOverlay> MappedOverlay::Open(std::string const & path, int
     return nullptr;
   }
   return m;
-}
-
-bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error,
-                                       bool * damaged)
-{
-  if (damaged)
-    *damaged = false;
-  Header h;
-  bool const belongs = ReadHeader(path, h) && (h.flags & kCliquesOnly) && h.baseBuildId == m_buildId &&
-                       h.avoidMask == avoidMask;
-  if (AttachAvoidCliques(path, avoidMask, error))
-    return true;
-  // It names this file and mask but doesn't load: damaged.
-  if (damaged && belongs)
-    *damaged = true;
-  return false;
 }
 
 MappedOverlay::~MappedOverlay() = default;
@@ -897,141 +817,37 @@ bool MappedOverlay::Parse(std::string * error)
         m_cellRoads[li][parent] |= m_cellRoads[li - 1][c];
     }
   }
-  return true;
-}
-
-bool MappedOverlay::AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error)
-{
-  Mapping mp;
-  if (!mp.Open(path, error))
-    return false;
-  auto const & h = *reinterpret_cast<Header const *>(mp.data);
-  if (std::memcmp(h.magic, kMagic, sizeof(kMagic)) != 0 || !IsReadableVersion(h.formatVersion) ||
-      !(h.flags & kCliquesOnly) || !(h.flags & kDeltaCliques) || h.baseBuildId != m_buildId ||
-      h.avoidMask != avoidMask || h.numLevels != m_levels.size())
+  // Format 8: the road types the cells' clique paths use (fewer cells than the road types inside them), with
+  // the road types of every entry and exit, which the search then skips when a route avoids them.
+  if (count(kCellPathRoads, 1) != 0)
   {
-    SetError(error, "avoid-option file doesn't belong to this overlay file");
-    return false;
-  }
-  for (size_t i = 0; i < kMaxSections; ++i)
-  {
-    if (h.offset[i] + h.size[i] > mp.size || (h.size[i] && h.offset[i] % 8 != 0))
+    uint64_t cells = 0, entries = 0, exits = 0;
+    for (auto const & L : m_levels)
     {
-      SetError(error, "bad section table");
+      cells += L.numCells;
+      entries += L.entryOff[L.numCells];
+      exits += L.exitOff[L.numCells];
+    }
+    if (count(kCellPathRoads, 1) != cells || count(kEntryRoads, 1) != entries || count(kExitRoads, 1) != exits)
+    {
+      SetError(error, "bad road types of the cells' paths");
       return false;
     }
+    uint8_t const * pc = sec(kCellPathRoads);
+    uint8_t const * pe = sec(kEntryRoads);
+    uint8_t const * px = sec(kExitRoads);
+    for (size_t li = 0; li < m_levels.size(); ++li)
+    {
+      auto & L = m_levels[li];
+      m_cellRoads[li].assign(pc, pc + L.numCells);
+      L.entryRoads = pe;
+      L.exitRoads = px;
+      pc += L.numCells;
+      pe += L.entryOff[L.numCells];
+      px += L.exitOff[L.numCells];
+    }
+    m_pathRoads = true;
   }
-  // Changed cells per level: check everything a query indexes, then switch those cells over.
-  struct Alt
-  {
-    std::vector<uint32_t> cell, rowOff;
-    std::vector<uint64_t> wordOff;
-    uint32_t const * rowRank;
-    uint64_t const * bits;
-    uint16_t const * values;
-    uint8_t const * penalty;
-    uint32_t const * penaltyOff;
-    float const * scale;
-  };
-  std::vector<Alt> alt(m_levels.size());
-  for (size_t li = 0; li < m_levels.size(); ++li)
-  {
-    auto const & L = m_levels[li];
-    uint32_t const base = kLevelBase + kLevelSections * static_cast<uint32_t>(li);
-    auto & A = alt[li];
-    if (h.numCells[li] != L.numCells || h.size[base + kEntries] % 4 || h.size[base + kRowRank] % 4 ||
-        h.size[base + kBits] % 8 || h.size[base + kValues] % 2 || h.size[base + kScale] % 4)
-    {
-      SetError(error, "avoid-option file has other level sizes");
-      return false;
-    }
-    auto const * changed = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kEntries]);
-    uint64_t const nChanged = h.size[base + kEntries] / 4, nRows = h.size[base + kRowRank] / 4;
-    uint64_t const nWords = h.size[base + kBits] / 8, nValues = h.size[base + kValues] / 2;
-    A.rowRank = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kRowRank]);
-    A.bits = reinterpret_cast<uint64_t const *>(mp.data + h.offset[base + kBits]);
-    A.values = reinterpret_cast<uint16_t const *>(mp.data + h.offset[base + kValues]);
-    A.penalty = mp.data + h.offset[base + kPenalty];
-    A.penaltyOff = reinterpret_cast<uint32_t const *>(mp.data + h.offset[base + kPenaltyOff]);
-    A.scale = reinterpret_cast<float const *>(mp.data + h.offset[base + kScale]);
-    if (h.size[base + kScale] / 4 != nChanged || h.size[base + kPenaltyOff] != 4 * (nChanged + 1) ||
-        A.penaltyOff[0] != 0 || A.penaltyOff[nChanged] != h.size[base + kPenalty] ||
-        !std::all_of(A.scale, A.scale + nChanged, IsUsableWeight))
-    {
-      SetError(error, "bad clique values");
-      return false;
-    }
-    A.cell.assign(L.numCells, kNoAlt);
-    uint64_t row = 0, word = 0, seen = 0;
-    for (uint64_t k = 0; k < nChanged; ++k)
-    {
-      uint32_t const c = changed[k];
-      if (c >= L.numCells || (k > 0 && c <= changed[k - 1]))
-      {
-        SetError(error, "bad changed-cell list");
-        return false;
-      }
-      uint64_t const nEn = L.entryOff[c + 1] - L.entryOff[c];
-      uint64_t const nEx = L.exitOff[c + 1] - L.exitOff[c];
-      uint64_t const wpr = (nEx + 63) / 64;
-      if (row + nEn > nRows || word + nEn * wpr > nWords)
-      {
-        SetError(error, "bad clique values");
-        return false;
-      }
-      A.cell[c] = static_cast<uint32_t>(k);
-      uint64_t const cellFirst = seen;
-      A.rowOff.push_back(static_cast<uint32_t>(row));
-      A.wordOff.push_back(word);
-      for (uint64_t i = 0; i < nEn; ++i, ++row)
-      {
-        if (A.rowRank[row] != seen)
-        {
-          SetError(error, "bad clique values");
-          return false;
-        }
-        uint64_t const w0 = word + i * wpr;
-        if (nEx % 64 != 0 && (A.bits[w0 + wpr - 1] >> (nEx % 64)) != 0)
-        {
-          SetError(error, "bad clique values");
-          return false;
-        }
-        for (uint64_t q = 0; q < wpr; ++q)
-          seen += static_cast<uint64_t>(__builtin_popcountll(A.bits[w0 + q]));
-      }
-      word += nEn * wpr;
-      uint64_t const pen = uint64_t(A.penaltyOff[k + 1]) - A.penaltyOff[k];
-      if (A.penaltyOff[k + 1] < A.penaltyOff[k] || (pen != 0 && pen != seen - cellFirst))
-      {
-        SetError(error, "bad clique values");
-        return false;
-      }
-    }
-    if (row != nRows || word != nWords || seen != nValues)
-    {
-      SetError(error, "bad clique values");
-      return false;
-    }
-  }
-  for (size_t li = 0; li < m_levels.size(); ++li)
-  {
-    auto & L = m_levels[li];
-    L.altCell = std::move(alt[li].cell);
-    L.altRowOff = std::move(alt[li].rowOff);
-    L.altWordOff = std::move(alt[li].wordOff);
-    L.altRowRank = alt[li].rowRank;
-    L.altBits = alt[li].bits;
-    L.altValues = alt[li].values;
-    L.altPenalty = alt[li].penalty;
-    L.altPenaltyOff = alt[li].penaltyOff;
-    L.altScale = alt[li].scale;
-  }
-  std::swap(m_avoidFile.fd, mp.fd);
-  std::swap(m_avoidFile.data, mp.data);
-  std::swap(m_avoidFile.size, mp.size);
-  std::swap(m_avoidFile.mapped, mp.mapped);
-  std::swap(m_avoidFile.buffer, mp.buffer);
-  m_avoidMask = avoidMask;
   return true;
 }
 

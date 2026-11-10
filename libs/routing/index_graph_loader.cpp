@@ -63,8 +63,21 @@ public:
   Geometry & GetGeometry(NumMwmId numMwmId) override;
   vector<RouteSegment::SpeedCamera> GetSpeedCameraInfo(Segment const & segment) override;
   void Clear() override;
+  void SetPlusBlocked(plus_avoid::BlockedByMap blocked) override
+  {
+    m_plusBlocked = std::move(blocked);
+    for (auto & [id, attrs] : m_graphs)
+      if (attrs.m_graph)
+        attrs.m_graph->SetPlusBlocked(PlusBlockedFor(id));
+  }
 
 private:
+  shared_ptr<plus_avoid::Blocked const> PlusBlockedFor(NumMwmId id) const
+  {
+    auto const it = m_plusBlocked.find(id);
+    return it == m_plusBlocked.end() ? nullptr : it->second;
+  }
+
   using GeometryPtrT = shared_ptr<Geometry>;
   GeometryPtrT CreateGeometry(NumMwmId numMwmId);
   using GraphPtrT = unique_ptr<IndexGraph>;
@@ -88,6 +101,7 @@ private:
   SpeedCamerasMapT const & ReceiveSpeedCamsFromMwm(NumMwmId numMwmId);
 
   RoutingOptions m_avoidRoutingOptions;
+  plus_avoid::BlockedByMap m_plusBlocked;
   std::function<time_t()> m_currentTimeGetter = [time = GetCurrentTimestamp()]() { return time; };
 };
 
@@ -158,6 +172,7 @@ IndexGraphLoaderImpl::GraphPtrT IndexGraphLoaderImpl::CreateIndexGraph(NumMwmId 
     auto graph = make_unique<IndexGraph>(geometry, m_estimator, m_avoidRoutingOptions, &value->GetRegionData());
     graph->SetCurrentTimeGetter(m_currentTimeGetter);
     DeserializeIndexGraph(*value, m_vehicleType, *graph);
+    graph->SetPlusBlocked(PlusBlockedFor(numMwmId));
 
     LOG(LINFO,
         (ROUTING_FILE_TAG, "section for", value->GetCountryFileName(), "loaded in", timer.ElapsedSeconds(), "seconds"));

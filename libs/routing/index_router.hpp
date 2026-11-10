@@ -6,6 +6,7 @@
 #include "routing/features_road_graph.hpp"
 #include "routing/guides_connections.hpp"
 #include "routing/nearest_edge_finder.hpp"
+#include "routing/plus_avoid_places.hpp"
 #include "routing/regions_decl.hpp"
 #include "routing/road_graph.hpp"
 #include "routing/router.hpp"
@@ -149,8 +150,15 @@ private:
   std::string m_plusNormalReason;
   // Maps the route crossed approximately (no overlay file yet).
   std::vector<std::string> m_plusApproxMaps;
-  std::vector<std::string> m_plusAvoidMaps;  // used without their avoid-option file (exact, slower)
+  // Avoided places (plus_avoid_places.hpp) looked up for the route being calculated: their road segments per
+  // map, and how many places covered at least one road.
+  plus_avoid::BlockedByMap m_plusBlocked;
+  size_t m_plusAvoidPlacesUsed = 0;
+  void PlusResolveAvoidPlaces(Checkpoints const & checkpoints);
 public:
+  // Comaps++ tests and tools: road segments the avoided places cover for the last route.
+  plus_avoid::BlockedByMap const & PlusBlocked() const { return m_plusBlocked; }
+
   // Comaps++ tests: the last CalculateRoute rejoined the previous route (AdjustRoute) instead of a new search.
   bool PlusLastWasAdjusted() const { return m_plusLastWasAdjusted; }
 

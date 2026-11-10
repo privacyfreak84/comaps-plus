@@ -17,30 +17,20 @@ public final class PlusOverlay
   private PlusOverlay() {}
 
   /**
-   * Downloaded maps whose base overlay file is missing or stale (map updated, or built by another
-   * version), nearest first; with {@code withAvoid}, then those lacking the file for the current avoid
-   * options.
+   * Downloaded maps whose overlay file is missing or stale (map updated, built by another version, or in an
+   * older layout), nearest first.
    */
   @NonNull
-  public static native String[] nativeMapsToBuild(boolean hasPosition, double lat, double lon, boolean withAvoid);
+  public static native String[] nativeMapsToBuild(boolean hasPosition, double lat, double lon);
 
-  /** Whether a map lacks its base file or the file for the current avoid options. */
+  /** Whether a map's overlay file is missing or stale. */
   public static native boolean nativeNeedsBuild(@NonNull String countryId);
 
-  /**
-   * Builds what one map lacks: the base overlay file, then, with {@code withAvoid}, the one for the
-   * current avoid options; blocks for minutes. Returns one of the BUILD_* codes.
-   */
-  public static native int nativeBuild(@NonNull String countryId, int threads, boolean withAvoid);
+  /** Builds a map's overlay file; blocks for minutes. Returns one of the BUILD_* codes. */
+  public static native int nativeBuild(@NonNull String countryId, int threads);
 
   /** Stops a running build soon (it then returns BUILD_CANCELLED and writes nothing). */
   public static native void nativeCancel();
-
-  /** Avoid options (bit mask) of the file being built now; 0 while building a base file or idle. */
-  public static native int nativeBuildingAvoidMask();
-
-  /** Current car avoid options as a bit mask. */
-  public static native int nativeCurrentAvoidMask();
 
   /** Progress of the running build, 0..1. */
   public static native double nativeProgress();
@@ -50,11 +40,10 @@ public final class PlusOverlay
   public static native String nativeStage();
 
   /**
-   * Deletes overlay files of maps that were deleted or updated, and leftovers of interrupted builds. Unless
-   * {@code keepAllAvoid}, also the files for avoid settings other than the current ones (with no avoid
-   * settings on, the last ones are kept).
+   * Deletes overlay files of maps that were deleted or updated, leftovers of interrupted builds, and the
+   * avoid-option files earlier versions built (avoid options need no file now).
    */
-  public static native int nativeDeleteOrphans(boolean keepAllAvoid);
+  public static native int nativeDeleteOrphans();
 
   /**
    * {engine, seconds, reason, map ids...} of the last car route; engine: "none", "fast", "rejoin", "normal"
@@ -62,13 +51,6 @@ public final class PlusOverlay
    */
   @NonNull
   public static native String[] nativeLastEngine();
-
-  /**
-   * Maps the last car route used without their file for the current avoid options: the route is exact,
-   * but faster once that file is built.
-   */
-  @NonNull
-  public static native String[] nativeLastAvoidMaps();
 
   /** Builds the current route again (from the current position when navigating); main thread only. */
   public static native void nativeRefreshRoute();

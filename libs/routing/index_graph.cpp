@@ -262,13 +262,16 @@ void IndexGraph::GetNeighboringEdges(astar::VertexData<Segment, RouteWeight> con
 
   bool const bidirectional = !road.IsOneWay();
   auto const & from = fromVertexData.m_vertex;
-  if ((isOutgoing || bidirectional) && rp.GetPointId() + 1 < road.GetPointsCount())
+  bool const blocked = useRoutingOptions && m_plusBlocked;
+  if ((isOutgoing || bidirectional) && rp.GetPointId() + 1 < road.GetPointsCount() &&
+      !(blocked && m_plusBlocked->IsBlocked(rp.GetFeatureId(), rp.GetPointId())))
   {
     GetNeighboringEdge(fromVertexData, Segment(from.GetMwmId(), rp.GetFeatureId(), rp.GetPointId(), isOutgoing),
                        isOutgoing, edges, parents, useAccessConditional);
   }
 
-  if ((!isOutgoing || bidirectional) && rp.GetPointId() > 0)
+  if ((!isOutgoing || bidirectional) && rp.GetPointId() > 0 &&
+      !(blocked && m_plusBlocked->IsBlocked(rp.GetFeatureId(), rp.GetPointId() - 1)))
   {
     GetNeighboringEdge(fromVertexData, Segment(from.GetMwmId(), rp.GetFeatureId(), rp.GetPointId() - 1, !isOutgoing),
                        isOutgoing, edges, parents, useAccessConditional);
@@ -288,10 +291,11 @@ void IndexGraph::GetSegmentCandidateForRoadPoint(RoadPoint const & rp, NumMwmId 
   bool const bidirectional = !road.IsOneWay();
   auto const pointId = rp.GetPointId();
 
-  if ((isOutgoing || bidirectional) && pointId + 1 < road.GetPointsCount())
+  if ((isOutgoing || bidirectional) && pointId + 1 < road.GetPointsCount() &&
+      !IsPlusBlocked(rp.GetFeatureId(), pointId))
     children.emplace_back(numMwmId, rp.GetFeatureId(), pointId, isOutgoing);
 
-  if ((!isOutgoing || bidirectional) && pointId > 0)
+  if ((!isOutgoing || bidirectional) && pointId > 0 && !IsPlusBlocked(rp.GetFeatureId(), pointId - 1))
     children.emplace_back(numMwmId, rp.GetFeatureId(), pointId - 1, !isOutgoing);
 }
 
@@ -376,6 +380,20 @@ void IndexGraph::ReconstructJointSegment(astar::VertexData<JointSegment, RouteWe
 
     if (noRoadAccess)
       continue;
+
+    // Comaps++: a joint segment passing a segment of an avoided place.
+    if (m_plusBlocked)
+    {
+      bool blocked = false;
+      Segment s = firstChild;
+      for (uint32_t p = currentPointId; p != lastPointId && !blocked; p = increment(p))
+      {
+        blocked = m_plusBlocked->IsBlocked(s.GetFeatureId(), s.GetSegmentIdx());
+        s.Next(currentPointId < lastPointId);
+      }
+      if (blocked)
+        continue;
+    }
 
     bool forward = currentPointId < lastPointId;
     Segment current = firstChild;
