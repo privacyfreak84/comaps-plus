@@ -17,6 +17,7 @@
 #define PLUS_OVERLAY_TOOL_NO_MAIN
 #include "plus_overlay_tool.cpp"
 
+#include "routing/plus_avoid_places.hpp"
 #include "routing/cross_mwm_index_graph.hpp"
 #include "routing/road_access.hpp"
 #include "routing/index_graph_loader.hpp"
@@ -53,6 +54,8 @@ DEFINE_int32(avoid_mask, -1, "router mode: avoid options for the run as RoutingO
 DEFINE_double(start_dir_deg, -1, "router mode: start direction (compass degrees, 0 = north); < 0: none.");
 DEFINE_bool(print_points, false, "router mode: print points at 20, 40, 60 and 80% along each route (for avoided "
                                   "places tests).");
+DEFINE_bool(route_avoid_test, false, "router mode: what Avoid would offer (plus_avoid::RouteAvoidOption) at the "
+                                     "route's 50% point, 1 km off it, and for a 3 km settlement on and off it.");
 DEFINE_bool(force_joints, true, "router mode: COMAPS_PLUS_FORCE_JOINTS=1 for the normal search.");
 
 namespace
@@ -781,6 +784,41 @@ int RunRouter(Multi & m)
           ++next;
         }
       }
+    }
+    if (code == routing::RouterResultCode::NoError && FLAGS_route_avoid_test)
+    {
+      auto const & poly = route.GetPoly().GetPoints();
+      m2::PointD const mid = poly[poly.size() / 2];
+      std::vector<m2::PointD> ends{mercator::FromLatLon(r.a), mercator::FromLatLon(r.b)};
+      auto show = [&](char const * what, routing::plus_avoid::Tapped const & t)
+      {
+        auto const p = routing::plus_avoid::RouteAvoidOption(route, ends, t, m.dataSource, *m.factory);
+        std::cout << "  " << r.name << " avoid at " << what << ": ";
+        if (!p)
+          std::cout << "none\n";
+        else
+        {
+          std::ostringstream os;
+          os.precision(9);
+          os << (p->kind == routing::plus_avoid::Place::Kind::Road ? "road '" : "area '") << p->name << "' " << p->lat
+             << " " << p->lon << " r " << p->radiusM;
+          std::cout << os.str() << "\n";
+        }
+      };
+      routing::plus_avoid::Tapped t;
+      t.point = mid;
+      show("50%", t);
+      t.point = mid + m2::PointD(mercator::MetersToMercator(1000), 0);
+      show("1 km off", t);
+      t.settlement = true;
+      t.settlementRadiusM = 3000;
+      t.settlementName = "Test town";
+      t.point = mid + m2::PointD(mercator::MetersToMercator(1500), 0);
+      show("town 1.5 km off", t);
+      t.point = mid + m2::PointD(mercator::MetersToMercator(5000), 0);
+      show("town 5 km off", t);
+      t.point = ends.front();
+      show("town at start", t);
     }
     std::vector<routing::Segment> segs;
     if (code == routing::RouterResultCode::NoError)

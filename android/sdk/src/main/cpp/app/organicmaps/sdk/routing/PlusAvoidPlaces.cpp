@@ -6,18 +6,29 @@
 
 #include "routing/plus_avoid_places.hpp"
 #include "routing/plus_overlay/overlay_router.hpp"
+#include "routing/route.hpp"
+
+#include "indexer/data_source.hpp"
+#include "indexer/feature.hpp"
+#include "indexer/ftypes_matcher.hpp"
 
 #include "routing_common/car_model.hpp"
 
 #include "geometry/mercator.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace
 {
 constexpr size_t kNumbersPerPlace = 5;  // kind, lat, lon, radius (m), enabled (0/1)
+
+// What Avoid would keep out of car routes for the place shown in the place page, given the current car route
+// (routing::plus_avoid::RouteAvoidOption): the settlement the route passes through, or the route's road at
+// that point. Kept for nativeAddPending.
+std::optional<routing::plus_avoid::Place> g_pending;
 }  // namespace
 
 extern "C"
@@ -75,22 +86,74 @@ JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeSe
     places.push_back(std::move(p));
   }
   routing::plus_avoid::SetPlaces(places);
+  frm()->PlusShowAvoidPlaces();
 }
 
-// The car road a "avoid this road" at (lat, lon) would pick: its name or number ("" if it has neither), or
-// null if no car road is within reach.
-JNIEXPORT jstring JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeRoadAt(JNIEnv * env, jclass,
-                                                                                       jdouble lat, jdouble lon)
+JNIEXPORT jboolean JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativePrepareRouteAvoid(JNIEnv *, jclass)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
+  g_pending.reset();
+  auto & rm = frm()->GetRoutingManager();
+  if (!frm()->HasPlacePageInfo() || rm.GetCurrentRouterType() != routing::RouterType::Vehicle)
+    return false;
+  auto const route = rm.RoutingSession().GetRoute();
+  if (!route || !route->IsValid())
+    return false;
+  auto const & info = frm()->GetCurrentPlacePageInfo();
+  if (info.IsMyPosition())
+    return false;
+  routing::plus_avoid::Tapped tapped;
+  tapped.point = info.GetMercator();
+  if (info.IsFeature())
+  {
+    auto const type = ftypes::IsLocalityChecker::Instance().GetType(info.GetTypes());
+    if (type == ftypes::LocalityType::City || type == ftypes::LocalityType::Town ||
+        type == ftypes::LocalityType::Village)
+    {
+      FeaturesLoaderGuard guard(frm()->GetDataSource(), info.GetID().m_mwmId);
+      auto ft = guard.GetFeatureByIndex(info.GetID().m_index);
+      uint64_t const population = ft ? ftypes::GetPopulation(*ft) : ftypes::GetDefPopulation(type);
+      tapped.settlement = true;
+      tapped.settlementRadiusM = ftypes::GetRadiusByPopulationForRouting(population, type);
+      tapped.settlementName = info.GetTitle();
+    }
+  }
+  std::vector<m2::PointD> checkpoints;
+  for (auto const & p : rm.GetRoutePoints())
+    checkpoints.push_back(p.m_position);
   auto & storage = frm()->GetStorage();
   routing::CarModelFactory models([&storage](std::string const & id) { return storage.GetParentIdFor(id); });
-  auto const roads = routing::plus_avoid::FindRoads(frm()->GetDataSource(), models, mercator::FromLatLon(lat, lon),
-                                                    routing::plus_avoid::kRoadPickRadiusM);
-  auto const picked = routing::plus_avoid::PickRoad(roads, {});
-  if (picked.empty())
-    return nullptr;
-  return jni::ToJavaString(env, routing::plus_avoid::RoadLabel(roads[picked.front()]));
+  g_pending = routing::plus_avoid::RouteAvoidOption(*route, checkpoints, tapped, frm()->GetDataSource(), models);
+  return g_pending.has_value();
+}
+
+// {kind, radius in metres} of the prepared place (empty if none).
+JNIEXPORT jdoubleArray JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativePendingNumbers(JNIEnv * env,
+                                                                                                    jclass)
+{
+  std::vector<double> n;
+  if (g_pending)
+    n = {static_cast<double>(g_pending->kind), static_cast<double>(g_pending->radiusM)};
+  jdoubleArray result = env->NewDoubleArray(static_cast<jsize>(n.size()));
+  env->SetDoubleArrayRegion(result, 0, static_cast<jsize>(n.size()), n.data());
+  return result;
+}
+
+JNIEXPORT jstring JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativePendingName(JNIEnv * env, jclass)
+{
+  return jni::ToJavaString(env, g_pending ? g_pending->name : std::string());
+}
+
+// Adds the prepared place to the list.
+JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeAddPending(JNIEnv *, jclass)
+{
+  if (!g_pending)
+    return;
+  auto places = routing::plus_avoid::GetPlaces();
+  places.push_back(*g_pending);
+  routing::plus_avoid::SetPlaces(places);
+  g_pending.reset();
+  frm()->PlusShowAvoidPlaces();
 }
 
 // How many avoided places applied to the last car route: they covered roads and weren't at its start, finish or

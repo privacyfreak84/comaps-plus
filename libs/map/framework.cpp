@@ -14,10 +14,12 @@
 #include "ge0/url_generator.hpp"
 
 #include "platform/location.hpp"
+#include "routing/plus_avoid_places.hpp"
 #include "routing/route.hpp"
 #include "routing/router.hpp"
 #include "routing/speed_camera_prohibition.hpp"
 
+#include "routing_common/car_model.hpp"
 #include "routing_common/num_mwm_id.hpp"
 
 #include "search/displayed_categories.hpp"
@@ -1643,6 +1645,7 @@ void Framework::CreateDrapeEngine(ref_ptr<dp::GraphicsContextFactory> contextFac
   m_searchMarks.SetDrapeEngine(make_ref(m_drapeEngine));
 
   InvalidateUserMarks();
+  PlusShowAvoidPlaces();
 
   m_transitManager.EnableTransitSchemeMode(CurrentMapModeHasTransitLines());
 
@@ -3757,4 +3760,50 @@ void Framework::Refresh3dMode()
   /// Load User Preferences and apply logic
   Load3dMode(allow3d, allow3dBuildings);
   Allow3dMode(allow3d, allow3dBuildings);
+}
+
+void Framework::PlusShowAvoidPlaces()
+{
+  for (size_t i = 0; i < m_plusAvoidLines; ++i)
+    m_drapeApi.RemoveLine("plus-avoid-" + std::to_string(i));
+  m_plusAvoidLines = 0;
+  if (!m_drapeEngine)
+    return;
+  dp::Color const color(220, 40, 40, 190);
+  routing::CarModelFactory models([this](std::string const & id) { return m_storage.GetParentIdFor(id); });
+  for (auto const & place : routing::plus_avoid::GetPlaces())
+  {
+    if (!place.enabled)
+      continue;
+    m2::PointD const center = mercator::FromLatLon(place.lat, place.lon);
+    std::vector<std::vector<m2::PointD>> lines;
+    if (place.kind == routing::plus_avoid::Place::Kind::Area)
+    {
+      // The area's edge: a circle of the radius in metres around the point.
+      double const r = std::clamp<double>(place.radiusM, routing::plus_avoid::kMinAreaRadiusM,
+                                          routing::plus_avoid::kMaxAreaRadiusM);
+      auto const rect = mercator::RectByCenterXYAndSizeInMeters(center, r);
+      std::vector<m2::PointD> circle;
+      for (int i = 0; i <= 64; ++i)
+      {
+        double const a = 2 * math::pi * i / 64;
+        circle.emplace_back(center.x + rect.SizeX() / 2 * std::cos(a), center.y + rect.SizeY() / 2 * std::sin(a));
+      }
+      lines.push_back(std::move(circle));
+    }
+    else
+    {
+      auto const roads = routing::plus_avoid::FindRoads(GetDataSource(), models, center,
+                                                        routing::plus_avoid::kRoadPickRadiusM);
+      for (size_t i : routing::plus_avoid::PickRoad(roads, place.name))
+        lines.push_back(roads[i].points);
+    }
+    for (auto & line : lines)
+    {
+      if (line.size() < 2)
+        continue;
+      m_drapeApi.AddLine("plus-avoid-" + std::to_string(m_plusAvoidLines++),
+                         df::DrapeApiLineData(line, color).Width(6.0f));
+    }
+  }
 }

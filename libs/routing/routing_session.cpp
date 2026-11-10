@@ -909,6 +909,12 @@ bool RoutingSession::IsRouteValid() const
   return m_route && m_route->IsValid();
 }
 
+std::shared_ptr<Route const> RoutingSession::GetRoute() const
+{
+  CHECK_THREAD_CHECKER(m_threadChecker, ());
+  return m_route;
+}
+
 bool RoutingSession::GetRouteJunctionPoints(std::vector<geometry::PointWithAltitude> & routeJunctionPoints) const
 {
   CHECK_THREAD_CHECKER(m_threadChecker, ());

@@ -683,39 +683,47 @@ struct OverlayRouter::Impl
     return !b.empty() && b[li][c];
   }
 
-  // Whether the search may use |cell|'s cliques: not open, and its clique paths use neither avoided road types
-  // nor roads of avoided places. Not monotone across levels with format 8 (a usable cell can have unusable
-  // children), so every level is checked.
-  bool CellUsable(uint32_t m, size_t li, uint32_t c)
+  // The level (1-based; 0: roads only) whose cliques the search uses at vertex |v| of map |m|, looking at
+  // levels below |cap| (1-based), and whether it may relax v's clique row (forward) or column (backward).
+  // A cell is skipped when open, holding roads of avoided places, or (|checkEnds|) holding an end. A cell
+  // whose clique paths rely on avoided road types is still used where that doesn't matter (format 9): from
+  // an entry whose own row doesn't rely on them (an exit's column, backward), and at a vertex the search
+  // reached through that cell's cliques (|via|: the label's level), whose continuations inside the cell the
+  // row it came from already covered. Usability isn't monotone across levels, so every level is checked.
+  std::pair<size_t, bool> UseLevel(uint32_t m, uint32_t v, uint8_t via, bool forward, size_t cap, bool checkEnds)
   {
     auto const & o = *maps[m].ovl;
-    return !o.IsOpen(li, c) && (o.CellRoads(li, c) & maps[m].openRoads) == 0 && !BlockedCell(m, li, c);
-  }
-
-  size_t QueryLevel(Key x)
-  {
-    uint32_t const m = MapOf(x), v = LocalOf(x);
-    auto const & o = *maps[m].ovl;
-    size_t const levels = o.Levels();
-    // The highest level whose cell holds no end and isn't open (both hold for the cell's parents too).
-    for (size_t li = levels; li-- > 0;)
+    uint8_t const avoid = static_cast<uint8_t>(maps[m].openRoads);
+    for (size_t li = cap; li-- > 0;)
     {
       uint32_t const c = o.Cell(li, v);
-      if (!CellUsable(m, li, c))
+      if (o.IsOpen(li, c) || BlockedCell(m, li, c))
         continue;
-      if (mapHasEnd[m])
+      if (checkEnds && mapHasEnd[m])
       {
         auto const & ec = endCells[m][li];
         if (std::binary_search(ec.begin(), ec.end(), c))
           continue;
       }
-      return li + 1;
+      if ((o.CellRoads(li, c) & avoid) == 0)
+        return {li + 1, true};
+      bool const boundary = forward ? o.IsEntry(li, v) : o.IsExit(li, v);
+      if (boundary && ((forward ? o.EntryPathRoads(li, c, v) : o.ExitPathRoads(li, c, v)) & avoid) == 0)
+        return {li + 1, true};
+      if (via == li + 1)
+        return {li + 1, false};
     }
-    return 0;
+    return {0, false};
+  }
+
+  std::pair<size_t, bool> QueryLevel(Key x, uint8_t via, bool forward)
+  {
+    uint32_t const m = MapOf(x);
+    return UseLevel(m, LocalOf(x), via, forward, maps[m].ovl->Levels(), true /* checkEnds */);
   }
 
   template <class Relax>
-  void ScanF(Key x, double d, double pen, Relax && relax, std::vector<BaseEdge> & tmp)
+  void ScanF(Key x, double d, double pen, uint8_t via, Relax && relax, std::vector<BaseEdge> & tmp)
   {
     double const travelTime = d - pen;
     if (IsRaw(x))
@@ -725,7 +733,9 @@ struct OverlayRouter::Impl
         relax(e.to, d + e.w, pen + e.pen, x, 0);
       return;
     }
-    size_t const lvl = QueryLevel(x);
+    auto const use = QueryLevel(x, via, true /* forward */);
+    size_t const lvl = use.first;
+    bool const useRow = use.second;
     OutEdges(x, tmp, nullptr, true /* search */, &travelTime);
     if (lvl == 0)
     {
@@ -737,7 +747,7 @@ struct OverlayRouter::Impl
     uint32_t const m = MapOf(x), v = LocalOf(x);
     auto const & o = *maps[m].ovl;
     uint32_t const c = o.Cell(li, v);
-    if (o.IsEntry(li, v))
+    if (useRow && o.IsEntry(li, v))
       o.ForEachFromEntry(
           li, c, v, [&](uint32_t exit, float w, uint32_t k)
           { relax(MakeKey(m, exit), d + w, pen + k * kPenaltyUnitS, x, static_cast<uint8_t>(lvl)); },
@@ -748,7 +758,7 @@ struct OverlayRouter::Impl
   }
 
   template <class Relax>
-  void ScanB(Key x, double d, Relax && relax, std::vector<BaseEdge> & tmp)
+  void ScanB(Key x, double d, uint8_t via, Relax && relax, std::vector<BaseEdge> & tmp)
   {
     if (IsRaw(x))
     {
@@ -757,7 +767,9 @@ struct OverlayRouter::Impl
         relax(e.to, d + e.w, x, 0);
       return;
     }
-    size_t const lvl = QueryLevel(x);
+    auto const use = QueryLevel(x, via, false /* forward */);
+    size_t const lvl = use.first;
+    bool const useColumn = use.second;
     InEdges(x, tmp);
     if (lvl == 0)
     {
@@ -769,7 +781,7 @@ struct OverlayRouter::Impl
     uint32_t const m = MapOf(x), v = LocalOf(x);
     auto const & o = *maps[m].ovl;
     uint32_t const c = o.Cell(li, v);
-    if (o.IsExit(li, v))
+    if (useColumn && o.IsExit(li, v))
       o.ForEachToExit(
           li, c, v, [&](uint32_t entry, float w) { relax(MakeKey(m, entry), d + w, x, static_cast<uint8_t>(lvl)); },
           static_cast<uint8_t>(maps[m].openRoads));
@@ -837,21 +849,20 @@ struct OverlayRouter::Impl
       }
       uint32_t const xv = LocalOf(x);
       OutEdges(x, tmp, nullptr);
-      // As the search does: the cliques of the highest usable level below |level| (a usable cell's children
-      // need not be usable, see CellUsable), else the roads.
-      int k = static_cast<int>(li) - 1;
-      while (k >= 0 && !CellUsable(m, static_cast<size_t>(k), o.Cell(static_cast<size_t>(k), xv)))
-        --k;
-      if (k < 0)
+      // As the search does (UseLevel), below the hop's own level.
+      auto const use = UseLevel(m, xv, lx.level, true /* forward */, li, false /* checkEnds */);
+      size_t const ul = use.first;
+      bool const useRow = use.second;
+      if (ul == 0)
       {
         for (auto const & e : tmp)
           if (MapOf(e.to) == m && o.Cell(li, LocalOf(e.to)) == c)
             relax(e.to, d + e.w, x, 0);
         continue;
       }
-      size_t const kl = static_cast<size_t>(k);
+      size_t const kl = ul - 1;
       uint32_t const cc = o.Cell(kl, xv);
-      if (o.IsEntry(kl, xv))
+      if (useRow && o.IsEntry(kl, xv))
         o.ForEachFromEntry(
             kl, cc, xv, [&](uint32_t exit, float w) { relax(MakeKey(m, exit), d + w, x, static_cast<uint8_t>(kl + 1)); },
             static_cast<uint8_t>(maps[m].openRoads));
@@ -1352,7 +1363,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
         continue;
       lx.done = true;
       ++stats.settled;
-      I.ScanF(x, d, lx.pen, relaxF, tmp);
+      I.ScanF(x, d, lx.pen, lx.level, relaxF, tmp);
     }
     else
     {
@@ -1363,7 +1374,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
         continue;
       lx.done = true;
       ++stats.settled;
-      I.ScanB(x, d, relaxB, tmp);
+      I.ScanB(x, d, lx.level, relaxB, tmp);
     }
   }
 

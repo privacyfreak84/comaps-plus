@@ -46,7 +46,8 @@ enum Section : uint32_t
   kCellPathRoads = 56,  // u8 per cell, level 1 first: road types the cell's clique paths use, leaving out
                         // each path's own entry and exit (LevelOverlay::cellRoads)
   kEntryRoads,          // u8 per entry of every cell, level 1 first: road types of the entry's own segment
-  kExitRoads,           // u8 per exit, likewise
+                        // (format 8), packed with those its row's paths rely on (format 9, PackBoundaryRoads)
+  kExitRoads,           // u8 per exit, likewise (its column's paths)
 };
 
 enum LevelSection : uint32_t
@@ -443,16 +444,20 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
   }
   if (fc.selfRoads.size() == fc.n &&
       std::all_of(ov.levels.begin(), ov.levels.end(),
-                  [&](LevelOverlay const & L) { return L.cellRoads.size() == L.entryOff.size() - 1; }))
+                  [&](LevelOverlay const & L)
+                  {
+                    return L.cellRoads.size() == L.entryOff.size() - 1 &&
+                           L.entryPathRoads.size() == L.entries.size() && L.exitPathRoads.size() == L.exits.size();
+                  }))
   {
     std::vector<uint8_t> cells, en, ex;
     for (auto const & L : ov.levels)
     {
       cells.insert(cells.end(), L.cellRoads.begin(), L.cellRoads.end());
-      for (VertexId v : L.entries)
-        en.push_back(fc.selfRoads[v]);
-      for (VertexId v : L.exits)
-        ex.push_back(fc.selfRoads[v]);
+      for (size_t i = 0; i < L.entries.size(); ++i)
+        en.push_back(PackBoundaryRoads(fc.selfRoads[L.entries[i]], L.entryPathRoads[i]));
+      for (size_t j = 0; j < L.exits.size(); ++j)
+        ex.push_back(PackBoundaryRoads(fc.selfRoads[L.exits[j]], L.exitPathRoads[j]));
     }
     putVec(kCellPathRoads, cells);
     putVec(kEntryRoads, en);
@@ -819,7 +824,8 @@ bool MappedOverlay::Parse(std::string * error)
   }
   // Format 8: the road types the cells' clique paths use (fewer cells than the road types inside them), with
   // the road types of every entry and exit, which the search then skips when a route avoids them.
-  if (count(kCellPathRoads, 1) != 0)
+  // Format 8 (never released) stored them without the rows and columns: read such files like format 7.
+  if (count(kCellPathRoads, 1) != 0 && h.formatVersion >= 9)
   {
     uint64_t cells = 0, entries = 0, exits = 0;
     for (auto const & L : m_levels)
@@ -842,6 +848,7 @@ bool MappedOverlay::Parse(std::string * error)
       m_cellRoads[li].assign(pc, pc + L.numCells);
       L.entryRoads = pe;
       L.exitRoads = px;
+      L.packedRoads = true;
       pc += L.numCells;
       pe += L.entryOff[L.numCells];
       px += L.exitOff[L.numCells];

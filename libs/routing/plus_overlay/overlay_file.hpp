@@ -41,8 +41,9 @@ namespace plus_overlay
 //   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
 //   cliques wrong; that is the only code change that makes the app rebuild every file.
 // - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
-constexpr uint32_t kFileFormatVersion = 8;  // 5: smaller layout; 6: 16-bit clique values; 7: road types per cell;
-                                            // 8: road types of the cells' paths and boundaries
+constexpr uint32_t kFileFormatVersion = 9;  // 5: smaller layout; 6: 16-bit clique values; 7: road types per cell;
+                                            // 8: road types of the cells' paths and boundaries;
+                                            // 9: and of each entry's row and exit's column
 constexpr uint32_t kMinReadableFormatVersion = 7;  // 7: road types per cell (routes with avoid options without
                                                    // their file)
 constexpr uint32_t kRoutingDataVersion = 2;  // 2: time-dependent edges, penalty units in cliques
@@ -124,6 +125,15 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
                       std::string * error = nullptr);
 
 // Read-only view of a file, memory-mapped: only the pages a query touches are read from storage.
+// A boundary vertex's road types in one byte (format 9): RoutingOptions bits 1-4 (tolls, motorways, ferries,
+// dirt) of its own segment in the low half, of the clique paths through it in the high half.
+inline uint8_t PackBoundaryRoads(uint8_t self, uint8_t paths)
+{
+  return static_cast<uint8_t>(((self >> 1) & 0x0F) | (((paths >> 1) & 0x0F) << 4));
+}
+inline uint8_t UnpackSelfRoads(uint8_t b) { return static_cast<uint8_t>((b & 0x0F) << 1); }
+inline uint8_t UnpackPathRoads(uint8_t b) { return static_cast<uint8_t>((b >> 4) << 1); }
+
 class MappedOverlay
 {
 public:
@@ -134,9 +144,11 @@ public:
     uint32_t const * exitOff = nullptr;
     uint32_t const * entries = nullptr;   // per cell, ascending
     uint32_t const * exits = nullptr;
-    // Format 8 on (else null): road types of each entry's / exit's own segment, parallel to entries / exits.
+    // Format 8 on (else null), parallel to entries / exits: road types of each one's own segment; format 9
+    // on (packedRoads) packed with those its row's / column's clique paths rely on (PackBoundaryRoads).
     uint8_t const * entryRoads = nullptr;
     uint8_t const * exitRoads = nullptr;
+    bool packedRoads = false;
     uint32_t const * rowRank = nullptr;   // per entry: values before its row
     uint64_t const * bits = nullptr;      // per cell, per entry row: ceil(exits / 64) words
     uint16_t const * values = nullptr;    // steps of the cell's scale
@@ -282,6 +294,29 @@ public:
   float Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) const;
   // Seconds per stored step in |cell| (the rounding of its values is at most half of it).
   float CellScale(size_t li, uint32_t cell) const { return CliquesOf(m_levels[li], cell).scale; }
+  static uint8_t SelfRoads(Level const & L, uint8_t b) { return L.packedRoads ? UnpackSelfRoads(b) : b; }
+
+  // Format 9 on: road types the clique paths from entry |v| of |cell| (its row) rely on, leaving out the types
+  // of its own segment and of each exit's; 0xFF if the file doesn't say. A search avoiding none of them gets
+  // exact times from the row even when the cell as a whole relies on them.
+  uint8_t EntryPathRoads(size_t li, uint32_t cell, uint32_t v) const
+  {
+    auto const & L = m_levels[li];
+    uint32_t const i = EntryIdx(li, cell, v);
+    if (!L.packedRoads || i >= L.entryOff[cell + 1] - L.entryOff[cell] || L.entries[L.entryOff[cell] + i] != v)
+      return 0xFF;
+    return UnpackPathRoads(L.entryRoads[L.entryOff[cell] + i]);
+  }
+  // Likewise for the clique paths to exit |v| (its column).
+  uint8_t ExitPathRoads(size_t li, uint32_t cell, uint32_t v) const
+  {
+    auto const & L = m_levels[li];
+    uint32_t const j = ExitIdx(li, cell, v);
+    if (!L.packedRoads || j >= L.exitOff[cell + 1] - L.exitOff[cell] || L.exits[L.exitOff[cell] + j] != v)
+      return 0xFF;
+    return UnpackPathRoads(L.exitRoads[L.exitOff[cell] + j]);
+  }
+
   // f(exit vertex, weight) for every exit of |cell| reachable from its entry |v|. With |skipRoads|, exits on
   // those road types are left out (format 8 on; older files have no such exits in cells a route may use).
   template <class F>
@@ -302,7 +337,7 @@ public:
       for (uint64_t w = cc.bits[row + k]; w != 0; w &= w - 1)
       {
         uint64_t const j = k * 64 + static_cast<uint64_t>(__builtin_ctzll(w));
-        if (!roads || (roads[j] & skipRoads) == 0)
+        if (!roads || (SelfRoads(L, roads[j]) & skipRoads) == 0)
           CallClique(f, exits[j], cc, idx);
         ++idx;
       }
@@ -325,7 +360,7 @@ public:
     auto const cc = CliquesOf(L, cell);
     for (uint64_t i = 0; i < nEn; ++i)
     {
-      if (roads && (roads[i] & skipRoads) != 0)
+      if (roads && (SelfRoads(L, roads[i]) & skipRoads) != 0)
         continue;
       uint64_t const row = i * wpr;
       uint64_t const word = cc.bits[row + k];

@@ -784,6 +784,11 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       for (uint8_t bit : {2, 4, 8, 16})
         os << " " << std::count_if(ov.levels[li].cellRoads.begin(), ov.levels[li].cellRoads.end(),
                                    [bit](uint8_t r) { return (r & bit) != 0; });
+      auto const & L = ov.levels[li];
+      os << "; of " << L.entryPathRoads.size() << " entries, rows on them:";
+      for (uint8_t bit : {2, 4, 8, 16})
+        os << " " << std::count_if(L.entryPathRoads.begin(), L.entryPathRoads.end(),
+                                   [bit](uint8_t r) { return (r & bit) != 0; });
       rep.Log(os.str());
     }
 
