@@ -600,6 +600,7 @@ struct CellScratch
 {
   std::vector<double> dist;
   std::vector<uint8_t> k;  // penalty units of the path to each vertex
+  std::vector<uint8_t> r;  // road types of the path to each vertex (Graph::fwdR)
   std::vector<uint32_t> stamp, done;
   std::vector<std::pair<double, uint32_t>> heap;
   uint32_t cur = 0;
@@ -610,6 +611,7 @@ struct CellScratch
     {
       dist.resize(n);
       k.resize(n);
+      r.resize(n);
       stamp.resize(n, 0);
       done.resize(n, 0);
     }
@@ -676,6 +678,8 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
   auto const & cellOf = p.cell[li];
   uint64_t const e0 = L.entryOff[c], nEn = L.entryOff[c + 1] - e0;
   uint64_t const x0 = L.exitOff[c], nEx = L.exitOff[c + 1] - x0;
+  if (!L.cellRoads.empty())
+    L.cellRoads[c] = 0;
   if (nEn == 0 || nEx == 0)
     return;
   uint64_t const v0 = lc.off[c], nv = lc.off[c + 1] - v0;
@@ -697,10 +701,11 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
     sc.stamp[ls] = st;
     sc.dist[ls] = 0;
     sc.k[ls] = 0;
+    sc.r[ls] = 0;
     push(0, ls);
     uint64_t remaining = nEx;
 
-    auto relax = [&](VertexId y, double d, uint32_t k)
+    auto relax = [&](VertexId y, double d, uint32_t k, uint8_t r)
     {
       uint32_t const ly = localId[y];
       if (sc.stamp[ly] != st || d < sc.dist[ly])
@@ -708,6 +713,7 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
         sc.stamp[ly] = st;
         sc.dist[ly] = d;
         sc.k[ly] = static_cast<uint8_t>(std::min<uint32_t>(k, 255));
+        sc.r[ly] = r;
         push(d, ly);
       }
     };
@@ -724,11 +730,12 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
       if (L.IsExit(x) && --remaining == 0)
         break;
       uint32_t const kx = sc.k[lx];
+      uint8_t const rx = sc.r[lx];
       if (li == 0)
       {
         for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
           if (cellOf[g.fwdTo[e]] == c && g.fwdW[e] < kInf)
-            relax(g.fwdTo[e], d + g.fwdW[e], kx + g.FwdK(e));
+            relax(g.fwdTo[e], d + g.fwdW[e], kx + g.FwdK(e), rx | g.FwdR(e));
         continue;
       }
       LevelOverlay const & C = ov.levels[li - 1];
@@ -739,7 +746,8 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
         uint64_t const base = C.matOff[cc] + C.EntryIdx(x, cc) * cnEx;
         for (uint64_t j = 0; j < cnEx; ++j)
           if (C.mat[base + j] < kInf)
-            relax(C.exits[cx0 + j], d + C.mat[base + j], kx + (C.matK.empty() ? 0 : C.matK[base + j]));
+            relax(C.exits[cx0 + j], d + C.mat[base + j], kx + (C.matK.empty() ? 0 : C.matK[base + j]),
+                  rx | (C.matR.empty() ? 0 : C.matR[base + j]));
       }
       if (C.IsExit(x))
       {
@@ -747,7 +755,7 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
         {
           VertexId const y = g.fwdTo[e];
           if (cellOf[y] == c && p.cell[li - 1][y] != cc && g.fwdW[e] < kInf)
-            relax(y, d + g.fwdW[e], kx + g.FwdK(e));
+            relax(y, d + g.fwdW[e], kx + g.FwdK(e), rx | g.FwdR(e));
         }
       }
     }
@@ -758,6 +766,11 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
       L.mat[L.matOff[c] + i * nEx + j] = reached ? static_cast<float>(sc.dist[ly]) : kUnreachable;
       if (!L.matK.empty())
         L.matK[L.matOff[c] + i * nEx + j] = reached ? sc.k[ly] : 0;
+      if (!L.matR.empty() && reached)
+      {
+        L.matR[L.matOff[c] + i * nEx + j] = sc.r[ly];
+        L.cellRoads[c] |= sc.r[ly] & ~(g.SelfR(src) | g.SelfR(L.exits[x0 + j]));
+      }
     }
   }
 }
@@ -774,6 +787,19 @@ std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov
   {
     auto const t0 = std::chrono::steady_clock::now();
     uint32_t const nc = p.numCells[li];
+    // Road types of the clique paths (allocated here: the builder may still have had the edge data parked
+    // when it built the boundaries).
+    LevelOverlay & L = ov.levels[li];
+    if (!g.fwdR.empty())
+    {
+      L.matR.assign(L.matOff[nc], 0);
+      L.cellRoads.assign(nc, 0);
+    }
+    else
+    {
+      L.matR.clear();
+      L.cellRoads.clear();
+    }
     LevelCells const lc = CellVertexLists(g, p, ov, li);
     std::atomic<uint32_t> next{0};
     std::vector<std::thread> pool;

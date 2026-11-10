@@ -32,7 +32,21 @@ public class DrivingOptionsFragment extends Fragment
   {
     View root = inflater.inflate(R.layout.fragment_driving_options, container, false);
     initViews(root);
+    root.findViewById(R.id.plus_avoid_places_row)
+        .setOnClickListener(v -> PlusAvoidPlacesActivity.start(requireContext()));
     return root;
+  }
+
+  @Override
+  public void onResume()
+  {
+    super.onResume();
+    // Comaps++: avoided roads and places.
+    final android.widget.TextView summary = requireView().findViewById(R.id.plus_avoid_places_summary);
+    final int total = app.organicmaps.sdk.routing.PlusAvoidPlaces.load().size();
+    summary.setText(total == 0 ? getString(R.string.plus_avoid_list_summary_none)
+                               : getString(R.string.plus_avoid_list_summary,
+                                           app.organicmaps.sdk.routing.PlusAvoidPlaces.enabledCount(), total));
   }
 
   private void initViews(@NonNull View root)

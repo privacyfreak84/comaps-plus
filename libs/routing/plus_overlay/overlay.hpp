@@ -42,9 +42,16 @@ struct Graph
   std::vector<double> revW;
   // Optional, per edge: penalty units (kPenaltyUnitS each) inside the edge's integrated weight.
   std::vector<uint8_t> fwdK, revK;
+  // Optional, per edge: RoutingOptions road types (tolls, motorways, ferries, dirt roads) of the segments the
+  // edge steps onto (its target and the chain before it); per vertex: those of the vertex's own segment.
+  // With them Customize records which road types each clique path uses (LevelOverlay::cellRoads).
+  std::vector<uint8_t> fwdR;
+  std::vector<uint8_t> selfR;
   std::vector<float> lat, lon;
 
   uint32_t FwdK(uint64_t e) const { return fwdK.empty() ? 0 : fwdK[e]; }
+  uint8_t FwdR(uint64_t e) const { return fwdR.empty() ? 0 : fwdR[e]; }
+  uint8_t SelfR(VertexId v) const { return selfR.empty() ? 0 : selfR[v]; }
 
   uint64_t NumEdges() const { return fwdTo.size(); }
   void BuildReverse();
@@ -120,6 +127,11 @@ struct LevelOverlay
   std::vector<VertexId> entries, exits;             // per cell, ascending vertex ids
   std::vector<float> mat;                           // per cell: row-major entry x exit (float32 as in the file)
   std::vector<uint8_t> matK;                        // penalty units of each mat entry's path (saturated)
+  std::vector<uint8_t> matR;                        // road types each mat entry's path steps onto (Graph::fwdR)
+  // Per cell: road types used by the paths behind its cliques, leaving out the types of each path's own
+  // entry and exit (a route avoiding a type never stands on such an entry or exit). A route avoiding none of
+  // them gets the same times from the cell's cliques as from its roads. Empty without Graph::fwdR.
+  std::vector<uint8_t> cellRoads;
   std::vector<uint8_t> role;                       // per vertex: bit 1 entry, bit 2 exit (of its cell)
 
   bool IsEntry(VertexId v) const { return role[v] & 1; }

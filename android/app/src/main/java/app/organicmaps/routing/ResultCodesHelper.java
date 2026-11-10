@@ -77,6 +77,10 @@ public class ResultCodesHelper
         titleRes = R.string.dialog_routing_unable_locate_route;
         messages.add(resources.getString(R.string.dialog_routing_cant_build_route));
         messages.add(resources.getString(R.string.dialog_routing_change_start_or_end));
+        // Comaps++: avoided roads and places can leave no route at all.
+        if (app.organicmaps.sdk.routing.RoutingController.get().isVehicleRouterType()
+            && app.organicmaps.sdk.routing.PlusAvoidPlaces.nativeLastApplied() > 0)
+          messages.add(resources.getString(R.string.plus_avoid_no_route));
       }
       else
       {

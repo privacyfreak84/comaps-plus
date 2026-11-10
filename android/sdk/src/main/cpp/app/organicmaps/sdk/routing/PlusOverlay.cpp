@@ -8,7 +8,6 @@
 #include "routing/plus_overlay/overlay_file.hpp"
 #include "routing/plus_overlay/overlay_router.hpp"
 
-#include "routing/routing_options.hpp"
 
 #include "indexer/data_source.hpp"
 #include "indexer/mwm_set.hpp"
@@ -25,14 +24,12 @@
 #include <memory>
 #include <mutex>
 #include <set>
-#include <tuple>
 #include <string>
 #include <vector>
 
 namespace
 {
 std::atomic<bool> g_cancel{false};
-std::atomic<uint32_t> g_buildingAvoidMask{0};  // avoid mask of the file being built (0: base file)
 std::atomic<double> g_progress{0};
 std::mutex g_stageMutex;
 std::string g_stage;
@@ -43,17 +40,10 @@ struct DownloadedMap
   platform::LocalCountryFile localFile;
   int64_t version = 0;
   std::string overlayPath;
-  std::string avoidPath;  // for the current avoid options (empty without)
-  m2::RectD rect;         // the map's bounds (mercator)
+  m2::RectD rect;  // the map's bounds (mercator)
 };
 
-uint32_t CurrentAvoidMask()
-{
-  return static_cast<uint32_t>(
-      routing::RoutingOptions::LoadOptionsFromSettings(routing::VehicleType::Car).GetOptions());
-}
-
-std::vector<DownloadedMap> DownloadedMaps(uint32_t avoidMask)
+std::vector<DownloadedMap> DownloadedMaps()
 {
   std::vector<DownloadedMap> maps;
   std::vector<std::shared_ptr<MwmInfo>> infos;
@@ -64,9 +54,8 @@ std::vector<DownloadedMap> DownloadedMaps(uint32_t avoidMask)
       continue;
     auto const & lf = info->GetLocalFile();
     auto const mwmPath = lf.GetPath(MapFileType::Map);
-    maps.push_back({lf.GetCountryName(), lf, info->GetVersion(), plus_overlay::OverlayPathForMap(mwmPath),
-                    avoidMask ? plus_overlay::AvoidOverlayPathForMap(mwmPath, avoidMask) : std::string(),
-                    info->m_bordersRect});
+    maps.push_back(
+        {lf.GetCountryName(), lf, info->GetVersion(), plus_overlay::OverlayPathForMap(mwmPath), info->m_bordersRect});
   }
   return maps;
 }
@@ -95,41 +84,29 @@ std::set<std::string> MapDirs()
   return dirs;
 }
 
+// Missing, built for another map version or build parameters, or in an older layout (still used for routes
+// until it is rebuilt).
 bool NeedsBaseBuild(DownloadedMap const & m)
 {
-  return !plus_overlay::OverlayFileMatches(m.overlayPath, m.version, plus_overlay::DefaultParamsHash());
-}
-
-bool NeedsAvoidBuild(DownloadedMap const & m, uint32_t avoidMask)
-{
-  if (avoidMask == 0)
-    return false;
-  uint64_t buildId = 0;
-  if (!plus_overlay::OverlayFileMatches(m.overlayPath, m.version, plus_overlay::DefaultParamsHash(), &buildId))
-    return true;
-  return !plus_overlay::AvoidCliquesFileMatches(m.avoidPath, buildId, avoidMask);
+  return !plus_overlay::OverlayFileMatches(m.overlayPath, m.version, plus_overlay::DefaultParamsHash()) ||
+         !plus_overlay::OverlayFileIsLatestFormat(m.overlayPath);
 }
 }  // namespace
 
 extern "C"
 {
-// Downloaded maps whose base overlay file is missing or was built for another map version / build
-// parameters, and with |withAvoid| also those lacking the file for the current avoid options (after all
-// the others: routes with avoid options are exact without it, only slower). Most useful first: the map you
-// are in, then the nearest ones (without a position: smallest first).
+// Downloaded maps whose overlay file is missing or stale (NeedsBaseBuild). Most useful first: the map you are
+// in, then the nearest ones (without a position: smallest first).
 JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeMapsToBuild(JNIEnv * env, jclass,
                                                                                          jboolean hasPosition,
-                                                                                         jdouble lat, jdouble lon,
-                                                                                         jboolean withAvoid)
+                                                                                         jdouble lat, jdouble lon)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
   m2::PointD const here = mercator::FromLatLon(lat, lon);
-  uint32_t const mask = withAvoid ? CurrentAvoidMask() : 0;
-  std::vector<std::tuple<bool, double, std::string>> todo;
-  for (auto const & m : DownloadedMaps(mask))
+  std::vector<std::pair<double, std::string>> todo;
+  for (auto const & m : DownloadedMaps())
   {
-    bool const base = NeedsBaseBuild(m);
-    if (!base && !NeedsAvoidBuild(m, mask))
+    if (!NeedsBaseBuild(m))
       continue;
     double key = 0;
     if (hasPosition)
@@ -143,45 +120,41 @@ JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nati
       Platform::GetFileSizeByFullPath(m.localFile.GetPath(MapFileType::Map), size);
       key = static_cast<double>(size);
     }
-    todo.emplace_back(!base, key, m.countryId);
+    todo.emplace_back(key, m.countryId);
   }
   std::sort(todo.begin(), todo.end());
   std::vector<std::string> ids;
   for (auto const & t : todo)
-    ids.push_back(std::get<2>(t));
+    ids.push_back(t.second);
   return jni::ToJavaStringArray(env, ids);
 }
 
-// Whether a downloaded map lacks its base file or the file for the current avoid options.
+// Whether a downloaded map's overlay file is missing or stale.
 JNIEXPORT jboolean JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeNeedsBuild(JNIEnv * env, jclass,
                                                                                        jstring countryId)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
   std::string const id = jni::ToNativeString(env, countryId);
-  uint32_t const mask = CurrentAvoidMask();
-  for (auto const & m : DownloadedMaps(mask))
+  for (auto const & m : DownloadedMaps())
     if (m.countryId == id)
-      return NeedsBaseBuild(m) || NeedsAvoidBuild(m, mask);
+      return NeedsBaseBuild(m);
   return false;
 }
 
-// Builds the base file if needed, then (with |withAvoid|) the file for the current avoid options.
+// Builds a map's overlay file if it is missing or stale.
 // 0: built, 1: cancelled, 2: failed, 3: the map isn't downloaded (any more), 4: already up to date.
 JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(JNIEnv * env, jclass,
-                                                                                jstring countryId, jint threads,
-                                                                                jboolean withAvoid)
+                                                                                jstring countryId, jint threads)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
   std::string const id = jni::ToNativeString(env, countryId);
-  uint32_t const mask = CurrentAvoidMask();
   std::unique_ptr<DownloadedMap> map;
-  for (auto & m : DownloadedMaps(mask))
+  for (auto & m : DownloadedMaps())
     if (m.countryId == id)
       map = std::make_unique<DownloadedMap>(std::move(m));
   if (!map)
     return 3;
-  bool const needBase = NeedsBaseBuild(*map);
-  if (!needBase && !(withAvoid && NeedsAvoidBuild(*map, mask)))
+  if (!NeedsBaseBuild(*map))
     return 4;
 
   g_cancel = false;
@@ -214,44 +187,14 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(
     }
     return 2;
   };
-  if (needBase)
-  {
-    g_buildingAvoidMask = 0;
-    if (Platform::MkDirChecked(TreeDir()))
-      o.partitionTreePath = TreePath(id);
-    jint const code =
-        report(plus_overlay::BuildOverlayFile(map->localFile, parentGetter, map->overlayPath, o), "overlay");
-    if (code != 0)
-      return code;
-  }
-  o.partitionTreePath.clear();
-  if (withAvoid && NeedsAvoidBuild(*map, mask))
-  {
-    g_buildingAvoidMask = mask;
-    g_progress = 0;
-    jint const code = report(plus_overlay::BuildAvoidCliquesFile(map->localFile, parentGetter, mask,
-                                                                 map->overlayPath, map->avoidPath, o),
-                             "avoid-option overlay");
-    g_buildingAvoidMask = 0;
-    return code;
-  }
-  return 0;
+  if (Platform::MkDirChecked(TreeDir()))
+    o.partitionTreePath = TreePath(id);
+  return report(plus_overlay::BuildOverlayFile(map->localFile, parentGetter, map->overlayPath, o), "overlay");
 }
 
 JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeCancel(JNIEnv *, jclass)
 {
   g_cancel = true;
-}
-
-// Avoid options (RoutingOptions bits) of the file being built; 0 while building a base file or idle.
-JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuildingAvoidMask(JNIEnv *, jclass)
-{
-  return static_cast<jint>(g_buildingAvoidMask.load());
-}
-
-JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeCurrentAvoidMask(JNIEnv *, jclass)
-{
-  return static_cast<jint>(CurrentAvoidMask());
 }
 
 JNIEXPORT jdouble JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeProgress(JNIEnv *, jclass)
@@ -265,20 +208,16 @@ JNIEXPORT jstring JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeSta
   return jni::ToJavaString(env, g_stage);
 }
 
-// Deletes overlay files whose map was deleted or replaced by an update, and interrupted builds; unless
-// |keepAllAvoid|, also avoid-option files for other options than the current ones.
-JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDeleteOrphans(JNIEnv *, jclass,
-                                                                                        jboolean keepAllAvoid)
+// Deletes overlay files whose map was deleted or replaced by an update, interrupted builds, and the avoid-option
+// files earlier versions built (avoid options need no file now).
+JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDeleteOrphans(JNIEnv *, jclass)
 {
-  // Avoid-option files: keep those of the current options; with none set, keep the last ones used.
-  uint32_t const mask = CurrentAvoidMask();
-  int64_t const keepMask = (keepAllAvoid || mask == 0) ? -1 : static_cast<int64_t>(mask);
   size_t deleted = 0;
   for (auto const & d : MapDirs())
-    deleted += plus_overlay::DeleteOrphanedOverlayFiles(d, keepMask);
+    deleted += plus_overlay::DeleteOrphanedOverlayFiles(d);
   // Partition splits of maps that are no longer downloaded.
   std::set<std::string> downloaded;
-  for (auto const & m : DownloadedMaps(0))
+  for (auto const & m : DownloadedMaps())
     downloaded.insert(m.countryId);
   Platform::FilesList trees;
   Platform::GetFilesByExt(TreeDir(), ".tree", trees);
@@ -305,11 +244,6 @@ JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nati
   std::vector<std::string> out{engine, std::to_string(r.seconds), r.reason};
   out.insert(out.end(), r.approxMaps.begin(), r.approxMaps.end());
   return jni::ToJavaStringArray(env, out);
-}
-
-JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeLastAvoidMaps(JNIEnv * env, jclass)
-{
-  return jni::ToJavaStringArray(env, plus_overlay::GetLastEngineReport().avoidMaps);
 }
 
 JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeRefreshRoute(JNIEnv *, jclass)

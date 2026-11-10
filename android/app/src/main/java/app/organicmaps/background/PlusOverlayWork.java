@@ -43,9 +43,8 @@ import java.util.concurrent.TimeUnit;
  * download or update (and at app start for anything missed). Shows a progress notification with a
  * Cancel button; cancelling stops the running build until the app starts again or a route needs a map.
  * Until a map's base file is built, routes cross that map on estimates (see PlusRouteStatus); maps a
- * route needs are built first. Every downloaded map gets its base file. The file for the current avoid
- * options is built only for the maps routes go through (routes with avoid options are exact without it,
- * only slower); files for other mixes are deleted.
+ * route needs are built first. Every downloaded map gets one file; avoid options and avoided places need
+ * nothing more.
  *
  * Nothing makes it give up on a map: it doesn't wait for battery or storage, a build the system killed
  * is tried again (with one thread, after the other maps), and failed builds are retried later.
@@ -110,7 +109,7 @@ public class PlusOverlayWork extends Worker
   }
 
   /**
-   * Builds these maps' files (with those for the current avoid options) before the others. With
+   * Builds these maps' files before the others. With
    * {@code preempt}, a build of another map that isn't half done yet is stopped and done later.
    */
   public static void prioritize(@NonNull Context context, @NonNull Collection<String> countryIds, boolean preempt)
@@ -233,7 +232,7 @@ public class PlusOverlayWork extends Worker
       return Result.success();
     }
 
-    PlusOverlay.nativeDeleteOrphans(false /* keepAllAvoid */);
+    PlusOverlay.nativeDeleteOrphans();
     final SharedPreferences prefs = MwmApplication.prefs(mContext);
     final String killed = prefs.getString(KEY_BUILDING, null);
     if (killed != null)
@@ -270,7 +269,7 @@ public class PlusOverlayWork extends Worker
         final String name = MapManager.nativeGetName(countryId);
         try
         {
-          setForegroundAsync(foregroundInfo(name, 0, "", false)).get();
+          setForegroundAsync(foregroundInfo(name, 0, "")).get();
         }
         catch (Exception e)
         {
@@ -280,23 +279,14 @@ public class PlusOverlayWork extends Worker
         final var tick = ticker.scheduleWithFixedDelay(() -> {
           if (isStopped())
             return;
-          final int building = PlusOverlay.nativeBuildingAvoidMask();
-          if (building != 0 && building != PlusOverlay.nativeCurrentAvoidMask())
-          {
-            // Avoid options changed meanwhile: the run queued by that change builds the right files.
-            Logger.i(TAG, "Avoid options changed, stopping the build for the old ones");
-            PlusOverlay.nativeCancel();
-            return;
-          }
-          updateProgress(name, PlusOverlay.nativeProgress(), PlusOverlay.nativeStage(), building != 0);
+          updateProgress(name, PlusOverlay.nativeProgress(), PlusOverlay.nativeStage());
         }, 1, 1, TimeUnit.SECONDS);
 
         final int threads = killedCount(countryId) > 0 ? 1 : BUILD_THREADS;
         Logger.i(TAG, "Building the fast-routing overlay for " + countryId + " with " + threads + " threads");
         prefs.edit().putString(KEY_BUILDING, countryId).commit();
         sBuilding = countryId;
-        // Files for the current avoid options only for the maps routes use (sPriority).
-        final int r = PlusOverlay.nativeBuild(countryId, threads, sPriority.contains(countryId));
+        final int r = PlusOverlay.nativeBuild(countryId, threads);
         sBuilding = null;
         final boolean preempted = sPreempted;
         sPreempted = false;
@@ -350,8 +340,7 @@ public class PlusOverlayWork extends Worker
     return Result.success();
   }
 
-  // Next map to build: those a route needs (base and avoid-option files), then the base files of the others,
-  // maps whose build the system killed last.
+  // Next map to build: those a route needs, then the others, maps whose build the system killed last.
   @Nullable
   private String nextMap(@NonNull Set<String> attempted)
   {
@@ -410,8 +399,8 @@ public class PlusOverlayWork extends Worker
   {
     final android.location.Location loc = MwmApplication.from(mContext).getLocationHelper().getSavedLocation();
     if (loc == null)
-      return PlusOverlay.nativeMapsToBuild(false, 0, 0, false /* withAvoid */);
-    return PlusOverlay.nativeMapsToBuild(true, loc.getLatitude(), loc.getLongitude(), false /* withAvoid */);
+      return PlusOverlay.nativeMapsToBuild(false, 0, 0);
+    return PlusOverlay.nativeMapsToBuild(true, loc.getLatitude(), loc.getLongitude());
   }
 
   @Override
@@ -423,16 +412,14 @@ public class PlusOverlayWork extends Worker
   }
 
   @NonNull
-  private Notification progressNotification(@NonNull String name, double progress, @NonNull String stage,
-                                            boolean avoidOptions)
+  private Notification progressNotification(@NonNull String name, double progress, @NonNull String stage)
   {
     final PendingIntent cancel = WorkManager.getInstance(mContext).createCancelPendingIntent(getId());
     final int percent = (int) Math.round(progress * 100);
     return new NotificationCompat.Builder(mContext, CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_logo_small)
         .setColor(ContextCompat.getColor(mContext, R.color.notification))
-        .setContentTitle(mContext.getString(avoidOptions ? R.string.plus_overlay_building_avoid
-                                                         : R.string.plus_overlay_building, name))
+        .setContentTitle(mContext.getString(R.string.plus_overlay_building, name))
         .setContentText(stage.isEmpty() ? mContext.getString(R.string.plus_overlay_building_text)
                                         : stage + " · " + percent + "%")
         .setSubText(sBuilding != null && PlusRouteStatus.isOnRoute(sBuilding)
@@ -448,22 +435,21 @@ public class PlusOverlayWork extends Worker
   }
 
   @NonNull
-  private ForegroundInfo foregroundInfo(@NonNull String name, double progress, @NonNull String stage,
-                                        boolean avoidOptions)
+  private ForegroundInfo foregroundInfo(@NonNull String name, double progress, @NonNull String stage)
   {
-    final Notification n = progressNotification(name, progress, stage, avoidOptions);
+    final Notification n = progressNotification(name, progress, stage);
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
       return new ForegroundInfo(PROGRESS_NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
     return new ForegroundInfo(PROGRESS_NOTIFICATION_ID, n);
   }
 
-  private void updateProgress(@NonNull String name, double progress, @NonNull String stage, boolean avoidOptions)
+  private void updateProgress(@NonNull String name, double progress, @NonNull String stage)
   {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
         && ContextCompat.checkSelfPermission(mContext, POST_NOTIFICATIONS) != PERMISSION_GRANTED)
       return;
     NotificationManagerCompat.from(mContext).notify(PROGRESS_NOTIFICATION_ID,
-                                                    progressNotification(name, progress, stage, avoidOptions));
+                                                    progressNotification(name, progress, stage));
   }
 
   private void notifyResult(int built, int failed)

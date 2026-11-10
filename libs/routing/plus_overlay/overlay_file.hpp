@@ -1,6 +1,6 @@
 #pragma once
 
-// Comaps++ per-map overlay file, format v2.
+// Comaps++ per-map overlay file.
 //
 // One file per map (<map name>.plusovl next to the .mwm). It holds no road graph: CoMaps' own
 // IndexGraph supplies the base edges at query time. Contents:
@@ -12,7 +12,10 @@
 //   - per level: entries/exits of every cell and the entry x exit cliques, sparse: one bit per
 //     (entry, exit) pair (about a third of the pairs are unreachable) and the finite values as 16-bit
 //     steps of a per-cell scale, plus a byte of penalty units per value in cells that have any;
-//   - the map's border transitions (OSM way id + segment index), used to join maps at query time.
+//   - the map's border transitions (OSM way id + segment index), used to join maps at query time;
+//   - format 8 on: per cell, the road types (tolls, motorways, ferries, dirt) its clique paths use, and per
+//     entry and exit the road types of its own segment, so routes with avoid options need no file of their
+//     own (MappedOverlay::CellRoads).
 // The header carries the map version and a hash of the build parameters; a file whose map version or
 // parameters don't match is treated as missing and rebuilt.
 
@@ -38,7 +41,8 @@ namespace plus_overlay
 //   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
 //   cliques wrong; that is the only code change that makes the app rebuild every file.
 // - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
-constexpr uint32_t kFileFormatVersion = 7;  // 5: smaller layout; 6: 16-bit clique values; 7: road types per cell
+constexpr uint32_t kFileFormatVersion = 8;  // 5: smaller layout; 6: 16-bit clique values; 7: road types per cell;
+                                            // 8: road types of the cells' paths and boundaries
 constexpr uint32_t kMinReadableFormatVersion = 7;  // 7: road types per cell (routes with avoid options without
                                                    // their file)
 constexpr uint32_t kRoutingDataVersion = 2;  // 2: time-dependent edges, penalty units in cliques
@@ -76,6 +80,9 @@ struct FileContents
   // Per vertex: RoutingOptions road types its edges step onto (written per level-1 cell, see
   // MappedOverlay::CellRoads).
   std::vector<uint8_t> roads;
+  // Per vertex: RoutingOptions road types of its own segment (Graph::selfR). With the cells' path road types
+  // (LevelOverlay::cellRoads) they go into the file as kCellPathRoads/kEntryRoads/kExitRoads.
+  std::vector<uint8_t> selfRoads;
 };
 
 // Hash of what makes two builds comparable (format version, cell sizes, balance, directions).
@@ -95,20 +102,14 @@ inline std::string OverlayPathForMap(std::string const & mwmPath)
   auto const dot = mwmPath.rfind('.');
   return (dot == std::string::npos ? mwmPath : mwmPath.substr(0, dot)) + kFileExtension;
 }
-// <dir>/<map>.mwm -> <dir>/<map>.avoid<mask>.plusovl (cliques for routes with avoid options)
-inline std::string AvoidOverlayPathForMap(std::string const & mwmPath, uint32_t avoidMask)
-{
-  auto const dot = mwmPath.rfind('.');
-  return (dot == std::string::npos ? mwmPath : mwmPath.substr(0, dot)) + ".avoid" + std::to_string(avoidMask) +
-         kFileExtension;
-}
 
 // Cheap check (header only): |path| is an overlay file of this format, built for map version
 // |mwmVersion| with the build parameters |paramsHash|.
 bool OverlayFileMatches(std::string const & path, int64_t mwmVersion, uint64_t paramsHash,
                         uint64_t * buildId = nullptr);
-// Header only: |path| is an avoid-option file for the base file with |baseBuildId| and |avoidMask|.
-bool AvoidCliquesFileMatches(std::string const & path, uint64_t baseBuildId, uint32_t avoidMask);
+// Header only: |path| is in the layout this code writes (kFileFormatVersion). Older readable files still serve
+// routes; the app rebuilds them in the background.
+bool OverlayFileIsLatestFormat(std::string const & path);
 
 // Clique values are stored per cell as travel time in 16-bit steps of the cell's scale (its largest time
 // / 65535, so at most half a step of rounding: under a second for any cell whose paths take less than
@@ -118,11 +119,6 @@ constexpr float kCliquePenaltyS = 1800.0f;  // == kPenaltyUnitS (checked in over
 constexpr uint32_t kMaxCliqueSteps = 65535;
 constexpr uint32_t kMaxCliquePenaltyUnits = 255;
 
-class MappedOverlay;
-// Cliques computed with avoid options (|avoidMask|, RoutingOptions bits) for the vertices, partition and
-// boundaries of |base|. Everything else is shared with the base file.
-bool WriteAvoidCliquesFile(std::string const & path, MappedOverlay const & base, uint32_t avoidMask,
-                           Overlay const & ov, std::string * error = nullptr);
 
 bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partition const & p, Overlay const & ov,
                       std::string * error = nullptr);
@@ -138,6 +134,9 @@ public:
     uint32_t const * exitOff = nullptr;
     uint32_t const * entries = nullptr;   // per cell, ascending
     uint32_t const * exits = nullptr;
+    // Format 8 on (else null): road types of each entry's / exit's own segment, parallel to entries / exits.
+    uint8_t const * entryRoads = nullptr;
+    uint8_t const * exitRoads = nullptr;
     uint32_t const * rowRank = nullptr;   // per entry: values before its row
     uint64_t const * bits = nullptr;      // per cell, per entry row: ceil(exits / 64) words
     uint16_t const * values = nullptr;    // steps of the cell's scale
@@ -145,19 +144,7 @@ public:
     uint32_t const * penaltyOff = nullptr;  // numCells + 1: first penalty byte of each cell (none if equal)
     float const * scale = nullptr;        // per cell: seconds per step
     std::vector<uint64_t> wordOff;        // numCells + 1: first word of each cell
-    // With an avoid-option file attached, the cells whose cliques differ from these: per cell, kNoAlt or
-    // the cell's index in the avoid file's arrays (rows and words of its changed cells, in cell order).
-    std::vector<uint32_t> altCell;
-    uint32_t const * altRowRank = nullptr;
-    uint64_t const * altBits = nullptr;
-    uint16_t const * altValues = nullptr;
-    uint8_t const * altPenalty = nullptr;
-    uint32_t const * altPenaltyOff = nullptr;  // per changed cell + 1
-    float const * altScale = nullptr;  // per changed cell
-    std::vector<uint32_t> altRowOff;   // per changed cell: its first row in altRowRank
-    std::vector<uint64_t> altWordOff;  // per changed cell: its first word in altBits
   };
-  static constexpr uint32_t kNoAlt = 0xFFFFFFFFu;
 
   // One cell's clique rows: rowRank by the cell's entry row (values before it, as an index into values),
   // bits from the cell's first word.
@@ -176,14 +163,6 @@ public:
   };
   static CellCliques CliquesOf(Level const & L, uint32_t cell)
   {
-    if (!L.altCell.empty() && L.altCell[cell] != kNoAlt)
-    {
-      uint32_t const k = L.altCell[cell];
-      uint32_t const * rr = L.altRowRank + L.altRowOff[k];
-      bool const pen = L.altPenaltyOff[k + 1] > L.altPenaltyOff[k];
-      return {rr, L.altBits + L.altWordOff[k], L.altValues, pen ? L.altPenalty + L.altPenaltyOff[k] : nullptr,
-              L.entryOff[cell + 1] > L.entryOff[cell] ? rr[0] : 0, L.altScale[k]};
-    }
     uint32_t const * rr = L.rowRank + L.entryOff[cell];
     bool const pen = L.penaltyOff[cell + 1] > L.penaltyOff[cell];
     return {rr, L.bits + L.wordOff[cell], L.values, pen ? L.penalty + L.penaltyOff[cell] : nullptr,
@@ -206,21 +185,15 @@ public:
   static std::unique_ptr<MappedOverlay> Open(std::string const & path, int64_t expectMwmVersion,
                                              uint64_t expectParamsHash, std::string * error = nullptr,
                                              bool * damaged = nullptr);
-  bool AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error, bool * damaged);
   ~MappedOverlay();
   MappedOverlay(MappedOverlay const &) = delete;
   MappedOverlay & operator=(MappedOverlay const &) = delete;
 
   int64_t MwmVersion() const { return m_mwmVersion; }
   uint64_t FileBytes() const { return m_file.size; }
-  uint64_t AvoidFileBytes() const { return m_avoidFile.size; }
   uint64_t ParamsHash() const { return m_paramsHash; }
   uint64_t BuildId() const { return m_buildId; }
-  uint32_t AvoidMask() const { return m_avoidMask; }
 
-  // Replaces the cliques with those of an avoid-option file built for this file and |avoidMask|
-  // (WriteAvoidCliquesFile). False (and nothing changed) if it is missing or doesn't match.
-  bool AttachAvoidCliques(std::string const & path, uint32_t avoidMask, std::string * error = nullptr);
 
   // Raw tables (for rebuilding cliques with other edge weights).
   uint64_t const * KeptBitsData() const { return m_keptBits; }
@@ -309,9 +282,10 @@ public:
   float Clique(size_t li, uint32_t cell, uint32_t i, uint32_t j) const;
   // Seconds per stored step in |cell| (the rounding of its values is at most half of it).
   float CellScale(size_t li, uint32_t cell) const { return CliquesOf(m_levels[li], cell).scale; }
-  // f(exit vertex, weight) for every exit of |cell| reachable from its entry |v|.
+  // f(exit vertex, weight) for every exit of |cell| reachable from its entry |v|. With |skipRoads|, exits on
+  // those road types are left out (format 8 on; older files have no such exits in cells a route may use).
   template <class F>
-  void ForEachFromEntry(size_t li, uint32_t cell, uint32_t v, F && f) const
+  void ForEachFromEntry(size_t li, uint32_t cell, uint32_t v, F && f, uint8_t skipRoads = 0) const
   {
     auto const & L = m_levels[li];
     uint64_t const nEx = L.exitOff[cell + 1] - L.exitOff[cell];
@@ -323,13 +297,19 @@ public:
     uint64_t const row = i * wpr;
     uint64_t idx = cc.rowRank[i];
     uint32_t const * exits = L.exits + L.exitOff[cell];
+    uint8_t const * roads = (skipRoads != 0 && L.exitRoads) ? L.exitRoads + L.exitOff[cell] : nullptr;
     for (uint64_t k = 0; k < wpr; ++k)
       for (uint64_t w = cc.bits[row + k]; w != 0; w &= w - 1)
-        CallClique(f, exits[k * 64 + static_cast<uint64_t>(__builtin_ctzll(w))], cc, idx++);
+      {
+        uint64_t const j = k * 64 + static_cast<uint64_t>(__builtin_ctzll(w));
+        if (!roads || (roads[j] & skipRoads) == 0)
+          CallClique(f, exits[j], cc, idx);
+        ++idx;
+      }
   }
-  // f(entry vertex, weight) for every entry of |cell| that reaches its exit |v|.
+  // f(entry vertex, weight) for every entry of |cell| that reaches its exit |v|; |skipRoads| as above.
   template <class F>
-  void ForEachToExit(size_t li, uint32_t cell, uint32_t v, F && f) const
+  void ForEachToExit(size_t li, uint32_t cell, uint32_t v, F && f, uint8_t skipRoads = 0) const
   {
     auto const & L = m_levels[li];
     uint64_t const nEn = L.entryOff[cell + 1] - L.entryOff[cell];
@@ -341,9 +321,12 @@ public:
     uint64_t const k = j / 64, bit = j % 64;
     uint64_t const below = (uint64_t(1) << bit) - 1;
     uint32_t const * entries = L.entries + L.entryOff[cell];
+    uint8_t const * roads = (skipRoads != 0 && L.entryRoads) ? L.entryRoads + L.entryOff[cell] : nullptr;
     auto const cc = CliquesOf(L, cell);
     for (uint64_t i = 0; i < nEn; ++i)
     {
+      if (roads && (roads[i] & skipRoads) != 0)
+        continue;
       uint64_t const row = i * wpr;
       uint64_t const word = cc.bits[row + k];
       if (!((word >> bit) & 1))
@@ -363,7 +346,11 @@ public:
   bool IsOpen(size_t li, uint32_t cell) const { return !m_open[li].empty() && m_open[li][cell]; }
   // RoutingOptions road types (tolls, motorways, ferries, dirt roads) inside |cell|: a cell without any of
   // the types a route avoids has the same cliques with those avoid options as without them.
+  // Format 8 on: the road types the cell's clique paths use, leaving out their own entries and exits (which
+  // a search avoiding those types skips, see ForEachFromEntry). Levels above 1 aren't the union of their
+  // children then: a cell can be usable while a child isn't.
   uint8_t CellRoads(size_t li, uint32_t cell) const { return m_cellRoads[li][cell]; }
+  bool HasPathRoads() const { return m_pathRoads; }
   bool HasTimeDependentEdges() const { return m_timeDependent; }
 
   uint32_t NumTransitions() const { return m_numTransitions; }
@@ -384,10 +371,8 @@ private:
     ~Mapping();
   };
   Mapping m_file;
-  Mapping m_avoidFile;  // AttachAvoidCliques
   uint64_t m_paramsHash = 0;
   uint64_t m_buildId = 0;
-  uint32_t m_avoidMask = 0;
 
   int64_t m_mwmVersion = 0;
   uint32_t m_n = 0, m_baseN = 0, m_numSlots = 0, m_numFeatures = 0, m_numTransitions = 0;
@@ -409,6 +394,7 @@ private:
   bool m_timeDependent = false;
   std::vector<std::vector<uint8_t>> m_open;
   std::vector<std::vector<uint8_t>> m_cellRoads;  // [level][cell]
+  bool m_pathRoads = false;
   std::vector<Level> m_levels;
   std::unique_ptr<ViaWayAutomaton> m_automaton;
   std::unordered_map<uint64_t, uint32_t> m_copyId;                    // (state << 32 | base) -> copy

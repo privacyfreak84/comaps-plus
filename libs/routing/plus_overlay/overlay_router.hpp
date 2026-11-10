@@ -39,7 +39,7 @@ struct EngineReport
   };
   Engine engine = Engine::None;
   std::vector<std::string> approxMaps;  // Approximate: those maps (country ids)
-  std::vector<std::string> avoidMaps;   // maps the route used without their avoid-option file
+  size_t avoidPlaces = 0;                // avoided places (plus_avoid_places.hpp) that covered roads on this route
   std::string reason;  // why the normal search ran
   double seconds = 0;
 };
@@ -51,11 +51,9 @@ struct OverlayMap
   routing::NumMwmId id = 0;
   std::string path;        // the map's overlay file
   int64_t mwmVersion = 0;  // the downloaded map's version; the file must have been built for it
-  // With avoid options (avoidMask != 0): the map's avoid-option cliques for that mask, which must
-  // belong to |path| (AvoidOverlayPathForMap). Without that file routes are still exact: the cells that
-  // hold avoided road types are searched on their roads (slower for options that touch many cells).
+  // Avoid options (RoutingOptions bits). No file of their own: the cells whose cliques use avoided road
+  // types are searched on their roads.
   uint32_t avoidMask = 0;
-  std::string avoidPath;
 };
 
 class OverlayRouter
@@ -95,8 +93,7 @@ public:
     // Maps without a usable overlay the route crosses: there it follows CoMaps' border-to-border times
     // (like CoMaps' long-route mode), so the route is approximate until their files are built.
     std::vector<routing::NumMwmId> approxMaps;
-    // Maps the route uses whose avoid-option file is missing (exact, but slower until it is built).
-    std::vector<routing::NumMwmId> noAvoidFileMaps;
+    uint64_t blockedCells = 0;  // level-1 cells searched on their roads because of avoided places
     std::string reason;  // why NotApplicable
   };
 

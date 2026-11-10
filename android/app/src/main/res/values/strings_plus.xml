@@ -3,7 +3,6 @@
 <resources>
     <string name="plus_overlay_channel" translatable="false">Fast routes</string>
     <string name="plus_overlay_building" translatable="false">Preparing fast routes: %s</string>
-    <string name="plus_overlay_building_avoid" translatable="false">Preparing fast routes for your avoid options: %s</string>
     <string name="plus_overlay_building_text" translatable="false">Starting…</string>
     <string name="plus_overlay_done" translatable="false">Fast car routes ready for %d new or updated maps</string>
     <string name="plus_overlay_failed" translatable="false">Fast routes couldn\'t be prepared for %d maps yet; trying again later. Routes through them are estimated until then.</string>
@@ -12,7 +11,6 @@
     <string name="plus_show_engine_title" translatable="false">Show how each car route was calculated</string>
     <string name="plus_show_engine_summary" translatable="false">For testing: a short message after each route says whether the fast route data was used, and if not, why.</string>
     <string name="plus_engine_fast" translatable="false">Fast route · %1$s s</string>
-    <string name="plus_engine_fast_noavoid" translatable="false">Fast route · %1$s s · without avoid-settings data for %2$s yet (exact, slower; being prepared)</string>
     <string name="plus_engine_rejoin" translatable="false">Back onto your route · %1$s s</string>
     <string name="plus_engine_normal" translatable="false">Normal router · %1$s s · %2$s</string>
     <string name="plus_engine_approximate" translatable="false">Fast route, estimated through maps not prepared yet · %1$s s</string>
@@ -20,4 +18,24 @@
     <string name="plus_route_refreshing" translatable="false">Fast routes for %s are ready: updating your route</string>
     <string name="plus_overlay_for_route" translatable="false">Your route will update when this is done</string>
     <string name="plus_overlay_ready_count" translatable="false">Ready for %1$d of %2$d downloaded maps</string>
+    <!-- Roadmap item 1: avoided roads and places -->
+    <string name="plus_avoid_button" translatable="false">Avoid</string>
+    <string name="plus_avoid_title" translatable="false">Keep car routes away from</string>
+    <string name="plus_avoid_this_road" translatable="false">This road: %s</string>
+    <string name="plus_avoid_this_road_unnamed" translatable="false">This road</string>
+    <string name="plus_avoid_this_area" translatable="false">This area…</string>
+    <string name="plus_avoid_radius_title" translatable="false">How far around this point?</string>
+    <string name="plus_avoid_radius_item" translatable="false">%s around it</string>
+    <string name="plus_avoid_added" translatable="false">Car routes now avoid %s. You can switch it off or delete it in Settings → Navigation → Avoided roads and places.</string>
+    <string name="plus_avoid_road_named" translatable="false">Road: %s</string>
+    <string name="plus_avoid_road_unnamed" translatable="false">Unnamed road</string>
+    <string name="plus_avoid_area_named" translatable="false">Area of %s</string>
+    <string name="plus_avoid_list_title" translatable="false">Avoided roads and places</string>
+    <string name="plus_avoid_list_summary" translatable="false">%1$d on, %2$d in total</string>
+    <string name="plus_avoid_list_summary_none" translatable="false">None yet. Tap a place on the map, then Avoid.</string>
+    <string name="plus_avoid_hint" translatable="false">Car routes never use these roads or pass through these areas, except when your start, destination or a stop is in one. To add one, tap a place on the map (or long-press anywhere), then Avoid; it may be under More.</string>
+    <string name="plus_avoid_empty" translatable="false">Nothing avoided yet.</string>
+    <string name="plus_avoid_show_on_map" translatable="false">Show on map</string>
+    <string name="plus_avoid_change_radius" translatable="false">Change size</string>
+    <string name="plus_avoid_no_route" translatable="false">Your avoided roads and places may be blocking every route. You can switch some off in Settings → Navigation → Avoided roads and places.</string>
 </resources>

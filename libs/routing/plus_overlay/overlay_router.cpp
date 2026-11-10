@@ -1,4 +1,5 @@
 #include "routing/plus_overlay/overlay_router.hpp"
+#include "routing/plus_overlay/dynamic_edges.hpp"
 
 #include "routing/base/astar_graph.hpp"
 #include "routing/base/astar_vertex_data.hpp"
@@ -8,6 +9,8 @@
 #include "routing/route_weight.hpp"
 #include "routing/segment.hpp"
 #include "routing/world_graph.hpp"
+
+#include "geometry/distance_on_sphere.hpp"
 
 #include "base/logging.hpp"
 
@@ -91,9 +94,7 @@ struct MapRt
   std::string path;
   int64_t version = 0;
   uint32_t avoidMask = 0;
-  std::string avoidPath;
-  // Avoid options the attached cliques don't account for (the map's avoid-option file is missing): cells
-  // with any of these road types are searched on their roads instead of their cliques.
+  // Avoided road types (= avoidMask): cells whose clique paths use any of them are searched on their roads.
   uint32_t openRoads = 0;
   bool tried = false;
   std::unique_ptr<MappedOverlay> ovl;
@@ -135,17 +136,9 @@ struct OverlayRouter::Impl
         LOG(LWARNING, ("Comaps++ overlay: damaged file deleted:", mr.path, mr.error));
         std::remove(mr.path.c_str());
       }
-      if (mr.ovl && mr.avoidMask != 0 &&
-          !mr.ovl->AttachAvoidCliques(mr.avoidPath, mr.avoidMask, &mr.error, &damaged))
-      {
-        if (damaged)
-        {
-          LOG(LWARNING, ("Comaps++ overlay: damaged file deleted:", mr.avoidPath, mr.error));
-          std::remove(mr.avoidPath.c_str());
-        }
-        // Still exact without it: the cells holding avoided road types are searched on their roads.
-        mr.openRoads = mr.avoidMask;
-      }
+      // Avoid options need no file of their own: the cells whose cliques use avoided road types are searched
+      // on their roads, which CoMaps' graph already filters (QueryLevel).
+      mr.openRoads = mr.avoidMask;
       if (mr.ovl)
       {
         for (uint32_t i = 0; i < mr.ovl->NumTransitions(); ++i)
@@ -617,6 +610,88 @@ struct OverlayRouter::Impl
   std::vector<std::vector<std::vector<uint32_t>>> endCells;  // [map][level] sorted cells holding an end
   std::vector<uint8_t> mapHasEnd;
 
+  // Per query: cells (every level) holding road segments of avoided places (plus_avoid_places.hpp). Their
+  // cliques may use those segments, so the search crosses them on their roads, which CoMaps' graph already
+  // filters. Found when the search first reaches a map. [map][level][cell], empty: none in that map.
+  std::vector<std::vector<std::vector<uint8_t>>> blockedCells;
+  std::vector<uint8_t> blockedReady;
+  uint64_t blockedL1 = 0;
+
+  void FindBlockedCells(uint32_t m)
+  {
+    blockedReady[m] = 1;
+    auto const blocked = Graph(m).GetPlusBlocked();
+    if (!blocked || blocked->Empty())
+      return;
+    auto const & o = *maps[m].ovl;
+    auto & cells = blockedCells[m];
+    cells.resize(o.Levels());
+    for (size_t li = 0; li < o.Levels(); ++li)
+      cells[li].assign(o.GetLevel(li).numCells, 0);
+    auto mark = [&](uint32_t v)
+    {
+      if (!cells[0][o.Cell(0, v)])
+        ++blockedL1;
+      for (size_t li = 0; li < o.Levels(); ++li)
+        cells[li][o.Cell(li, v)] = 1;
+    };
+    routing::IndexGraph::SegmentEdgeListT next;
+    for (auto const & [f, segs] : blocked->features)
+    {
+      std::vector<uint32_t> all;
+      if (segs.empty())
+      {
+        auto const & road = Graph(m).GetRoadGeometry(f);
+        for (uint32_t i = 0; road.IsValid() && i + 1 < road.GetPointsCount(); ++i)
+          all.push_back(i);
+      }
+      for (uint32_t seg : segs.empty() ? all : segs)
+      {
+        for (bool const fwd : {true, false})
+        {
+          // The overlay vertex this segment belongs to: itself, or the end of the chain it lies on (an edge
+          // whose chain passes the segment is inside the cells holding that end, if inside any).
+          Segment s(maps[m].id, f, seg, fwd);
+          for (int guard = 0; guard < 100000 && o.HasSegment(s.GetFeatureId(), s.GetSegmentIdx()); ++guard)
+          {
+            uint32_t const slot = o.Slot(s.GetFeatureId(), s.GetSegmentIdx(), s.IsForward());
+            if (o.Kept(slot))
+            {
+              uint32_t const v = o.Rank(slot);
+              mark(v);
+              if (auto const * copies = o.CopiesOf(v))
+                for (uint32_t c : *copies)
+                  mark(c);
+              break;
+            }
+            next.clear();
+            Graph(m).GetEdgeList(s, true /* isOutgoing */, false /* useRoutingOptions */, next);
+            if (next.size() != 1)
+              break;
+            s = next[0].GetTarget();
+          }
+        }
+      }
+    }
+  }
+
+  bool BlockedCell(uint32_t m, size_t li, uint32_t c)
+  {
+    if (!blockedReady[m])
+      FindBlockedCells(m);
+    auto const & b = blockedCells[m];
+    return !b.empty() && b[li][c];
+  }
+
+  // Whether the search may use |cell|'s cliques: not open, and its clique paths use neither avoided road types
+  // nor roads of avoided places. Not monotone across levels with format 8 (a usable cell can have unusable
+  // children), so every level is checked.
+  bool CellUsable(uint32_t m, size_t li, uint32_t c)
+  {
+    auto const & o = *maps[m].ovl;
+    return !o.IsOpen(li, c) && (o.CellRoads(li, c) & maps[m].openRoads) == 0 && !BlockedCell(m, li, c);
+  }
+
   size_t QueryLevel(Key x)
   {
     uint32_t const m = MapOf(x), v = LocalOf(x);
@@ -626,7 +701,7 @@ struct OverlayRouter::Impl
     for (size_t li = levels; li-- > 0;)
     {
       uint32_t const c = o.Cell(li, v);
-      if (o.IsOpen(li, c) || (o.CellRoads(li, c) & maps[m].openRoads) != 0)
+      if (!CellUsable(m, li, c))
         continue;
       if (mapHasEnd[m])
       {
@@ -663,8 +738,10 @@ struct OverlayRouter::Impl
     auto const & o = *maps[m].ovl;
     uint32_t const c = o.Cell(li, v);
     if (o.IsEntry(li, v))
-      o.ForEachFromEntry(li, c, v, [&](uint32_t exit, float w, uint32_t k)
-                         { relax(MakeKey(m, exit), d + w, pen + k * kPenaltyUnitS, x, static_cast<uint8_t>(lvl)); });
+      o.ForEachFromEntry(
+          li, c, v, [&](uint32_t exit, float w, uint32_t k)
+          { relax(MakeKey(m, exit), d + w, pen + k * kPenaltyUnitS, x, static_cast<uint8_t>(lvl)); },
+          static_cast<uint8_t>(maps[m].openRoads));
     for (auto const & e : tmp)
       if (e.dyn || MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
         relax(e.to, d + e.w, pen + e.pen, x, 0);
@@ -693,8 +770,9 @@ struct OverlayRouter::Impl
     auto const & o = *maps[m].ovl;
     uint32_t const c = o.Cell(li, v);
     if (o.IsExit(li, v))
-      o.ForEachToExit(li, c, v, [&](uint32_t entry, float w)
-                      { relax(MakeKey(m, entry), d + w, x, static_cast<uint8_t>(lvl)); });
+      o.ForEachToExit(
+          li, c, v, [&](uint32_t entry, float w) { relax(MakeKey(m, entry), d + w, x, static_cast<uint8_t>(lvl)); },
+          static_cast<uint8_t>(maps[m].openRoads));
     for (auto const & e : tmp)
       if (MapOf(e.to) != m || o.Cell(li, LocalOf(e.to)) != c)
         relax(e.to, d + e.w, x, 0);
@@ -759,21 +837,27 @@ struct OverlayRouter::Impl
       }
       uint32_t const xv = LocalOf(x);
       OutEdges(x, tmp, nullptr);
-      if (li == 0)
+      // As the search does: the cliques of the highest usable level below |level| (a usable cell's children
+      // need not be usable, see CellUsable), else the roads.
+      int k = static_cast<int>(li) - 1;
+      while (k >= 0 && !CellUsable(m, static_cast<size_t>(k), o.Cell(static_cast<size_t>(k), xv)))
+        --k;
+      if (k < 0)
       {
         for (auto const & e : tmp)
-          if (MapOf(e.to) == m && o.Cell(0, LocalOf(e.to)) == c)
+          if (MapOf(e.to) == m && o.Cell(li, LocalOf(e.to)) == c)
             relax(e.to, d + e.w, x, 0);
         continue;
       }
-      uint32_t const cc = o.Cell(li - 1, xv);
-      if (o.IsEntry(li - 1, xv))
-        o.ForEachFromEntry(li - 1, cc, xv, [&](uint32_t exit, float w)
-                           { relax(MakeKey(m, exit), d + w, x, static_cast<uint8_t>(li)); });
-      if (o.IsExit(li - 1, xv))
-        for (auto const & e : tmp)
-          if (MapOf(e.to) == m && o.Cell(li, LocalOf(e.to)) == c && o.Cell(li - 1, LocalOf(e.to)) != cc)
-            relax(e.to, d + e.w, x, 0);
+      size_t const kl = static_cast<size_t>(k);
+      uint32_t const cc = o.Cell(kl, xv);
+      if (o.IsEntry(kl, xv))
+        o.ForEachFromEntry(
+            kl, cc, xv, [&](uint32_t exit, float w) { relax(MakeKey(m, exit), d + w, x, static_cast<uint8_t>(kl + 1)); },
+            static_cast<uint8_t>(maps[m].openRoads));
+      for (auto const & e : tmp)
+        if (MapOf(e.to) == m && o.Cell(li, LocalOf(e.to)) == c && o.Cell(kl, LocalOf(e.to)) != cc)
+          relax(e.to, d + e.w, x, 0);
     }
     if (!found)
       return false;
@@ -872,14 +956,12 @@ void OverlayRouter::SetMaps(std::vector<OverlayMap> const & maps)
     mr.path = om.path;
     mr.version = om.mwmVersion;
     mr.avoidMask = om.avoidMask;
-    mr.avoidPath = om.avoidPath;
     auto it = m_impl->mapIdx.find(om.id);
     if (it != m_impl->mapIdx.end())
     {
       auto & old = m_impl->maps[it->second];
       // A map whose file was missing or stale is tried again (its overlay may have been built since).
-      if (old.path == om.path && old.version == om.mwmVersion && old.avoidMask == om.avoidMask &&
-          old.avoidPath == om.avoidPath && old.ovl)
+      if (old.path == om.path && old.version == om.mwmVersion && old.avoidMask == om.avoidMask && old.ovl)
         mr = std::move(old);
     }
     next.push_back(std::move(mr));
@@ -941,6 +1023,9 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   I.rawSegs.clear();
   I.rawIdx.clear();
   I.approxTouched.clear();
+  I.blockedCells.assign(I.maps.size(), {});
+  I.blockedReady.assign(I.maps.size(), 0);
+  I.blockedL1 = 0;
   // Conditional access is checked at the time the route gets there, which only a forward search knows.
   I.forwardOnly = false;
   for (uint32_t m = 0; m < I.maps.size(); ++m)
@@ -951,6 +1036,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   {
     stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     stats.baseScans = I.baseScans;
+    stats.blockedCells = I.blockedL1;
     stats.reason = why;
     I.starter = nullptr;
     return r;
@@ -1520,12 +1606,6 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     auto it = I.mapIdx.find(id);
     if (it == I.mapIdx.end() || !I.Ovl(it->second))
       stats.approxMaps.push_back(id);
-  }
-  for (auto const id : used)
-  {
-    auto it = I.mapIdx.find(id);
-    if (it != I.mapIdx.end() && I.Ovl(it->second) && I.maps[it->second].openRoads != 0)
-      stats.noAvoidFileMaps.push_back(id);
   }
   lap(stats.unpackMs);
   return finish(Result::Ok, "");
