@@ -46,7 +46,7 @@ public final class PlusAvoidPlaceDialog
         .show();
   }
 
-  static void chooseRadius(@NonNull Context context, int current, @NonNull IntConsumer onChosen)
+  public static void chooseRadius(@NonNull Context context, int current, @NonNull IntConsumer onChosen)
   {
     final CharSequence[] labels = new CharSequence[RADII_M.length];
     int checked = DEFAULT_RADIUS_INDEX;
