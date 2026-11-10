@@ -471,8 +471,9 @@ public:
   std::string GenerateTrackRecordingName() const;
   dp::Color GenerateTrackRecordingColor() const;
 
+  // |properties|: stored with the track (Comaps++: the route's avoided places).
   kml::TrackId SaveRoute(std::vector<geometry::PointWithAltitude> points, std::string const & from,
-                         std::string const & to);
+                         std::string const & to, kml::Properties properties = {});
 
   void UpdateBookmarkLabels();
 

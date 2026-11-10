@@ -79,6 +79,11 @@ public class PlacePageButtonFactory
         titleId = R.string.plus_avoid_button;
         yield R.drawable.ic_avoid_place;
       }
+      case UNAVOID_PLACE ->
+      {
+        titleId = R.string.plus_avoid_remove_button;
+        yield R.drawable.ic_avoid_place;
+      }
       case MORE ->
       {
         titleId = R.string.placepage_more_button;

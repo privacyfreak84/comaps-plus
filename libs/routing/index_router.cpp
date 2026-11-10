@@ -1324,8 +1324,6 @@ void IndexRouter::PlusResolveAvoidPlaces(Checkpoints const & checkpoints)
   std::unordered_map<NumMwmId, std::unordered_map<uint32_t, std::pair<bool, std::vector<uint32_t>>>> blocked;
   for (auto const & place : places)
   {
-    if (!place.enabled)
-      continue;
     bool const area = place.kind == plus_avoid::Place::Kind::Area;
     double const radius = area ? std::clamp<double>(place.radiusM, plus_avoid::kMinAreaRadiusM,
                                                     plus_avoid::kMaxAreaRadiusM)

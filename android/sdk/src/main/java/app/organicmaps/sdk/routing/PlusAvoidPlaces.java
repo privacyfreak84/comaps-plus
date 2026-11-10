@@ -1,120 +1,41 @@
 package app.organicmaps.sdk.routing;
 
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
- * Comaps++: roads and areas kept out of car routes. The list is saved in the core and read by every car route;
- * nothing has to be prepared for it. A place at a route's start, finish or a stop doesn't apply to that route.
+ * Comaps++: roads and areas kept out of the current car route. They belong to that route: they're cleared when
+ * the route is closed, saved with it when it's saved, and never stored on their own. Nothing has to be prepared
+ * for them. A place at a route's start, finish or a stop doesn't apply to it.
  */
 public final class PlusAvoidPlaces
 {
   public static final int KIND_AREA = 0;
   public static final int KIND_ROAD = 1;
-  private static final int NUMBERS_PER_PLACE = 5;
 
   public static final class Place
   {
     public int kind;
-    public double lat;
-    public double lon;
     /** Area only, metres. */
     public int radiusM;
-    public boolean enabled = true;
     /** Road: its name or number ("" for an unnamed road). Area: the settlement's name, if any. */
     @NonNull
     public String name = "";
-
-    @NonNull
-    public static Place area(double lat, double lon, int radiusM)
-    {
-      final Place p = new Place();
-      p.kind = KIND_AREA;
-      p.lat = lat;
-      p.lon = lon;
-      p.radiusM = radiusM;
-      return p;
-    }
-
-    @NonNull
-    public static Place road(double lat, double lon, @NonNull String name)
-    {
-      final Place p = new Place();
-      p.kind = KIND_ROAD;
-      p.lat = lat;
-      p.lon = lon;
-      p.name = name;
-      return p;
-    }
   }
 
   private PlusAvoidPlaces() {}
 
-  @NonNull
-  public static List<Place> load()
-  {
-    final double[] n = nativeGetNumbers();
-    final String[] names = nativeGetNames();
-    final List<Place> places = new ArrayList<>();
-    for (int i = 0; i < names.length && (i + 1) * NUMBERS_PER_PLACE <= n.length; ++i)
-    {
-      final Place p = new Place();
-      final int o = i * NUMBERS_PER_PLACE;
-      p.kind = (int) n[o];
-      p.lat = n[o + 1];
-      p.lon = n[o + 2];
-      p.radiusM = (int) n[o + 3];
-      p.enabled = n[o + 4] != 0;
-      p.name = names[i] == null ? "" : names[i];
-      places.add(p);
-    }
-    return places;
-  }
-
-  public static void save(@NonNull List<Place> places)
-  {
-    final double[] n = new double[places.size() * NUMBERS_PER_PLACE];
-    final String[] names = new String[places.size()];
-    for (int i = 0; i < places.size(); ++i)
-    {
-      final Place p = places.get(i);
-      final int o = i * NUMBERS_PER_PLACE;
-      n[o] = p.kind;
-      n[o + 1] = p.lat;
-      n[o + 2] = p.lon;
-      n[o + 3] = p.radiusM;
-      n[o + 4] = p.enabled ? 1 : 0;
-      names[i] = p.name;
-    }
-    nativeSet(n, names);
-  }
-
-  public static void add(@NonNull Place place)
-  {
-    final List<Place> places = load();
-    places.add(place);
-    save(places);
-  }
-
-  public static int enabledCount()
-  {
-    int count = 0;
-    for (Place p : load())
-      if (p.enabled)
-        ++count;
-    return count;
-  }
-
   /**
-   * Works out what Avoid means for the place shown in the place page while a car route is shown: the settlement
-   * the route passes through, or the route's own road at that point. False (no Avoid) without a car route, for
-   * places off the route, and for places the route has to go to anyway (its start, finish or a stop).
+   * Works out what the place page offers for the place shown in it. A place the route already avoids (drawn in
+   * red): Don't avoid. Otherwise, with a car route shown: Avoid for the settlement the route passes through, or
+   * the route's own road at that point. False for places off the route and places the route has to go to anyway
+   * (its start, finish or a stop).
    */
   public static native boolean nativePrepareRouteAvoid();
 
-  /** {kind, radius in metres} of the place nativePrepareRouteAvoid found (empty if none). */
+  /** Whether the prepared place is one the route already avoids. */
+  public static native boolean nativeIsPendingRemoval();
+
+  /** {kind, radius in metres} of the prepared place (empty if none). */
   @NonNull
   public static native double[] nativePendingNumbers();
 
@@ -122,17 +43,12 @@ public final class PlusAvoidPlaces
   @NonNull
   public static native String nativePendingName();
 
-  /** Adds that place to the list. */
-  public static native void nativeAddPending();
+  /** Adds that place to the current route's avoided places, or removes it from them. */
+  public static native void nativeApplyPending();
+
+  /** How many places the current route avoids. */
+  public static native int nativeCount();
 
   /** How many avoided places applied to the last car route (covered roads, not at its ends or stops). */
   public static native int nativeLastApplied();
-
-  @NonNull
-  private static native double[] nativeGetNumbers();
-
-  @NonNull
-  private static native String[] nativeGetNames();
-
-  private static native void nativeSet(@NonNull double[] numbers, @NonNull String[] names);
 }

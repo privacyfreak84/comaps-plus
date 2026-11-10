@@ -420,6 +420,10 @@ Framework::Framework(FrameworkParams const & params, bool loadMaps)
   InitTransliteration();
   LOG(LDEBUG, ("Transliterators initialized"));
 
+  // Comaps++: redraw the route's avoided places whenever they change (added, removed, cleared with the route).
+  routing::plus_avoid::SetChangeListener([this]()
+  { GetPlatform().RunTask(Platform::Thread::Gui, [this]() { PlusShowAvoidPlaces(); }); });
+
   /// @todo No any real config loading here for now.
   GetPowerManager().Subscribe(this);
   GetPowerManager().Load();
@@ -430,6 +434,7 @@ Framework::Framework(FrameworkParams const & params, bool loadMaps)
 
 Framework::~Framework()
 {
+  routing::plus_avoid::SetChangeListener({});
   GetPowerManager().UnsubscribeAll();
 
   m_threadRunner.reset();
@@ -2094,6 +2099,9 @@ void Framework::ActivateMapSelection()
     bm.OnTrackSelected(m_currentPlacePageInfo->GetTrackId());
   else
     bm.OnTrackDeselected();
+  PlusShowTrackAvoidPlaces(m_currentPlacePageInfo->GetSelectedObject() == df::SelectionShape::OBJECT_TRACK
+                               ? m_currentPlacePageInfo->GetTrackId()
+                               : kml::kInvalidTrackId);
 
   auto const & featureId = m_currentPlacePageInfo->GetID();
 
@@ -2126,6 +2134,7 @@ void Framework::DeactivateMapSelection()
     auto & bm = GetBookmarkManager();
     bm.OnTrackDeselected();
     bm.ResetRecentlyDeletedBookmark();
+    PlusShowTrackAvoidPlaces(kml::kInvalidTrackId);
 
     m_currentPlacePageInfo = {};
 
@@ -3762,6 +3771,14 @@ void Framework::Refresh3dMode()
   Allow3dMode(allow3d, allow3dBuildings);
 }
 
+void Framework::PlusShowTrackAvoidPlaces(kml::TrackId trackId)
+{
+  if (trackId == m_plusAvoidTrack)
+    return;
+  m_plusAvoidTrack = trackId;
+  PlusShowAvoidPlaces();
+}
+
 void Framework::PlusShowAvoidPlaces()
 {
   for (size_t i = 0; i < m_plusAvoidLines; ++i)
@@ -3769,12 +3786,30 @@ void Framework::PlusShowAvoidPlaces()
   m_plusAvoidLines = 0;
   if (!m_drapeEngine)
     return;
+  // The current route's avoided places (they exist only while it does), and those of the saved route
+  // (track) being viewed.
+  auto places = routing::plus_avoid::GetPlaces();
+  if (m_plusAvoidTrack != kml::kInvalidTrackId)
+  {
+    if (auto const * track = GetBookmarkManager().GetTrack(m_plusAvoidTrack))
+    {
+      auto const & props = track->GetData().m_properties;
+      if (auto const it = props.find(routing::plus_avoid::kTrackPropertyKey); it != props.end())
+      {
+        std::vector<routing::plus_avoid::Place> saved;
+        routing::plus_avoid::Deserialize(it->second, saved);
+        for (auto & p : saved)
+          if (std::find(places.begin(), places.end(), p) == places.end())
+            places.push_back(std::move(p));
+      }
+    }
+  }
+  if (places.empty())
+    return;
   dp::Color const color(220, 40, 40, 190);
   routing::CarModelFactory models([this](std::string const & id) { return m_storage.GetParentIdFor(id); });
-  for (auto const & place : routing::plus_avoid::GetPlaces())
+  for (auto const & place : places)
   {
-    if (!place.enabled)
-      continue;
     m2::PointD const center = mercator::FromLatLon(place.lat, place.lon);
     std::vector<std::vector<m2::PointD>> lines;
     if (place.kind == routing::plus_avoid::Place::Kind::Area)

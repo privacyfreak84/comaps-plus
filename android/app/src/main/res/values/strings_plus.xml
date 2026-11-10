@@ -18,24 +18,19 @@
     <string name="plus_route_refreshing" translatable="false">Fast routes for %s are ready: updating your route</string>
     <string name="plus_overlay_for_route" translatable="false">Your route will update when this is done</string>
     <string name="plus_overlay_ready_count" translatable="false">Ready for %1$d of %2$d downloaded maps</string>
-    <!-- Roadmap item 1: avoided roads and places -->
+    <!-- Roadmap item 1: avoided roads and places, for the current route only -->
     <string name="plus_avoid_button" translatable="false">Avoid</string>
-    <string name="plus_avoid_title" translatable="false">Avoid on car routes</string>
-    <string name="plus_avoid_confirm_road" translatable="false">Car routes will no longer use %s. The route is calculated again now.</string>
-    <string name="plus_avoid_confirm_area" translatable="false">Car routes will no longer pass through %1$s (within %2$s of its centre). The route is calculated again now.</string>
+    <string name="plus_avoid_title" translatable="false">Avoid on this route</string>
+    <string name="plus_avoid_confirm_road" translatable="false">This route will no longer use %s. It\'s calculated again now.</string>
+    <string name="plus_avoid_confirm_area" translatable="false">This route will no longer pass through %1$s (within %2$s of its centre). It\'s calculated again now.</string>
     <string name="plus_avoid_this_road" translatable="false">this road</string>
-    <string name="plus_avoid_radius_item" translatable="false">%s around it</string>
-    <string name="plus_avoid_radius_title" translatable="false">How far around this point?</string>
-    <string name="plus_avoid_added" translatable="false">Car routes now avoid %s. You can switch it off or delete it in Settings → Navigation → Avoided roads and places.</string>
+    <string name="plus_avoid_added" translatable="false">This route now avoids %s.</string>
+    <string name="plus_avoid_remove_button" translatable="false">Don\'t avoid</string>
+    <string name="plus_avoid_remove_title" translatable="false">Stop avoiding on this route</string>
+    <string name="plus_avoid_confirm_remove" translatable="false">This route may use %s again. It\'s calculated again now.</string>
+    <string name="plus_avoid_removed" translatable="false">This route no longer avoids %s.</string>
     <string name="plus_avoid_road_named" translatable="false">Road: %s</string>
     <string name="plus_avoid_road_unnamed" translatable="false">Unnamed road</string>
     <string name="plus_avoid_area_named" translatable="false">Area of %s</string>
-    <string name="plus_avoid_list_title" translatable="false">Avoided roads and places</string>
-    <string name="plus_avoid_list_summary" translatable="false">%1$d on, %2$d in total</string>
-    <string name="plus_avoid_list_summary_none" translatable="false">None yet. With a car route shown, tap a town or a point on the route, then Avoid.</string>
-    <string name="plus_avoid_hint" translatable="false">Car routes never use these roads or pass through these areas, except when your start, destination or a stop is in one; they are drawn in red on the map. To add one, show a car route, then tap a town or village the route passes through, or tap (or long-press) a point on the route, and choose Avoid; it may be under More.</string>
-    <string name="plus_avoid_empty" translatable="false">Nothing avoided yet.</string>
-    <string name="plus_avoid_show_on_map" translatable="false">Show on map</string>
-    <string name="plus_avoid_change_radius" translatable="false">Change size</string>
-    <string name="plus_avoid_no_route" translatable="false">Your avoided roads and places may be blocking every route. You can switch some off in Settings → Navigation → Avoided roads and places.</string>
+    <string name="plus_avoid_no_route" translatable="false">The roads and places this route avoids may be blocking every way there. Tap one drawn in red and choose Don\'t avoid.</string>
 </resources>

@@ -1,5 +1,6 @@
-// Comaps++: roads and areas kept out of car routes (roadmap item 1). The list lives in the core
-// (routing/plus_avoid_places.hpp), which every car route reads; nothing is prepared for it.
+// Comaps++: roads and areas kept out of the current car route (roadmap item 1). The list lives in the core
+// (routing/plus_avoid_places.hpp) for as long as the route does; nothing is prepared for it and nothing is
+// stored apart from the route.
 
 #include "app/organicmaps/sdk/Framework.hpp"
 #include "app/organicmaps/sdk/core/jni_helper.hpp"
@@ -16,91 +17,47 @@
 
 #include "geometry/mercator.hpp"
 
-#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace
 {
-constexpr size_t kNumbersPerPlace = 5;  // kind, lat, lon, radius (m), enabled (0/1)
-
-// What Avoid would keep out of car routes for the place shown in the place page, given the current car route
-// (routing::plus_avoid::RouteAvoidOption): the settlement the route passes through, or the route's road at
-// that point. Kept for nativeAddPending.
+// What the place page offers for the place shown in it, kept for nativeApplyPending: avoiding the settlement
+// the route passes through or the route's road at that point (routing::plus_avoid::RouteAvoidOption), or no
+// longer avoiding a place this route avoids (the point lies in it).
 std::optional<routing::plus_avoid::Place> g_pending;
+bool g_pendingRemoval = false;
 }  // namespace
 
 extern "C"
 {
-// kNumbersPerPlace numbers per place, in list order.
-JNIEXPORT jdoubleArray JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeGetNumbers(JNIEnv * env, jclass)
-{
-  auto const places = routing::plus_avoid::GetPlaces();
-  std::vector<double> numbers;
-  for (auto const & p : places)
-  {
-    numbers.push_back(static_cast<double>(p.kind));
-    numbers.push_back(p.lat);
-    numbers.push_back(p.lon);
-    numbers.push_back(p.radiusM);
-    numbers.push_back(p.enabled ? 1.0 : 0.0);
-  }
-  jdoubleArray result = env->NewDoubleArray(static_cast<jsize>(numbers.size()));
-  env->SetDoubleArrayRegion(result, 0, static_cast<jsize>(numbers.size()), numbers.data());
-  return result;
-}
-
-JNIEXPORT jobjectArray JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeGetNames(JNIEnv * env, jclass)
-{
-  std::vector<std::string> names;
-  for (auto const & p : routing::plus_avoid::GetPlaces())
-    names.push_back(p.name);
-  return jni::ToJavaStringArray(env, names);
-}
-
-// Replaces and saves the list. |numbers| as nativeGetNumbers returns them, |names| one per place.
-JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeSet(JNIEnv * env, jclass,
-                                                                                 jdoubleArray numbers,
-                                                                                 jobjectArray names)
-{
-  jsize const count = env->GetArrayLength(names);
-  if (env->GetArrayLength(numbers) != count * static_cast<jsize>(kNumbersPerPlace))
-    return;
-  std::vector<double> n(static_cast<size_t>(count) * kNumbersPerPlace);
-  env->GetDoubleArrayRegion(numbers, 0, static_cast<jsize>(n.size()), n.data());
-  std::vector<routing::plus_avoid::Place> places;
-  for (jsize i = 0; i < count; ++i)
-  {
-    double const * v = n.data() + i * kNumbersPerPlace;
-    routing::plus_avoid::Place p;
-    p.kind = v[0] == 1 ? routing::plus_avoid::Place::Kind::Road : routing::plus_avoid::Place::Kind::Area;
-    p.lat = v[1];
-    p.lon = v[2];
-    p.radiusM = static_cast<uint32_t>(std::max(0.0, v[3]));
-    p.enabled = v[4] != 0;
-    auto * name = static_cast<jstring>(env->GetObjectArrayElement(names, i));
-    p.name = name ? jni::ToNativeString(env, name) : std::string();
-    if (name)
-      env->DeleteLocalRef(name);
-    places.push_back(std::move(p));
-  }
-  routing::plus_avoid::SetPlaces(places);
-  frm()->PlusShowAvoidPlaces();
-}
-
 JNIEXPORT jboolean JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativePrepareRouteAvoid(JNIEnv *, jclass)
 {
   CHECK(g_framework, ("Framework isn't created yet!"));
   g_pending.reset();
+  g_pendingRemoval = false;
   auto & rm = frm()->GetRoutingManager();
   if (!frm()->HasPlacePageInfo() || rm.GetCurrentRouterType() != routing::RouterType::Vehicle)
     return false;
-  auto const route = rm.RoutingSession().GetRoute();
-  if (!route || !route->IsValid())
-    return false;
   auto const & info = frm()->GetCurrentPlacePageInfo();
   if (info.IsMyPosition())
+    return false;
+  auto & storage = frm()->GetStorage();
+  routing::CarModelFactory models([&storage](std::string const & id) { return storage.GetParentIdFor(id); });
+
+  // A place this route already avoids (drawn in red): offer to stop avoiding it. Works without a route too,
+  // so a route that avoided places left impossible can be fixed.
+  auto const places = routing::plus_avoid::GetPlaces();
+  if (auto const i = routing::plus_avoid::PlaceAt(places, info.GetMercator(), frm()->GetDataSource(), models))
+  {
+    g_pending = places[*i];
+    g_pendingRemoval = true;
+    return true;
+  }
+
+  auto const route = rm.RoutingSession().GetRoute();
+  if (!route || !route->IsValid())
     return false;
   routing::plus_avoid::Tapped tapped;
   tapped.point = info.GetMercator();
@@ -121,10 +78,14 @@ JNIEXPORT jboolean JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nati
   std::vector<m2::PointD> checkpoints;
   for (auto const & p : rm.GetRoutePoints())
     checkpoints.push_back(p.m_position);
-  auto & storage = frm()->GetStorage();
-  routing::CarModelFactory models([&storage](std::string const & id) { return storage.GetParentIdFor(id); });
   g_pending = routing::plus_avoid::RouteAvoidOption(*route, checkpoints, tapped, frm()->GetDataSource(), models);
   return g_pending.has_value();
+}
+
+// Whether the prepared place is one the route already avoids (the place page offers Don't avoid).
+JNIEXPORT jboolean JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeIsPendingRemoval(JNIEnv *, jclass)
+{
+  return g_pending && g_pendingRemoval;
 }
 
 // {kind, radius in metres} of the prepared place (empty if none).
@@ -144,16 +105,26 @@ JNIEXPORT jstring JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativ
   return jni::ToJavaString(env, g_pending ? g_pending->name : std::string());
 }
 
-// Adds the prepared place to the list.
-JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeAddPending(JNIEnv *, jclass)
+// Adds the prepared place to the current route's avoided places, or removes it from them. The map redraws them
+// by itself; the caller recalculates the route.
+JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeApplyPending(JNIEnv *, jclass)
 {
   if (!g_pending)
     return;
   auto places = routing::plus_avoid::GetPlaces();
-  places.push_back(*g_pending);
+  if (g_pendingRemoval)
+    std::erase(places, *g_pending);
+  else
+    places.push_back(*g_pending);
   routing::plus_avoid::SetPlaces(places);
   g_pending.reset();
-  frm()->PlusShowAvoidPlaces();
+  g_pendingRemoval = false;
+}
+
+// How many places the current route avoids.
+JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusAvoidPlaces_nativeCount(JNIEnv *, jclass)
+{
+  return static_cast<jint>(routing::plus_avoid::GetPlaces().size());
 }
 
 // How many avoided places applied to the last car route: they covered roads and weren't at its start, finish or

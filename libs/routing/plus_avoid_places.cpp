@@ -19,9 +19,9 @@
 
 #include "base/string_utils.hpp"
 
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -33,27 +33,28 @@ namespace plus_avoid
 {
 namespace
 {
-std::string_view constexpr kSettingsKey = "PlusAvoidPlaces";
+// Where earlier versions kept a permanent list. Avoided places now belong to a route; the old list is
+// removed the first time the list is read.
+std::string_view constexpr kOldSettingsKey = "PlusAvoidPlaces";
 
 std::mutex g_mutex;
 bool g_loaded = false;
 std::vector<Place> g_places;
-std::atomic<uint64_t> g_generation{1};
+std::function<void()> g_listener;
 
 void LoadLocked()
 {
   if (g_loaded)
     return;
   g_loaded = true;
-  // Desktop tools and tests set the list through the environment.
   if (char const * env = std::getenv("COMAPS_PLUS_AVOID_PLACES"))
   {
     Deserialize(env, g_places);
     return;
   }
-  std::string s;
-  if (settings::Get(kSettingsKey, s))
-    Deserialize(s, g_places);
+  std::string old;
+  if (settings::Get(kOldSettingsKey, old))
+    settings::Delete(kOldSettingsKey);
 }
 }  // namespace
 
@@ -66,22 +67,34 @@ std::vector<Place> GetPlaces()
 
 void SetPlaces(std::vector<Place> const & places)
 {
-  std::lock_guard lock(g_mutex);
-  g_loaded = true;
-  if (places == g_places)
-    return;
-  g_places = places;
-  settings::Set(kSettingsKey, Serialize(g_places));
-  ++g_generation;
+  std::function<void()> listener;
+  {
+    std::lock_guard lock(g_mutex);
+    LoadLocked();
+    if (places == g_places)
+      return;
+    g_places = places;
+    listener = g_listener;
+  }
+  if (listener)
+    listener();
 }
 
-uint64_t Generation()
+void ClearPlaces()
 {
-  return g_generation.load();
+  SetPlaces({});
+}
+
+void SetChangeListener(std::function<void()> listener)
+{
+  std::lock_guard lock(g_mutex);
+  g_listener = std::move(listener);
 }
 
 // One place per entry, entries separated by ';':
-// <version 1>,<kind 0|1>,<lat>,<lon>,<radius m>,<enabled 0|1>,<url-encoded name>
+// <version 2>,<kind 0|1>,<lat>,<lon>,<radius m>,<url-encoded name>
+// Version 1 (the old permanent list, still used in test scripts) had <enabled 0|1> before the name; switched
+// off entries are dropped.
 std::string Serialize(std::vector<Place> const & places)
 {
   std::ostringstream os;
@@ -91,8 +104,8 @@ std::string Serialize(std::vector<Place> const & places)
     auto const & p = places[i];
     if (i > 0)
       os << ';';
-    os << 1 << ',' << static_cast<int>(p.kind) << ',' << p.lat << ',' << p.lon << ',' << p.radiusM << ','
-       << (p.enabled ? 1 : 0) << ',' << url::UrlEncode(p.name);
+    os << 2 << ',' << static_cast<int>(p.kind) << ',' << p.lat << ',' << p.lon << ',' << p.radiusM << ','
+       << url::UrlEncode(p.name);
   }
   return os.str();
 }
@@ -119,18 +132,21 @@ bool Deserialize(std::string const & s, std::vector<Place> & places)
     int version = 0, kind = 0, enabled = 1;
     unsigned radius = 0;
     Place p;
-    if (f.size() < 7 || !strings::to_int(f[0], version) || version != 1 || !strings::to_int(f[1], kind) ||
-        kind < 0 || kind > 1 || !strings::to_double(f[2].c_str(), p.lat) ||
-        !strings::to_double(f[3].c_str(), p.lon) || !strings::to_uint(f[4], radius) ||
-        !strings::to_int(f[5], enabled) || std::fabs(p.lat) > 90 || std::fabs(p.lon) > 180)
+    bool const known = !f.empty() && strings::to_int(f[0], version) && (version == 1 || version == 2) &&
+                       f.size() >= (version == 1 ? 7u : 6u);
+    if (!known || !strings::to_int(f[1], kind) || kind < 0 || kind > 1 ||
+        !strings::to_double(f[2].c_str(), p.lat) || !strings::to_double(f[3].c_str(), p.lon) ||
+        !strings::to_uint(f[4], radius) || (version == 1 && !strings::to_int(f[5], enabled)) ||
+        std::fabs(p.lat) > 90 || std::fabs(p.lon) > 180)
     {
       ok = false;  // skip what this version can't read, keep the rest
       continue;
     }
+    if (enabled == 0)
+      continue;
     p.kind = static_cast<Place::Kind>(kind);
     p.radiusM = radius;
-    p.enabled = enabled != 0;
-    p.name = url::UrlDecode(f[6]);
+    p.name = url::UrlDecode(f[version == 1 ? 6 : 5]);
     places.push_back(std::move(p));
   }
   return ok;
@@ -278,6 +294,28 @@ std::optional<Place> RouteAvoidOption(Route const & route, std::vector<m2::Point
   p.lon = ll.m_lon;
   p.name = RoadLabel(*road);
   return p;
+}
+
+std::optional<size_t> PlaceAt(std::vector<Place> const & places, m2::PointD const & point,
+                              DataSource const & dataSource, VehicleModelFactoryInterface & models)
+{
+  for (size_t i = 0; i < places.size(); ++i)
+  {
+    auto const & place = places[i];
+    m2::PointD const center = mercator::FromLatLon(place.lat, place.lon);
+    if (place.kind == Place::Kind::Area)
+    {
+      double const radius = std::clamp<double>(place.radiusM, kMinAreaRadiusM, kMaxAreaRadiusM);
+      if (mercator::DistanceOnEarth(center, point) <= radius)
+        return i;
+      continue;
+    }
+    auto const roads = FindRoads(dataSource, models, center, kRoadPickRadiusM);
+    for (size_t r : PickRoad(roads, place.name))
+      if (DistanceToPolyline(point, roads[r].points) <= kOnRouteM)
+        return i;
+  }
+  return {};
 }
 
 std::string RoadLabel(RoadNearby const & road)
