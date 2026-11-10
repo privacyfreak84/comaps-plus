@@ -9,39 +9,53 @@ import app.organicmaps.sdk.routing.PlusAvoidPlaces;
 import app.organicmaps.sdk.routing.PlusOverlay;
 import app.organicmaps.sdk.routing.RoutingController;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.function.IntConsumer;
 
 /**
- * Comaps++ roadmap item 1: "Avoid" on the place page. Keeps car routes off the road at that point, or out of
- * an area around it. Nothing is prepared: the next route already avoids it.
+ * Comaps++ roadmap item 1: "Avoid" on the place page while a car route is shown. For a settlement the route
+ * passes through it keeps routes out of that settlement; for any other point on the route, off the route's
+ * road there. Nothing is prepared: the route is recalculated straight away.
  */
 public final class PlusAvoidPlaceDialog
 {
-  static final int[] RADII_M = {100, 250, 500, 1000, 2000, 5000};
+  static final int[] RADII_M = {100, 250, 500, 1000, 2000, 5000, 10000, 20000};
   static final int DEFAULT_RADIUS_INDEX = 1;
 
   private PlusAvoidPlaceDialog() {}
 
-  public static void show(@NonNull Activity activity, double lat, double lon)
+  /** Whether the place page should offer Avoid (see PlusAvoidPlaces.nativePrepareRouteAvoid). */
+  public static boolean available()
   {
-    final String road = PlusAvoidPlaces.nativeRoadAt(lat, lon);
-    final List<CharSequence> items = new ArrayList<>();
-    if (road != null)
-      items.add(road.isEmpty() ? activity.getString(R.string.plus_avoid_this_road_unnamed)
-                               : activity.getString(R.string.plus_avoid_this_road, road));
-    items.add(activity.getString(R.string.plus_avoid_this_area));
+    return PlusAvoidPlaces.nativePrepareRouteAvoid();
+  }
+
+  /** Asks to confirm the place prepared by available(), then adds it and recalculates the route. */
+  public static void show(@NonNull Activity activity)
+  {
+    final double[] n = PlusAvoidPlaces.nativePendingNumbers();
+    if (n.length < 2)
+      return;
+    final PlusAvoidPlaces.Place place = new PlusAvoidPlaces.Place();
+    place.kind = (int) n[0];
+    place.radiusM = (int) n[1];
+    place.name = PlusAvoidPlaces.nativePendingName();
     new MaterialAlertDialogBuilder(activity)
         .setTitle(R.string.plus_avoid_title)
-        .setItems(items.toArray(new CharSequence[0]),
-                  (dialog, which) -> {
-                    if (road != null && which == 0)
-                      add(activity, PlusAvoidPlaces.Place.road(lat, lon, road));
-                    else
-                      chooseRadius(activity, RADII_M[DEFAULT_RADIUS_INDEX],
-                                   radius -> add(activity, PlusAvoidPlaces.Place.area(lat, lon, radius)));
-                  })
+        .setMessage(place.kind == PlusAvoidPlaces.KIND_ROAD
+                        ? activity.getString(R.string.plus_avoid_confirm_road,
+                                             place.name.isEmpty() ? activity.getString(R.string.plus_avoid_this_road)
+                                                                  : place.name)
+                        : activity.getString(R.string.plus_avoid_confirm_area, describe(activity, place),
+                                             distance(place.radiusM)))
+        .setPositiveButton(R.string.plus_avoid_button,
+                           (dialog, which) -> {
+                             PlusAvoidPlaces.nativeAddPending();
+                             Toast
+                                 .makeText(activity, activity.getString(R.string.plus_avoid_added, describe(activity, place)),
+                                           Toast.LENGTH_LONG)
+                                 .show();
+                             refreshRoute();
+                           })
         .setNegativeButton(R.string.cancel, null)
         .show();
   }
@@ -67,15 +81,6 @@ public final class PlusAvoidPlaceDialog
         .show();
   }
 
-  private static void add(@NonNull Activity activity, @NonNull PlusAvoidPlaces.Place place)
-  {
-    PlusAvoidPlaces.add(place);
-    Toast.makeText(activity, activity.getString(R.string.plus_avoid_added, describe(activity, place)),
-                   Toast.LENGTH_LONG)
-        .show();
-    refreshRoute();
-  }
-
   /** The current car route, calculated again with the changed list. */
   public static void refreshRoute()
   {
@@ -94,6 +99,8 @@ public final class PlusAvoidPlaceDialog
     if (place.kind == PlusAvoidPlaces.KIND_ROAD)
       return place.name.isEmpty() ? context.getString(R.string.plus_avoid_road_unnamed)
                                   : context.getString(R.string.plus_avoid_road_named, place.name);
+    if (!place.name.isEmpty())
+      return place.name;
     return context.getString(R.string.plus_avoid_area_named, distance(place.radiusM));
   }
 

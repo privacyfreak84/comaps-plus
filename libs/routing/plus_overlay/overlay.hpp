@@ -132,6 +132,9 @@ struct LevelOverlay
   // entry and exit (a route avoiding a type never stands on such an entry or exit). A route avoiding none of
   // them gets the same times from the cell's cliques as from its roads. Empty without Graph::fwdR.
   std::vector<uint8_t> cellRoads;
+  // The same per entry (its row: paths to every exit) and per exit (its column), parallel to entries / exits.
+  // A search avoiding none of an entry's types may use its row even when the cell as a whole relies on them.
+  std::vector<uint8_t> entryPathRoads, exitPathRoads;
   std::vector<uint8_t> role;                       // per vertex: bit 1 entry, bit 2 exit (of its cell)
 
   bool IsEntry(VertexId v) const { return role[v] & 1; }

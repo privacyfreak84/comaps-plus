@@ -23,7 +23,7 @@ public final class PlusAvoidPlaces
     /** Area only, metres. */
     public int radiusM;
     public boolean enabled = true;
-    /** Road: its name or number ("" for an unnamed road). Area: empty. */
+    /** Road: its name or number ("" for an unnamed road). Area: the settlement's name, if any. */
     @NonNull
     public String name = "";
 
@@ -108,11 +108,22 @@ public final class PlusAvoidPlaces
   }
 
   /**
-   * The car road "avoid this road" would pick at this point: its name or number ("" if it has neither), or
-   * null if no car road is near enough.
+   * Works out what Avoid means for the place shown in the place page while a car route is shown: the settlement
+   * the route passes through, or the route's own road at that point. False (no Avoid) without a car route, for
+   * places off the route, and for places the route has to go to anyway (its start, finish or a stop).
    */
-  @Nullable
-  public static native String nativeRoadAt(double lat, double lon);
+  public static native boolean nativePrepareRouteAvoid();
+
+  /** {kind, radius in metres} of the place nativePrepareRouteAvoid found (empty if none). */
+  @NonNull
+  public static native double[] nativePendingNumbers();
+
+  /** Name of that place: the settlement's, or the road's name or number ("" for an unnamed road). */
+  @NonNull
+  public static native String nativePendingName();
+
+  /** Adds that place to the list. */
+  public static native void nativeAddPending();
 
   /** How many avoided places applied to the last car route (covered roads, not at its ends or stops). */
   public static native int nativeLastApplied();

@@ -182,6 +182,8 @@ public:
   /// \brief returns points of route junctions.
   /// \returns true if there is valid route information. If the route is not valid returns false.
   bool GetRouteJunctionPoints(std::vector<geometry::PointWithAltitude> & routeJunctionPoints) const;
+  // Comaps++: the current route (null if none), for avoiding what the user taps on it.
+  std::shared_ptr<Route const> GetRoute() const;
 
   SessionState OnLocationPositionChanged(location::GpsInfo const & info);
   void GetRouteFollowingInfo(FollowingInfo & info) const;

@@ -679,7 +679,11 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
   uint64_t const e0 = L.entryOff[c], nEn = L.entryOff[c + 1] - e0;
   uint64_t const x0 = L.exitOff[c], nEx = L.exitOff[c + 1] - x0;
   if (!L.cellRoads.empty())
+  {
     L.cellRoads[c] = 0;
+    std::fill(L.entryPathRoads.begin() + L.entryOff[c], L.entryPathRoads.begin() + L.entryOff[c + 1], 0);
+    std::fill(L.exitPathRoads.begin() + L.exitOff[c], L.exitPathRoads.begin() + L.exitOff[c + 1], 0);
+  }
   if (nEn == 0 || nEx == 0)
     return;
   uint64_t const v0 = lc.off[c], nv = lc.off[c + 1] - v0;
@@ -769,7 +773,10 @@ void ComputeCell(Graph const & g, Partition const & p, Overlay & ov, size_t li, 
       if (!L.matR.empty() && reached)
       {
         L.matR[L.matOff[c] + i * nEx + j] = sc.r[ly];
-        L.cellRoads[c] |= sc.r[ly] & ~(g.SelfR(src) | g.SelfR(L.exits[x0 + j]));
+        uint8_t const r = sc.r[ly] & ~(g.SelfR(src) | g.SelfR(L.exits[x0 + j]));
+        L.cellRoads[c] |= r;
+        L.entryPathRoads[e0 + i] |= r;
+        L.exitPathRoads[x0 + j] |= r;
       }
     }
   }
@@ -794,11 +801,15 @@ std::vector<double> Customize(Graph const & g, Partition const & p, Overlay & ov
     {
       L.matR.assign(L.matOff[nc], 0);
       L.cellRoads.assign(nc, 0);
+      L.entryPathRoads.assign(L.entryOff[nc], 0);
+      L.exitPathRoads.assign(L.exitOff[nc], 0);
     }
     else
     {
       L.matR.clear();
       L.cellRoads.clear();
+      L.entryPathRoads.clear();
+      L.exitPathRoads.clear();
     }
     LevelCells const lc = CellVertexLists(g, p, ov, li);
     std::atomic<uint32_t> next{0};

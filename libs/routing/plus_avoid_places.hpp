@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,8 @@ class DataSource;
 
 namespace routing
 {
+class Route;
+
 namespace plus_avoid
 {
 struct Place
@@ -43,7 +46,7 @@ struct Place
   uint32_t radiusM = 0;  // Area only
   bool enabled = true;
   // Shown in the list. For a road: its name or number, preferred over a nearer road when the road is
-  // looked up again in a later route or map version.
+  // looked up again in a later route or map version. For an area: the settlement's name, if any.
   std::string name;
 
   bool operator==(Place const & o) const
@@ -95,6 +98,23 @@ std::string RoadLabel(RoadNearby const & road);
 
 // Distance from |p| to the polyline |points| (metres).
 double DistanceToPolyline(m2::PointD const & p, std::vector<m2::PointD> const & points);
+
+// What "Avoid" means for a place the user taps while a car route is shown (roadmap item 1). A settlement
+// the route passes through: that settlement, as an area sized by its population (|settlementRadiusM|,
+// ftypes::GetRadiusByPopulationForRouting). Any other point on the route (within kOnRouteM): the route's
+// own road there. Anything else, or a place the route has to go to anyway (its start, finish or a stop is
+// in it): nothing.
+constexpr double kOnRouteM = 40.0;
+struct Tapped
+{
+  m2::PointD point;  // mercator
+  bool settlement = false;
+  double settlementRadiusM = 0;
+  std::string settlementName;
+};
+std::optional<Place> RouteAvoidOption(Route const & route, std::vector<m2::PointD> const & checkpoints,
+                                      Tapped const & tapped, DataSource const & dataSource,
+                                      VehicleModelFactoryInterface & models);
 
 // Road segments left out of car routes in one map: feature id -> segment indices, ascending (empty: every
 // segment of the feature).

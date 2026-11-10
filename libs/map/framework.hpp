@@ -224,6 +224,7 @@ protected:
   SearchMarks m_searchMarks;
 
   df::DrapeApi m_drapeApi;
+  size_t m_plusAvoidLines = 0;  // lines PlusShowAvoidPlaces added to m_drapeApi
 
   bool m_isRenderingEnabled;
 
@@ -321,6 +322,9 @@ public:
   void SwitchToUsingVehicleStyle(bool const shouldUseVehicleStyle);
 
   df::DrapeApi & GetDrapeApi() { return m_drapeApi; }
+  // Comaps++: draws the enabled avoided roads and places (routing/plus_avoid_places.hpp) on the map; call
+  // after the list changes.
+  void PlusShowAvoidPlaces();
 
   /// \returns true if there're unsaved changes in map with |countryId| and false otherwise.
   /// \note It works for group and leaf node.

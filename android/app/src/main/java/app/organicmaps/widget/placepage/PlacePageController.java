@@ -515,11 +515,7 @@ public class PlacePageController
     case ROUTE_AVOID_TOLL -> onAvoidTollBtnClicked();
     case ROUTE_AVOID_UNPAVED -> onAvoidUnpavedBtnClicked();
     case ROUTE_AVOID_FERRY -> onAvoidFerryBtnClicked();
-    case AVOID_PLACE ->
-    {
-      if (mMapObject != null)
-        app.organicmaps.routing.PlusAvoidPlaceDialog.show(requireActivity(), mMapObject.getLat(), mMapObject.getLon());
-    }
+    case AVOID_PLACE -> app.organicmaps.routing.PlusAvoidPlaceDialog.show(requireActivity());
     }
   }
 
@@ -729,8 +725,8 @@ public class PlacePageController
           buttons.add(mapObject.isBookmark() ? PlacePageButtons.ButtonType.BOOKMARK_DELETE
                                              : PlacePageButtons.ButtonType.BOOKMARK_SAVE);
       }
-      // Comaps++: keep car routes away from this road or area (roadmap item 1).
-      if (!mapObject.isMyPosition())
+      // Comaps++: with a car route shown, keep it out of this settlement or off this road (roadmap item 1).
+      if (!mapObject.isMyPosition() && app.organicmaps.routing.PlusAvoidPlaceDialog.available())
         buttons.add(PlacePageButtons.ButtonType.AVOID_PLACE);
     }
     mViewModel.setCurrentButtons(buttons);

@@ -1,5 +1,8 @@
 #include "routing/plus_avoid_places.hpp"
 
+#include "routing/index_graph_starter.hpp"
+#include "routing/route.hpp"
+
 #include "indexer/data_source.hpp"
 #include "indexer/feature.hpp"
 #include "indexer/feature_data.hpp"
@@ -190,7 +193,8 @@ std::vector<RoadNearby> FindRoads(DataSource const & dataSource, VehicleModelFac
 
 std::vector<size_t> PickRoad(std::vector<RoadNearby> const & roads, std::string const & name)
 {
-  auto const matches = [&name](RoadNearby const & r) { return !name.empty() && (r.name == name || r.ref == name); };
+  auto const matches = [&name](RoadNearby const & r)
+  { return !name.empty() && (r.name == name || r.ref == name || RoadLabel(r) == name); };
   bool const anyMatch = std::any_of(roads.begin(), roads.end(), matches);
   RoadNearby const * best = nullptr;
   for (auto const & r : roads)
@@ -207,9 +211,81 @@ std::vector<size_t> PickRoad(std::vector<RoadNearby> const & roads, std::string 
   return picked;
 }
 
+std::optional<Place> RouteAvoidOption(Route const & route, std::vector<m2::PointD> const & checkpoints,
+                                      Tapped const & tapped, DataSource const & dataSource,
+                                      VehicleModelFactoryInterface & models)
+{
+  auto const & poly = route.GetPoly().GetPoints();
+  auto const & segments = route.GetRouteSegments();
+  if (poly.size() < 2)
+    return {};
+  auto nearEnd = [&](m2::PointD const & p, double margin)
+  {
+    return std::any_of(checkpoints.begin(), checkpoints.end(),
+                       [&](m2::PointD const & c) { return mercator::DistanceOnEarth(c, p) <= margin; });
+  };
+
+  if (tapped.settlement)
+  {
+    double const radius = std::clamp<double>(tapped.settlementRadiusM, kMinAreaRadiusM, kMaxAreaRadiusM);
+    if (DistanceToPolyline(tapped.point, poly) > radius || nearEnd(tapped.point, radius + kCheckpointMarginM))
+      return {};
+    auto const ll = mercator::ToLatLon(tapped.point);
+    Place p;
+    p.kind = Place::Kind::Area;
+    p.lat = ll.m_lat;
+    p.lon = ll.m_lon;
+    p.radiusM = static_cast<uint32_t>(std::lround(radius));
+    p.name = tapped.settlementName;
+    return p;
+  }
+
+  // The route's segment nearest to the point.
+  size_t best = 0;
+  double bestDist = std::numeric_limits<double>::max();
+  size_t const n = std::min(segments.size(), poly.size() - 1);
+  for (size_t i = 0; i < n; ++i)
+  {
+    double const d = SegmentDistance(tapped.point, poly[i], poly[i + 1]);
+    if (d < bestDist)
+    {
+      bestDist = d;
+      best = i;
+    }
+  }
+  if (bestDist > kOnRouteM)
+    return {};
+  auto const & seg = segments[best].GetSegment();
+  if (IndexGraphStarter::IsFakeSegment(seg))
+    return {};
+  // Saved at the middle of that segment, which lies on the route's road (a point at a junction could pick a
+  // crossing road later), with the road's name or number as the maps store it.
+  m2::PointD const mid = (poly[best] + poly[best + 1]) / 2;
+  auto const roads = FindRoads(dataSource, models, mid, kRoadPickRadiusM);
+  RoadNearby const * road = nullptr;
+  for (auto const & r : roads)
+    if (r.id.m_index == seg.GetFeatureId() && (!road || r.distM < road->distM))
+      road = &r;
+  if (!road)
+    return {};
+  for (auto const & c : checkpoints)
+    if (DistanceToPolyline(c, road->points) <= kCheckpointMarginM)
+      return {};
+  auto const ll = mercator::ToLatLon(mid);
+  Place p;
+  p.kind = Place::Kind::Road;
+  p.lat = ll.m_lat;
+  p.lon = ll.m_lon;
+  p.name = RoadLabel(*road);
+  return p;
+}
+
 std::string RoadLabel(RoadNearby const & road)
 {
-  return road.name.empty() ? road.ref : road.name;
+  if (!road.name.empty())
+    return road.name;
+  // A road with several numbers ("NH135A;IN:NH/135A"): the first.
+  return road.ref.substr(0, road.ref.find(';'));
 }
 }  // namespace plus_avoid
 }  // namespace routing
