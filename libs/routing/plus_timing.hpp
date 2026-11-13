@@ -7,7 +7,7 @@
 #include <string>
 #include <utility>
 
-// Comaps++ routing timing. Every line is logged with the "[plus-timing]" tag.
+// Tabula routing timing. Every line is logged with the "[plus-timing]" tag.
 // "visited" is the number of vertices the A* searches settled inside the scope.
 namespace routing::plus_timing
 {

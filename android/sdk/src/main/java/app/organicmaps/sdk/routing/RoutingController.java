@@ -145,7 +145,7 @@ public class RoutingController
     }
   };
 
-  // Comaps++: told about every car routing result (the app can show which router answered).
+  // Tabula: told about every car routing result (the app can show which router answered).
   public interface CarRouteResultListener
   {
     void onCarRouteResult(int resultCode);

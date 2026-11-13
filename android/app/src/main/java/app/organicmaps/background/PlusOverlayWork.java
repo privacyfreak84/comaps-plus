@@ -39,7 +39,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Comaps++: builds the overlay files for fast car routing on the phone, one map at a time, after a map
+ * Tabula: builds the overlay files for fast car routing on the phone, one map at a time, after a map
  * download or update (and at app start for anything missed). Shows a progress notification with a
  * Cancel button; cancelling stops the running build until the app starts again or a route needs a map.
  * Until a map's base file is built, routes cross that map on estimates (see PlusRouteStatus); maps a

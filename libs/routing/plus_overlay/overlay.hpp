@@ -1,6 +1,6 @@
 #pragma once
 
-// Comaps++ cell-overlay prototype (multi-level Dijkstra / CRP style).
+// Tabula cell-overlay prototype (multi-level Dijkstra / CRP style).
 //
 // Everything here works on a plain directed graph whose vertices are CoMaps routing segments
 // (feature, segment index, direction) and whose edge weights are exactly what

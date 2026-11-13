@@ -725,7 +725,7 @@ public class PlacePageController
           buttons.add(mapObject.isBookmark() ? PlacePageButtons.ButtonType.BOOKMARK_DELETE
                                              : PlacePageButtons.ButtonType.BOOKMARK_SAVE);
       }
-      // Comaps++: with a car route shown, keep it out of this settlement or off this road, or stop avoiding a
+      // Tabula: with a car route shown, keep it out of this settlement or off this road, or stop avoiding a
       // place it avoids (roadmap item 1).
       if (!mapObject.isMyPosition() && app.organicmaps.routing.PlusAvoidPlaceDialog.available())
         buttons.add(app.organicmaps.routing.PlusAvoidPlaceDialog.isRemoval()

@@ -1,6 +1,6 @@
 #pragma once
 
-// Comaps++ per-map overlay file.
+// Tabula per-map overlay file.
 //
 // One file per map (<map name>.plusovl next to the .mwm). It holds no road graph: CoMaps' own
 // IndexGraph supplies the base edges at query time. Contents:

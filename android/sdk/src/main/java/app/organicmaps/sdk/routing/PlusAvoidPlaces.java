@@ -3,7 +3,7 @@ package app.organicmaps.sdk.routing;
 import androidx.annotation.NonNull;
 
 /**
- * Comaps++: roads and areas kept out of the current car route. They belong to that route: they're cleared when
+ * Tabula: roads and areas kept out of the current car route. They belong to that route: they're cleared when
  * the route is closed, saved with it when it's saved, and never stored on their own. Nothing has to be prepared
  * for them. A place at a route's start, finish or a stop doesn't apply to it.
  */

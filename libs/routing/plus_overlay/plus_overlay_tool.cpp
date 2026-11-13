@@ -1,4 +1,4 @@
-// Comaps++ cell-overlay prototype driver.
+// Tabula cell-overlay prototype driver.
 //
 // 1. Loads one MWM's car IndexGraph exactly as the router does and extracts the full segment
 //    graph (vertex = directed segment, edge weights from IndexGraph::GetEdgeList).
@@ -650,7 +650,7 @@ int main(int argc, char ** argv)
   std::cout << std::unitbuf;
   std::cout.setf(std::ios::fixed);
   std::cout.precision(3);
-  std::cout << "== Comaps++ overlay prototype: " << FLAGS_mwm << " v" << FLAGS_mwm_version << "\n";
+  std::cout << "== Tabula overlay prototype: " << FLAGS_mwm << " v" << FLAGS_mwm_version << "\n";
 
   std::unique_ptr<CoMaps> cm;
   auto ensureCoMaps = [&]()

@@ -29,7 +29,7 @@ public:
   virtual std::vector<RouteSegment::SpeedCamera> GetSpeedCameraInfo(Segment const & segment) = 0;
   virtual void Clear() = 0;
 
-  // Comaps++: segments of avoided places per map, set on every graph loaded from now on.
+  // Tabula: segments of avoided places per map, set on every graph loaded from now on.
   virtual void SetPlusBlocked(plus_avoid::BlockedByMap /* blocked */) {}
 
   static std::unique_ptr<IndexGraphLoader> Create(VehicleType vehicleType, bool loadAltitudes,

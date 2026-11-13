@@ -389,7 +389,7 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
     };
     SCOPE_GUARD(plusReport, publishReport);
 
-    // Comaps++: car reroutes are full overlay routes (best route from the new position, 0.3-3 s); CoMaps'
+    // Tabula: car reroutes are full overlay routes (best route from the new position, 0.3-3 s); CoMaps'
     // rejoin search is kept for the other vehicle types and when the overlay is switched off.
     bool const plusSkipsAdjust = m_vehicleType == VehicleType::Car && !PlusOverlayDisabled();
     if (adjustToPrevRoute && !plusSkipsAdjust && m_lastRoute && m_lastFakeEdges &&
@@ -839,7 +839,7 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
 
   if (result == plus_overlay::OverlayRouter::Result::Ok)
   {
-    LOG(LINFO, ("Comaps++ overlay route (avoid options", avoidMask, "):", stats.ms, "ms,", stats.settled, "settled,", stats.baseScans,
+    LOG(LINFO, ("Tabula overlay route (avoid options", avoidMask, "):", stats.ms, "ms,", stats.settled, "settled,", stats.baseScans,
                 "edge lists,", stats.mapsUsed, "maps, weight", stats.weight, "; phases ms: ends", stats.fakeMs, "seeds",
                 stats.seedMs, "search", stats.searchMs, "unpack", stats.unpackMs));
     for (auto const id : stats.approxMaps)
@@ -849,7 +849,7 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
         m_plusApproxMaps.push_back(name);
     }
     if (!stats.approxMaps.empty())
-      LOG(LINFO, ("Comaps++ overlay: approximate through", m_plusApproxMaps, "(overlay not built yet)"));
+      LOG(LINFO, ("Tabula overlay: approximate through", m_plusApproxMaps, "(overlay not built yet)"));
     if (!m_plusBlocked.empty())
     {
       size_t onBlocked = 0;
@@ -861,7 +861,7 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
         if (it != m_plusBlocked.end() && it->second->IsBlocked(sg.GetFeatureId(), sg.GetSegmentIdx()))
           ++onBlocked;
       }
-      LOG(onBlocked == 0 ? LINFO : LERROR, ("Comaps++ overlay: avoided places,", stats.blockedCells,
+      LOG(onBlocked == 0 ? LINFO : LERROR, ("Tabula overlay: avoided places,", stats.blockedCells,
                                             "level-1 cells searched on their roads,", onBlocked,
                                             "route segments in avoided places"));
     }
@@ -872,11 +872,11 @@ RouterResultCode IndexRouter::TryPlusOverlay(IndexGraphStarter & starter, Router
   {
     // The overlay holds every road of every map the search reached: the normal search would explore the
     // same roads (slowly) and find nothing either.
-    LOG(LINFO, ("Comaps++ overlay: no route"));
+    LOG(LINFO, ("Tabula overlay: no route"));
     return RouterResultCode::RouteNotFound;
   }
   std::string why = stats.reason;
-  LOG(LINFO, ("Comaps++ overlay:", why, "- using the normal search"));
+  LOG(LINFO, ("Tabula overlay:", why, "- using the normal search"));
   return notApplicable(why);
 }
 
@@ -1114,7 +1114,7 @@ RouterResultCode IndexRouter::CalculateSubrouteLeapsOnlyMode(Checkpoints const &
 
     // Select best candidate by calculating start/end sub-routes and using candidateMidWeights.
     //
-    // Comaps++: candidates arrive sorted by the leaps estimate. COMAPS_PLUS_MAX_CANDIDATES=N scores
+    // Tabula: candidates arrive sorted by the leaps estimate. COMAPS_PLUS_MAX_CANDIDATES=N scores
     // only the first N of them. Unset or 0 scores all of them, as upstream does.
     size_t maxCandidates = candidates.size();
     if (char const * env = std::getenv("COMAPS_PLUS_MAX_CANDIDATES"))
@@ -1377,7 +1377,7 @@ void IndexRouter::PlusResolveAvoidPlaces(Checkpoints const & checkpoints)
     }
     m_plusBlocked[mwm] = std::make_shared<plus_avoid::Blocked const>(std::move(b));
   }
-  LOG(LINFO, ("Comaps++ avoided places:", m_plusAvoidPlacesUsed, "of", places.size(), "apply,", m_plusBlocked.size(),
+  LOG(LINFO, ("Tabula avoided places:", m_plusAvoidPlacesUsed, "of", places.size(), "apply,", m_plusBlocked.size(),
               "maps, in", timer.ElapsedSeconds(), "s"));
 }
 
@@ -2114,7 +2114,7 @@ void IndexRouter::SetupAlgorithmMode(IndexGraphStarter & starter, bool guidesAct
   case VehicleType::Transit: starter.GetGraph().SetMode(WorldGraphMode::NoLeaps); break;
   case VehicleType::Car:
   case VehicleType::Decoder:
-    // Comaps++: COMAPS_PLUS_FORCE_JOINTS=1 skips leaps and runs one search over all maps, for comparison.
+    // Tabula: COMAPS_PLUS_FORCE_JOINTS=1 skips leaps and runs one search over all maps, for comparison.
     if (std::getenv("COMAPS_PLUS_FORCE_JOINTS") != nullptr)
       starter.GetGraph().SetMode(WorldGraphMode::Joints);
     else

@@ -1,4 +1,4 @@
-// Comaps++ cell-overlay prototype across several MWMs (states).
+// Tabula cell-overlay prototype across several MWMs (states).
 //
 // Every MWM's segment graph is extracted as in plus_overlay_tool. The graphs are put into one
 // combined graph (vertex ids offset per MWM) and joined the way CoMaps' world graph joins them:
@@ -1210,7 +1210,7 @@ int main(int argc, char ** argv)
   std::cout.setf(std::ios::fixed);
   std::cout.precision(3);
   auto const mwms = SplitList(FLAGS_mwms, ';');
-  std::cout << "== Comaps++ multi-map overlay (" << FLAGS_mode << "): " << FLAGS_mwms << " v" << FLAGS_mwm_version
+  std::cout << "== Tabula multi-map overlay (" << FLAGS_mode << "): " << FLAGS_mwms << " v" << FLAGS_mwm_version
             << "\n";
   Multi m;
   m.Init(mwms);

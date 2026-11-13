@@ -11,7 +11,7 @@ import app.organicmaps.sdk.routing.RoutingController;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
 /**
- * Comaps++ roadmap item 1: Avoid on the place page while a car route is shown. For a settlement the route
+ * Tabula roadmap item 1: Avoid on the place page while a car route is shown. For a settlement the route
  * passes through it keeps this route out of that settlement; for any other point on the route, off the route's
  * road there. Tapping a place the route avoids (drawn in red) offers Don't avoid. The places belong to this route
  * only and go when it's closed. Nothing is prepared: the route is recalculated straight away.

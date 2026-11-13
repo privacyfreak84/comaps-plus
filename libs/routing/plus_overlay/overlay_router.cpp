@@ -133,7 +133,7 @@ struct OverlayRouter::Impl
       // rebuilds it: delete it, so the app's background job does (it builds whatever is missing).
       if (damaged)
       {
-        LOG(LWARNING, ("Comaps++ overlay: damaged file deleted:", mr.path, mr.error));
+        LOG(LWARNING, ("Tabula overlay: damaged file deleted:", mr.path, mr.error));
         std::remove(mr.path.c_str());
       }
       // Avoid options need no file of their own: the cells whose cliques use avoided road types are searched
@@ -168,7 +168,7 @@ struct OverlayRouter::Impl
     {
       // The file lists a border vertex CoMaps doesn't know: CoMaps can't cross there either, so neither
       // does the route.
-      LOG(LWARNING, ("Comaps++ overlay: not a border transition in the map:", s, outgoing));
+      LOG(LWARNING, ("Tabula overlay: not a border transition in the map:", s, outgoing));
       return;
     }
     starter->GetGraph().GetTwinsInner(s, outgoing, twinScratch);
@@ -259,7 +259,7 @@ struct OverlayRouter::Impl
       double w = 0;
       if (!legRefiner(from, to, anyMap, leg, w) || leg.empty() || !(leg.back() == to))
       {
-        LOG(LINFO, ("Comaps++ overlay: no leg from", from, "to", to));
+        LOG(LINFO, ("Tabula overlay: no leg from", from, "to", to));
         return false;
       }
       out.insert(out.end(), leg.begin() + (leg.front() == from ? 1 : 0), leg.end());
@@ -1476,7 +1476,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       {
         // Shouldn't happen (the hop came from these files and roads). Find that stretch on the roads.
         path.resize(before);
-        LOG(LWARNING, ("Comaps++ overlay: unpacking a level", int(l), "hop failed, searching it on the roads"));
+        LOG(LWARNING, ("Tabula overlay: unpacking a level", int(l), "hop failed, searching it on the roads"));
         if (!I.RefineInMap(I.SegOfKey(a), I.SegOfKey(b), path, nullptr, MapOf(a) != MapOf(b) || IsRaw(a) || IsRaw(b)))
           return finish(Result::NotApplicable, "internal error: a stretch of the route can't be unpacked");
       }

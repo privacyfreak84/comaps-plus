@@ -17,7 +17,6 @@ import app.organicmaps.BuildConfig;
 import app.organicmaps.R;
 import app.organicmaps.base.BaseMwmFragment;
 import app.organicmaps.sdk.Framework;
-import app.organicmaps.sdk.util.Constants;
 import app.organicmaps.sdk.util.DateUtils;
 import app.organicmaps.util.Graphics;
 import app.organicmaps.util.SharingUtils;
@@ -60,22 +59,22 @@ public class HelpFragment extends BaseMwmFragment implements View.OnClickListene
     setupItem(R.id.faq, true, root);
     setupItem(R.id.news, true, root);
     setupItem(R.id.web, true, root);
-    setupItem(R.id.code_repo, true, root);
-    setupItem(R.id.mastodon, true, root);
-    setupItem(R.id.matrix, true, root);
-    setupItem(R.id.lemmy, true, root);
-    setupItem(R.id.bluesky, true, root);
-    setupItem(R.id.pixelfed, true, root);
     setupItem(R.id.openstreetmap, true, root);
     setupItem(R.id.email, true, root);
     setupItem(R.id.report, isLandscape, root);
     setupItem(R.id.copyright, false, root);
 
-    final MaterialTextView supportUsView = root.findViewById(R.id.support_us);
-    if (BuildConfig.FLAVOR.equals("google") && !TextUtils.isEmpty(mDonateUrl))
-      supportUsView.setVisibility(View.GONE);
-    else
-      setupItem(R.id.support_us, true, root);
+    // Tabula: credits instead of CoMaps' own pitch; CoMaps' socials, code repository, volunteering page and
+    // terms aren't linked. "News" opens the releases, "Email" the issues page.
+    final MaterialTextView credits = root.findViewById(R.id.plus_credits);
+    credits.setText(R.string.plus_about_credits);
+    credits.setTypeface(null, android.graphics.Typeface.NORMAL);
+    Linkify.addLinks(credits, Linkify.WEB_URLS);
+    ((TextView) root.findViewById(R.id.news)).setText(R.string.plus_about_releases);
+    ((TextView) root.findViewById(R.id.email)).setText(R.string.plus_about_issues);
+    for (int id : new int[] {R.id.code_repo, R.id.mastodon, R.id.matrix, R.id.lemmy, R.id.bluesky, R.id.pixelfed,
+                             R.id.support_us, R.id.term_of_use_link})
+      root.findViewById(id).setVisibility(View.GONE);
 
     final MaterialButton donateView = root.findViewById(R.id.donate);
     if (TextUtils.isEmpty(mDonateUrl))
@@ -92,12 +91,9 @@ public class HelpFragment extends BaseMwmFragment implements View.OnClickListene
     else
       setupItem(R.id.rate, true, root);
 
-    View termOfUseView = root.findViewById(R.id.term_of_use_link);
     View privacyPolicyView = root.findViewById(R.id.privacy_policy);
-    termOfUseView.setOnClickListener(
-        v -> Utils.openUrl(requireActivity(), getResources().getString(R.string.app_site_url) + "terms/"));
     privacyPolicyView.setOnClickListener(
-        v -> Utils.openUrl(requireActivity(), getResources().getString(R.string.app_site_url) + "privacy/"));
+        v -> Utils.openUrl(requireActivity(), getResources().getString(R.string.app_site_url) + "#privacy"));
 
     shareLauncher = SharingUtils.RegisterLauncher(this);
 
@@ -113,29 +109,15 @@ public class HelpFragment extends BaseMwmFragment implements View.OnClickListene
     if (id == R.id.web)
       Utils.openUrl(requireActivity(), getResources().getString(R.string.app_site_url));
     else if (id == R.id.news)
-      Utils.openUrl(requireActivity(), "https://www.comaps.app/news/");
+      Utils.openUrl(requireActivity(), getResources().getString(R.string.app_site_url) + "releases");
     else if (id == R.id.email)
-      Utils.sendTo(requireContext(), BuildConfig.SUPPORT_MAIL, getString(R.string.project_name));
-    else if (id == R.id.code_repo)
-      Utils.openUrl(requireActivity(), Constants.Url.CODE_REPO);
-    else if (id == R.id.mastodon)
-      Utils.openUrl(requireActivity(), Constants.Url.MASTODON);
-    else if (id == R.id.matrix)
-      Utils.openUrl(requireActivity(), Constants.Url.MATRIX);
-    else if (id == R.id.lemmy)
-      Utils.openUrl(requireActivity(), Constants.Url.LEMMY);
-    else if (id == R.id.bluesky)
-      Utils.openUrl(requireActivity(), Constants.Url.BLUESKY);
-    else if (id == R.id.pixelfed)
-      Utils.openUrl(requireActivity(), Constants.Url.PIXELFED);
+      Utils.openUrl(requireActivity(), getResources().getString(R.string.app_site_url) + "issues");
     else if (id == R.id.openstreetmap)
       Utils.openUrl(requireActivity(), getString(R.string.osm_wiki_about_url));
     else if (id == R.id.faq)
       ((HelpActivity) requireActivity()).stackFragment(FaqFragment.class, getString(R.string.faq), null);
     else if (id == R.id.report)
       Utils.sendBugReport(shareLauncher, requireActivity(), "", "");
-    else if (id == R.id.support_us)
-      Utils.openUrl(requireActivity(), getResources().getString(R.string.app_site_url) + "community/#volunteer-section");
     else if (id == R.id.donate)
       Utils.openUrl(requireActivity(), mDonateUrl);
     else if (id == R.id.rate)

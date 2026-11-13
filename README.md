@@ -1,18 +1,18 @@
-# Comaps++
+# Tabula
 
-Comaps++ is an offline maps app for Android, built on [OpenStreetMap](https://www.openstreetmap.org) data. It is a fork of [CoMaps](https://codeberg.org/comaps/comaps) and keeps everything CoMaps does. The main change so far: long car routes are calculated in a few seconds instead of minutes.
+Tabula is an offline maps app for Android, built on [OpenStreetMap](https://www.openstreetmap.org) data. It is a fork of [CoMaps](https://codeberg.org/comaps/comaps) and keeps everything CoMaps does. The main change so far: long car routes are calculated in a few seconds instead of minutes.
 
-This is a test-stage project. There is no release yet, and the app still installs under the CoMaps name and icon. See [Get a test build](#get-a-test-build) and the [roadmap](#roadmap).
+This is a test-stage project with no release yet. Until November 2026 it was called Comaps++. See [Get a test build](#get-a-test-build) and the [roadmap](#roadmap).
 
 ## Fast car routes
 
-On a phone, CoMaps could take several minutes to calculate a car route from Lucknow to Pune. Comaps++ prepares extra route data on the phone for each downloaded map, once, and then answers the same route in about two seconds.
+On a phone, CoMaps could take several minutes to calculate a car route from Lucknow to Pune. Tabula prepares extra route data on the phone for each downloaded map, once, and then answers the same route in about two seconds.
 
 The extra data is a cell overlay (the method behind OSRM's MLD and Microsoft's CRP). Each map's road network is split into nested cells, and the travel time between the entry and exit points of every cell is stored. A route then only searches inside the cells at its two ends and jumps across everything in between. The overlay is built from CoMaps' own road graph and travel-time model, including turn costs, U-turns, turn restrictions and access rules, so the routes it returns are CoMaps' routes. Roads that are open only at certain times are left out of the stored times and checked for the moment the route gets there, as CoMaps does. Turn-by-turn directions, street names and arrival times still come from CoMaps' normal route builder.
 
 Measured on a 2-core Linux VM with India maps (version 261004), against CoMaps' router in its exact search mode on the same machine:
 
-| Route | CoMaps | Comaps++ |
+| Route | CoMaps | Tabula |
 |---|---|---|
 | Lucknow to Pune (3 state maps) | 124 s | 2.3 s |
 | 15 random routes over 300 km (median) | 28.2 s | 1.96 s |
@@ -25,7 +25,7 @@ Short trips were already quick, so the gain is in long ones. In maps with time-r
 
 - After you download or update a map, a background job prepares its route data. A notification shows progress and has a Cancel button. The job also runs when the app starts, to catch anything missed, and after a reboot even if the app isn't opened.
 - The job doesn't wait for a charged battery or free storage, and doesn't give up on a map. If Android stops a preparation (for example for memory), it is tried again with one thread after the other maps, and from the third time with a growing pause (15 minutes up to 6 hours). A preparation that fails is tried again after 1, 4, 16 minutes and so on, up to 6 hours. A stopped preparation keeps its cell layout, so the next attempt skips the slowest step.
-- Until a map is prepared, car routes through it still work. Comaps++ estimates the part of the route inside that map from CoMaps' border-to-border times and shows a message that the route may be a few minutes off. That map is prepared first, and the route is recalculated by itself when it's ready.
+- Until a map is prepared, car routes through it still work. Tabula estimates the part of the route inside that map from CoMaps' border-to-border times and shows a message that the route may be a few minutes off. That map is prepared first, and the route is recalculated by itself when it's ready.
 - Avoid settings (tolls, motorways, ferries, dirt roads, in any mix) need nothing prepared, and their routes are exact from the moment you change the settings. The route data records, for every cell, which of these road types its stored travel times rely on. A route avoiding one of those types goes through such a cell road by road, with the avoided roads left out; every other cell keeps its stored times. On the test VM, 8 routes across Uttar Pradesh took 1.0 to 1.2 s without avoid settings, 1.1 to 1.6 s avoiding tolls, 1.1 to 2.0 s avoiding motorways and 1.2 to 3.5 s avoiding dirt roads. Routes across two maps that avoid dirt roads are slower: 2.3 to 7.6 s for routes of 9 to 14 hours from Uttar Pradesh into Madhya Pradesh, against 2.6 to 3.2 s without, because the largest cells nearly all rely on some dirt road.
 - You can also keep a car route out of a town or off a road you choose ([roadmap item 1](ROADMAP.md#1-avoid-specific-roads-and-places)). With a car route on the map, tap a town or village the route passes through and choose Avoid (it may be under More): the route then stays out of it, within a radius set by its population (about 13 km for Lucknow, 1 to 2 km for a town, under 1 km for a village). Tap, or long-press, any other point on the route and Avoid keeps the route off its road there (the whole OSM way). Anywhere else, and for the route's start, destination and stops, Avoid isn't offered. The route is calculated again straight away. Nothing is prepared: each route looks up the road segments a place covers (a few milliseconds) and searches the cells holding them road by road. Avoided places belong to that route only. They're drawn in red while the route is on the map, kept when it's recalculated or you start navigating, and gone when you close the route; nothing is stored apart from the route. Tap a place drawn in red and choose Don't avoid to use it again. A route the app restores after a restart keeps its avoided places, and a route saved as a track keeps them too, drawn while that track is selected. If no route is left, the "no route" message says the avoided places may be the reason.
 - Rerouting after a missed turn goes straight to the fast search. In 110 test reroutes the new route was as quick as a fresh route from the same spot (one was 5 s slower), and took 0.3 to 3.2 seconds.
@@ -59,7 +59,7 @@ Memory while routing: for Lucknow to Pune the whole router process on the test V
 The point of the overlay is speed without different routes, so every change was checked against CoMaps' own router:
 
 - 13 routes of 108 to 1,218 km across Uttar Pradesh, Madhya Pradesh and Maharashtra: identical arrival times.
-- 327 generated routes in 12 groups (state borders, bridges and tunnels, dead ends, small islands, one-way streets, ramps, restricted access, roundabouts, random pairs, the longest possible pairs, and 20 hand-picked routes such as the Mumbai to Pune expressway ghats and the Bandra-Worli sea link): the same outcome in all 327 (routed or not), no crash or hang. Where both routed, arrival times matched within a minute except on two routes. On one, Comaps++ found a route more than a minute quicker. On the other, CoMaps' route arrives 64 s sooner but scores worse by CoMaps' own measure, which adds penalties for roads with restricted access.
+- 327 generated routes in 12 groups (state borders, bridges and tunnels, dead ends, small islands, one-way streets, ramps, restricted access, roundabouts, random pairs, the longest possible pairs, and 20 hand-picked routes such as the Mumbai to Pune expressway ghats and the Bandra-Worli sea link): the same outcome in all 327 (routed or not), no crash or hang. Where both routed, arrival times matched within a minute except on two routes. On one, Tabula found a route more than a minute quicker. On the other, CoMaps' route arrives 64 s sooner but scores worse by CoMaps' own measure, which adds penalties for roads with restricted access.
 - 24 routes with avoid settings, 6 routes with 1 to 3 stops, 110 reroutes: same arrival times.
 - Without avoid-setting files (maps 261105): 8 routes across Uttar Pradesh avoiding tolls, motorways and dirt roads (24 routes) against CoMaps' exact search with the same settings: the same roads on all 24 and the same arrival times, except one route that is 10 s apart with each setting, as it is without avoid settings.
 - Avoided places: the same 8 routes with 8 places on them (4 roads, 4 areas of 250 m to 2 km): all 8 changed, none uses a segment of an avoided place, and they take the same roads as CoMaps' exact search with the same places (one route 10 s apart in arrival time, as without places). Three routes from Uttar Pradesh into Madhya Pradesh with 3 places, with and without avoiding dirt roads: two within 5 s of CoMaps (as without places), one 30 s slower out of 10.8 hours, with its avoided area next to the state border.
@@ -68,12 +68,12 @@ The point of the overlay is speed without different routes, so every change was 
 - Inside one map, 100 random routes against a plain shortest-path search: no differences.
 - Outside India, 776 generated routes in Berlin with Brandenburg (386) and in Tyrol, Salzburg and Vorarlberg (390), with the clock set to Monday 08:30, including 40 routes per region that start on a time-restricted road: the same outcome in all 776, and arrival times within a minute except on 5 routes. The 40 time-restricted routes in Germany were also run at Sunday 03:00 and Friday 17:30. Avoiding motorways, 39 German border routes: all within a minute.
 
-Two findings along the way. On 2 of 20 test routes in Uttar Pradesh, CoMaps' router returns a slower route than the best legal one (17% and 32% slower), because of how it checks turn restrictions that span several roads; Comaps++ returns the best one. And on one German route at 03:00, CoMaps' route crosses a road signed closed from 22:00 to 05:00 and reaches it at about 03:40; Comaps++ takes a legal route, 49 minutes longer. At noon both routers return the same route.
+Two findings along the way. On 2 of 20 test routes in Uttar Pradesh, CoMaps' router returns a slower route than the best legal one (17% and 32% slower), because of how it checks turn restrictions that span several roads; Tabula returns the best one. And on one German route at 03:00, CoMaps' route crosses a road signed closed from 22:00 to 05:00 and reaches it at about 03:40; Tabula takes a legal route, 49 minutes longer. At noon both routers return the same route.
 
 ### Known limits
 
 - Tested with India, Germany (Berlin, Brandenburg) and Austria (Tyrol, Salzburg, Vorarlberg) maps.
-- Near map borders a few routes differ slightly: in India 1 of 40 border test routes is more than a minute off (78 s). Comaps++ switches between maps only where a road crosses the border; CoMaps can switch at any junction of a road present in both maps. Doing the same was tried: it made long routes about twice as slow and improved 2 of 40 border routes, so it was left out.
+- Near map borders a few routes differ slightly: in India 1 of 40 border test routes is more than a minute off (78 s). Tabula switches between maps only where a road crosses the border; CoMaps can switch at any junction of a road present in both maps. Doing the same was tried: it made long routes about twice as slow and improved 2 of 40 border routes, so it was left out.
 - A route that starts on a road closed at that moment starts on it and leaves it at the nearest junction; CoMaps starts from a neighbouring road instead. In tests this changed 1 of 40 such routes (5 minutes shorter).
 - Preparing a large map needs about 800 MB of memory at its peak (Uttar Pradesh). A phone that can never spare that much keeps retrying (with pauses) without finishing, and routes through that map stay estimated.
 - Each new route-data layout makes the app prepare every map again after updating. Files in the previous layout keep serving routes meanwhile (avoid settings are slower with them until each map is redone).
@@ -90,7 +90,9 @@ There are no releases yet. Test APKs come from the Android Check workflow:
 
 1. Open [Actions, Android Check](https://github.com/privacyfreak84/comaps-plus/actions/workflows/android-check.yaml) and pick the latest successful run on `main`. The workflow runs on demand: the repository owner starts it with Run workflow.
 2. Download the `android-WebBeta` artifact (64-bit ARM phones). You need to be signed in to GitHub.
-3. Unzip and install the APK. It installs as `app.comaps.test`, next to any regular CoMaps.
+3. Unzip and install the APK. It installs as `app.tabula.test`, next to CoMaps if you have it.
+
+Builds from before the rename installed as `app.comaps.test`. Android treats the new ID as a different app, so it starts empty: download your maps again (the old app's maps aren't shared with it), and the new app prepares their route data again. Export bookmarks from the old app first if you want to keep them, then uninstall it.
 
 To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 
@@ -100,8 +102,8 @@ To build it yourself, follow [docs/INSTALL.md](docs/INSTALL.md).
 2. Faster navigation. Done.
 3. An update checker and downloader in the app's settings.
 4. Full OpenStreetMap editing, added over time.
-5. Remove links to CoMaps (website, donations and so on), keeping it in the credits.
-6. A new package name, app name and icon throughout the app.
+5. Remove links to CoMaps (website, donations and so on), keeping it in the credits. Done in the Android app.
+6. A new package name, app name and icon throughout the app. Done in the Android app: Tabula, `app.tabula`.
 7. Several route options to choose from, as in Google Maps.
 8. Less storage space and memory used by maps on the phone. Done for the route data; the map files come from CoMaps.
 9. The same changes in the iOS and desktop apps.
@@ -114,13 +116,13 @@ Details, status and what each item needs: [ROADMAP.md](ROADMAP.md).
 
 ### Branches
 
-- `main`: Comaps++.
+- `main`: Tabula.
 - `upstream`: an untouched mirror of CoMaps from Codeberg. Its release tags are mirrored as `upstream/<tag>`.
 - The Sync upstream workflow ([.github/workflows/plus-sync-upstream.yml](.github/workflows/plus-sync-upstream.yml), script [.plus/sync-upstream.sh](.plus/sync-upstream.sh)) checks Codeberg every 6 hours. If the new upstream commits merge without conflicts, it merges them into `main` and starts the Android Check build as a compile check. If they conflict, it opens an issue and leaves `main` alone. It also opens an issue when upstream changes routing code (prepared route files may need `kRoutingDataVersion` raised) and one for each new upstream release.
 
 ### Releases
 
-The Release workflow ([.github/workflows/plus-release.yml](.github/workflows/plus-release.yml)) builds a signed arm64 APK from `main` and publishes it as a GitHub release tagged `v<date>-<n>`, with the commit list, the signing certificate's SHA-256 and the APK's SHA-256 in the notes. Start it with `gh workflow run plus-release.yml` or from the Actions tab. It needs the secrets `PLUS_KEYSTORE` (base64 of the keystore), `PLUS_KEYSTORE_PASSWORD` and `PLUS_KEY_ALIAS`, and it refuses to run while the app ID is still CoMaps' `app.comaps`.
+The Release workflow ([.github/workflows/plus-release.yml](.github/workflows/plus-release.yml)) builds a signed arm64 APK from `main` and publishes it as a GitHub release tagged `v<date>-<n>`, with the commit list, the signing certificate's SHA-256 and the APK's SHA-256 in the notes. Start it with `gh workflow run plus-release.yml` or from the Actions tab. It needs the secrets `PLUS_KEYSTORE` (base64 of the keystore), `PLUS_KEYSTORE_PASSWORD` and `PLUS_KEY_ALIAS`, and it refuses to run if the app ID is ever set back to CoMaps' `app.comaps`.
 
 ### Where the routing code is
 
@@ -150,6 +152,16 @@ Environment switches for testing:
 | `COMAPS_PLUS_ROAD_CACHE` | Size of CoMaps' road geometry cache |
 | `COMAPS_PLUS_AVOID_PLACES` | Avoided places for every route of the run, in the format of `plus_avoid::Serialize` (`plus_avoid_places.cpp`) |
 
+### Name, links and icon (roadmap items 5 and 6)
+
+- The app ID, name and home page are set at the top of [android/app/build.gradle.kts](android/app/build.gradle.kts) (`appName`, `appId`, `plusHomeUrl`). Test builds add `.test`, debug builds `.debug`.
+- CoMaps' translated string files, the FAQ and the copyright page stay as they are upstream, so translation updates keep merging. At build time [android/app/plus_brand.py](android/app/plus_brand.py) writes a copy of every string that mentions CoMaps or links to comaps.app, with the name Tabula and this repository's links, into a resource folder that takes priority over CoMaps' files. Download links go to the latest release, support addresses and CoMaps' issue tracker to this repository's issues, other comaps.app pages to this page. Map server addresses are kept.
+- Grammatical endings stay as CoMaps' translators wrote them, so some languages that inflect names (Finnish, Turkish, Hungarian) read slightly off.
+- The About screen credits CoMaps, Organic Maps, MAPS.ME and OpenStreetMap, and links releases and issues here. CoMaps' social accounts, donations, volunteering page, terms and support email are gone. Bug reports share the app's logs through the share menu instead of mailing them.
+- Shared locations carry an OpenStreetMap link instead of a comaps.at link. Tabula still opens comaps.at, `comaps://` and other Organic Maps style links it receives.
+- OpenStreetMap edits and notes are tagged with Tabula; exported bookmarks are named Tabula.
+- Maps still download from CoMaps' servers. The iOS and desktop apps aren't renamed yet (roadmap item 9).
+
 ### Other changes from CoMaps
 
 - Submodule URLs in `.gitmodules` are absolute, so they resolve from GitHub.
@@ -157,8 +169,12 @@ Environment switches for testing:
 
 Bugs and ideas: [issues](https://github.com/privacyfreak84/comaps-plus/issues).
 
+## Privacy
+
+Tabula has no account and shows no ads, and the Android app's dependencies ([android/app/build.gradle.kts](android/app/build.gradle.kts)) include no analytics or advertising library. The app goes online to list and download maps from CoMaps' servers, where [CoMaps' privacy policy](https://www.comaps.app/privacy/) applies, and to send your map edits and notes to OpenStreetMap if you sign in there. This list comes from reading the code, not from a network audit.
+
 ## Credits and license
 
-Comaps++ is built on [CoMaps](https://codeberg.org/comaps/comaps), which is a fork of [Organic Maps](https://organicmaps.app), originally based on Maps.ME. Map data comes from [OpenStreetMap](https://www.openstreetmap.org) contributors. The cell overlay follows the approach of Delling, Goldberg, Pajor and Werneck's customizable route planning, as used in OSRM's MLD.
+Tabula is built on [CoMaps](https://codeberg.org/comaps/comaps), which is a fork of [Organic Maps](https://organicmaps.app), originally based on Maps.ME. Map data comes from [OpenStreetMap](https://www.openstreetmap.org) contributors. The cell overlay follows the approach of Delling, Goldberg, Pajor and Werneck's customizable route planning, as used in OSRM's MLD.
 
 Licensed under the Apache License 2.0, like CoMaps. See [LICENSE](LICENSE), [NOTICE](NOTICE) and [data/copyright.html](data/copyright.html).

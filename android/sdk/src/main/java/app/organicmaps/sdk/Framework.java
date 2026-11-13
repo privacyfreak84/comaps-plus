@@ -24,7 +24,6 @@ import app.organicmaps.sdk.routing.RoutingProgressListener;
 import app.organicmaps.sdk.routing.RoutingRecommendationListener;
 import app.organicmaps.sdk.routing.TransitRouteInfo;
 import app.organicmaps.sdk.settings.SpeedCameraMode;
-import app.organicmaps.sdk.util.Constants;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -75,11 +74,15 @@ public class Framework
   // this class is just bridge between Java and C++ worlds, we must not create it
   private Framework() {}
 
+  /**
+   * Tabula: the web link put in shared locations. An OpenStreetMap link, which opens in any browser or maps app,
+   * instead of a page on CoMaps' comaps.at. The place's name isn't part of the link; the shared text has it.
+   */
   public static String getHttpGe0Url(double lat, double lon, double zoomLevel, String name)
   {
-    return nativeGetGe0Url(lat, lon, zoomLevel, name)
-        .replaceFirst(Constants.Url.SHORT_SHARE_PREFIX, Constants.Url.HTTP_SHARE_PREFIX)
-        .replaceFirst(Constants.Url.SHORT_SHARE_PREFIX_OLD, Constants.Url.HTTP_SHARE_PREFIX);
+    final long zoom = Math.round(Math.max(1, Math.min(19, zoomLevel)));
+    return String.format(java.util.Locale.US, "https://www.openstreetmap.org/?mlat=%.5f&mlon=%.5f#map=%d/%.5f/%.5f",
+                         lat, lon, zoom, lat, lon);
   }
 
   /**

@@ -381,7 +381,7 @@ void IndexGraph::ReconstructJointSegment(astar::VertexData<JointSegment, RouteWe
     if (noRoadAccess)
       continue;
 
-    // Comaps++: a joint segment passing a segment of an avoided place.
+    // Tabula: a joint segment passing a segment of an avoided place.
     if (m_plusBlocked)
     {
       bool blocked = false;

@@ -99,7 +99,7 @@ struct Reporter
     if (o.log)
       o.log(s);
     else
-      LOG(LINFO, ("Comaps++ overlay build:", s));
+      LOG(LINFO, ("Tabula overlay build:", s));
   }
   void Progress(double f, std::string const & stage) const
   {

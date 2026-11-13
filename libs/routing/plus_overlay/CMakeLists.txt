@@ -1,6 +1,6 @@
 project(plus_overlay_tool)
 
-# Comaps++ cell-overlay (MLD/CRP) prototype. Desktop only, not linked into the app.
+# Tabula cell-overlay (MLD/CRP) prototype. Desktop only, not linked into the app.
 
 set(SRC
   plus_overlay_tool.cpp

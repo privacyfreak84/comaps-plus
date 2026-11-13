@@ -323,7 +323,7 @@ public:
   void SwitchToUsingVehicleStyle(bool const shouldUseVehicleStyle);
 
   df::DrapeApi & GetDrapeApi() { return m_drapeApi; }
-  // Comaps++: draws in red the current route's avoided roads and places (routing/plus_avoid_places.hpp), and
+  // Tabula: draws in red the current route's avoided roads and places (routing/plus_avoid_places.hpp), and
   // those of the saved route (track) being viewed. Called when either changes.
   void PlusShowAvoidPlaces();
   // The saved route (track) selected on the map, or kml::kInvalidTrackId.

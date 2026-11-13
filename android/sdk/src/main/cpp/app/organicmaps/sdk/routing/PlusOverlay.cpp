@@ -1,4 +1,4 @@
-// Comaps++: building the per-map overlay files that make long car routes fast.
+// Tabula: building the per-map overlay files that make long car routes fast.
 // Called from app.organicmaps.background.PlusOverlayWork on a WorkManager thread.
 
 #include "app/organicmaps/sdk/Framework.hpp"
@@ -177,12 +177,12 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeBuild(
     switch (r.status)
     {
     case plus_overlay::BuildResult::Status::Ok:
-      LOG(LINFO, ("Comaps++", what, "built for", id, ":", r.fileBytes / 1048576.0, "MB in", r.seconds,
+      LOG(LINFO, ("Tabula", what, "built for", id, ":", r.fileBytes / 1048576.0, "MB in", r.seconds,
                   "s, peak memory", r.peakRssKb / 1024, "MB"));
       return 0;
-    case plus_overlay::BuildResult::Status::Cancelled: LOG(LINFO, ("Comaps++", what, "cancelled for", id)); return 1;
+    case plus_overlay::BuildResult::Status::Cancelled: LOG(LINFO, ("Tabula", what, "cancelled for", id)); return 1;
     case plus_overlay::BuildResult::Status::Failed:
-      LOG(LWARNING, ("Comaps++", what, "failed for", id, ":", r.error));
+      LOG(LWARNING, ("Tabula", what, "failed for", id, ":", r.error));
       return 2;
     }
     return 2;
@@ -225,7 +225,7 @@ JNIEXPORT jint JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeDelete
     if (downloaded.count(t.substr(0, t.size() - 5)) == 0 && Platform::RemoveFileIfExists(base::JoinPath(TreeDir(), t)))
       ++deleted;
   if (deleted)
-    LOG(LINFO, ("Comaps++ overlay: deleted", deleted, "files of removed or updated maps"));
+    LOG(LINFO, ("Tabula overlay: deleted", deleted, "files of removed or updated maps"));
   return static_cast<jint>(deleted);
 }
 // {engine, seconds, reason} of the last car route: engine is "none", "fast", "rejoin" or "normal".

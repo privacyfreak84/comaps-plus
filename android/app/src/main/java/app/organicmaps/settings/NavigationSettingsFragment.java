@@ -73,8 +73,7 @@ public class NavigationSettingsFragment extends BaseXmlSettingsFragment
     }
     else if (key.equals(getString(R.string.pref_android_auto_support)))
     {
-      if (!Utils.isAndroidAutoSupported(requireContext()))
-        Utils.openUrl(requireContext(), "https://www.comaps.app/support/how-to-use-android-auto/");
+      // Tabula: CoMaps' Android Auto guide isn't linked; the summary already says whether it's supported.
     }
     return super.onPreferenceTreeClick(preference);
   }

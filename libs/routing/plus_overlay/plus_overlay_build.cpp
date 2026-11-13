@@ -1,4 +1,4 @@
-// Comaps++ overlay builder for one map: a desktop front end for plus_overlay::BuildOverlayFile, the
+// Tabula overlay builder for one map: a desktop front end for plus_overlay::BuildOverlayFile, the
 // same function the app runs on the phone after a map download or update.
 
 #include "routing/plus_overlay/overlay_builder.hpp"
@@ -80,7 +80,7 @@ int main(int argc, char ** argv)
     };
   }
 
-  std::cout << "== Comaps++ overlay build: " << FLAGS_mwm << " v" << FLAGS_mwm_version << ", " << FLAGS_threads
+  std::cout << "== Tabula overlay build: " << FLAGS_mwm << " v" << FLAGS_mwm_version << ", " << FLAGS_threads
             << " threads\n";
   auto const parentGetter = [cpg](std::string const & id) { return (*cpg)(id); };
   auto const r = plus_overlay::BuildOverlayFile(localFile, parentGetter, FLAGS_out, o);

@@ -3,7 +3,7 @@ package app.organicmaps.sdk.routing;
 import androidx.annotation.NonNull;
 
 /**
- * Comaps++: per-map overlay files that make long car routes fast. The router uses a map's file once
+ * Tabula: per-map overlay files that make long car routes fast. The router uses a map's file once
  * it exists and matches the downloaded map version; until then it crosses that map on estimates.
  */
 public final class PlusOverlay

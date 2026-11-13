@@ -111,7 +111,7 @@ while IFS=$'\t' read -r tag url pre; do
   kind=release
   [ "$pre" = "true" ] && kind="pre-release"
   if git merge-base --is-ancestor "$commit" origin/main; then
-    state="It is already in main. Run the Release workflow to publish a Comaps++ build that includes it, then close this issue."
+    state="It is already in main. Run the Release workflow to publish a Tabula build that includes it, then close this issue."
   else
     state="It is not in main yet because the upstream merge conflicts; see the sync-conflict issue."
   fi

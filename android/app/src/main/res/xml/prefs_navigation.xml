@@ -22,7 +22,7 @@
     </intent>
   </PreferenceScreen>
 
-  <!-- Comaps++ -->
+  <!-- Tabula -->
   <Preference
     android:key="pref_plus_overlay_storage"
     android:persistent="false"

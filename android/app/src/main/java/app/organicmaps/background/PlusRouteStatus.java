@@ -17,7 +17,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Comaps++: what the user sees when a car route crosses maps whose fast-route files aren't built yet.
+ * Tabula: what the user sees when a car route crosses maps whose fast-route files aren't built yet.
  * Such a route is still fast to calculate, but parts of it rest on estimates, so it may be a few minutes
  * off. The user is told so once per set of maps; those maps are built first, and when they are ready the
  * route is calculated again by itself.
