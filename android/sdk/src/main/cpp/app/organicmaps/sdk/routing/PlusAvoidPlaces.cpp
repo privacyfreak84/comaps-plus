@@ -1,4 +1,4 @@
-// Comaps++: roads and areas kept out of the current car route (roadmap item 1). The list lives in the core
+// Tabula: roads and areas kept out of the current car route (roadmap item 1). The list lives in the core
 // (routing/plus_avoid_places.hpp) for as long as the route does; nothing is prepared for it and nothing is
 // stored apart from the route.
 

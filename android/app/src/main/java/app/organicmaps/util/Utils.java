@@ -41,7 +41,6 @@ import app.organicmaps.BuildConfig;
 import app.organicmaps.MwmActivity;
 import app.organicmaps.MwmApplication;
 import app.organicmaps.R;
-import app.organicmaps.sdk.util.Config;
 import app.organicmaps.sdk.util.Constants;
 import app.organicmaps.sdk.util.Distance;
 import app.organicmaps.sdk.util.StringUtils;
@@ -248,6 +247,9 @@ public class Utils
   {
     subject =
         activity.getString(R.string.project_name) + " Bug Report" + (TextUtils.isEmpty(subject) ? "" : ": " + subject);
+    // Tabula has no support address: the logs are shared to wherever the user picks, with where to report.
+    if (TextUtils.isEmpty(body))
+      body = activity.getString(R.string.plus_bug_report_body, activity.getString(R.string.app_site_url) + "issues");
     LogsManager.INSTANCE.zipLogs(
         new SupportInfoWithLogsCallback(launcher, activity, subject, body, BuildConfig.SUPPORT_MAIL));
   }
@@ -490,12 +492,8 @@ public class Utils
   @NonNull
   public static String getDonateUrl(@NonNull Context context)
   {
-    final String url = Config.getDonateUrl();
-    // Enable donations by default if not Google or Huawei. Replace comaps.app/donate/ with localized page.
-    if ((url.isEmpty() && !BuildConfig.FLAVOR.equals("google") && !BuildConfig.FLAVOR.equals("huawei"))
-        || url.endsWith("comaps.app/donate/"))
-      return context.getString(R.string.app_site_url) + "donate/";
-    return url;
+    // Tabula takes no donations; CoMaps' donation page isn't linked from the app.
+    return "";
   }
 
   public static boolean isAndroidAutoSupported(Context context)

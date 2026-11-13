@@ -1,6 +1,6 @@
 #pragma once
 
-// Comaps++: builds one map's overlay file on the device (or on a desktop, same code).
+// Tabula: builds one map's overlay file on the device (or on a desktop, same code).
 //
 // No raw segment graph is held in memory: CoMaps' IndexGraph is walked twice (degrees, then chains
 // between junctions) to get a compressed graph, via-way restrictions are expanded on it, the map is

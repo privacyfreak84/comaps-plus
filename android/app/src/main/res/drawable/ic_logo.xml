@@ -1,12 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Tabula logo in colour (the launcher icon's folded map without its background). Artwork on a 512 grid, cropped to it. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="64dp"
     android:height="64dp"
-    android:viewportWidth="835"
-    android:viewportHeight="835">
-  <path
-      android:pathData="M698.5,141.1a20,20 0,0 1,30.8 -1.3A416,416 0,0 1,835 417.4a416,416 0,0 1,-93.3 263,20 20,0 0,1 -31.3,-0.6l-43,-56.6a20,20 0,0 1,-0.2 -24,307 307,0 0,0 59.3,-181.8c0,-74.2 -26.2,-142.3 -69.9,-195.6a20,20 0,0 1,-0.5 -24.8zM260.7,456.4a20,20 0,0 1,-7.7 -36.7l282,-177.4a20,20 0,0 1,29.9 22.7l-97,318.9a20,20 0,0 1,-37.5 2.2l-49.2,-111.5z"
-      android:fillColor="#ccdfca"/>
-  <path
-      android:pathData="M626.3,753a20,20 0,0 1,-6.2 29.6A416,416 0,0 1,417.5 835,417.7 417.7,0 0,1 0,417.4 417.7,417.7 0,0 1,603.3 43.5a20,20 0,0 1,7 30l-42.4,55.8a20,20 0,0 1,-24.2 6.1,307 307,0 0,0 -126.2,-27 309,309 0,0 0,-309 309c0,170.6 138.5,309 309,309a307,307 0,0 0,141.6 -34.3,20 20,0 0,1 25.1,5.6z"
-      android:fillColor="#fefdf6"/>
+    android:viewportWidth="282"
+    android:viewportHeight="282">
+    <group
+        android:translateX="-115"
+        android:translateY="-115">
+        <path
+            android:pathData="M131.9 176.8 L214.3 153.3 L297.7 176.8 L380.1 153.3 L380.1 335.2 L297.7 358.7 L214.3 335.2 L131.9 358.7 Z"
+            android:fillColor="#FFFEFDF6"
+            android:strokeColor="#FFFEFDF6"
+            android:strokeWidth="18"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M214.3 153.3 L297.7 176.8 L297.7 358.7 L214.3 335.2 Z"
+            android:fillColor="#FFCCDFCA" />
+        <path
+            android:pathData="M178 312 C232 262 284 330 334 262"
+            android:strokeColor="#FF61805B"
+            android:strokeWidth="16"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M160,312.0a18,18 0 1,0 36,0a18,18 0 1,0 -36,0Z"
+            android:fillColor="#FF61805B" />
+        <path
+            android:pathData="M171,312.0a7,7 0 1,0 14,0a7,7 0 1,0 -14,0Z"
+            android:fillColor="#FFFEFDF6" />
+        <path
+            android:pathData="M334 266 L309.0 216.6 A28 28 0 1 1 359.0 216.6 Z"
+            android:fillColor="#FF61805B"
+            android:strokeColor="#FF61805B"
+            android:strokeWidth="8"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M323,204.0a11,11 0 1,0 22,0a11,11 0 1,0 -22,0Z"
+            android:fillColor="#FFFEFDF6" />
+    </group>
 </vector>

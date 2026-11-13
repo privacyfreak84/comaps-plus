@@ -1,6 +1,6 @@
 #pragma once
 
-// Comaps++ roadmap item 1: roads and areas the user chose to keep out of the current car route.
+// Tabula roadmap item 1: roads and areas the user chose to keep out of the current car route.
 //
 // They belong to that route only: kept in memory while the route exists (RoutingManager clears them when
 // the route is closed), saved with it when the route is saved (as a track, or for restoring after a restart)

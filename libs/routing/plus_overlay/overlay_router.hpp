@@ -1,6 +1,6 @@
 #pragma once
 
-// Comaps++ overlay routing at query time.
+// Tabula overlay routing at query time.
 //
 // Answers a car route on the overlay files of the maps involved, using CoMaps' own IndexGraph for the
 // base edges (the search near the start and finish, edges leaving a cell, and unpacking cells into

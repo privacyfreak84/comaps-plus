@@ -11,7 +11,6 @@ import androidx.core.os.ParcelCompat;
 import app.organicmaps.sdk.Framework;
 import app.organicmaps.sdk.routing.RoutePointInfo;
 import app.organicmaps.sdk.search.Popularity;
-import app.organicmaps.sdk.util.Constants;
 
 // TODO consider refactoring to remove hack with MapObject unmarshalling itself and Bookmark at the same time.
 // Used by JNI.
@@ -153,6 +152,7 @@ public class Bookmark extends MapObject
   @NonNull
   public String getHttpGe0Url(boolean addName)
   {
-    return getGe0Url(addName).replaceFirst(Constants.Url.SHORT_SHARE_PREFIX, Constants.Url.HTTP_SHARE_PREFIX);
+    // Tabula: an OpenStreetMap link, as in Framework.getHttpGe0Url.
+    return app.organicmaps.sdk.Framework.getHttpGe0Url(getLat(), getLon(), getScale(), getName());
   }
 }

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Comaps++ strings (English only for now). -->
+<!-- Tabula strings (English only for now). -->
 <resources>
     <string name="plus_overlay_channel" translatable="false">Fast routes</string>
     <string name="plus_overlay_building" translatable="false">Preparing fast routes: %s</string>
@@ -33,4 +33,9 @@
     <string name="plus_avoid_road_unnamed" translatable="false">Unnamed road</string>
     <string name="plus_avoid_area_named" translatable="false">Area of %s</string>
     <string name="plus_avoid_no_route" translatable="false">The roads and places this route avoids may be blocking every way there. Tap one drawn in red and choose Don\'t avoid.</string>
+    <!-- About screen (roadmap items 5 and 6) -->
+    <string name="plus_about_credits" translatable="false">Tabula is a fork of CoMaps (https://codeberg.org/comaps/comaps), which continues Organic Maps (https://organicmaps.app) and MAPS.ME. Map data © OpenStreetMap contributors (https://www.openstreetmap.org/copyright). Maps are downloaded from CoMaps\' servers.</string>
+    <string name="plus_about_releases" translatable="false">Releases and changes</string>
+    <string name="plus_about_issues" translatable="false">Report a problem or ask on GitHub</string>
+    <string name="plus_bug_report_body" translatable="false">Please attach this file to a new issue at %s and describe what happened.</string>
 </resources>

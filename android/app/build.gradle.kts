@@ -38,8 +38,11 @@ java {
     }
 }
 
-val appName = "CoMaps"
-val appId = "app.comaps"
+// Tabula: the fork's name, app ID and home page. The name and links in the app's texts are applied at build
+// time by plus_brand.py (see the end of this file), so CoMaps' own string files stay as they are upstream.
+val appName = "Tabula"
+val appId = "app.tabula"
+val plusHomeUrl = "https://github.com/privacyfreak84/comaps-plus/"
 // These are properly set in the 'secure.properties.*' files but must be declared here for build sync to succeed.
 project.ext["secretTestStoreFile"] = "comaps-test.keystore"
 project.ext["secretTestStorePassword"] = ""
@@ -100,7 +103,7 @@ android {
         base.archivesName = "${appName.replace(" ", "")}-${defaultConfig.versionCode!!}"
         ndk.debugSymbolLevel = "full"
         buildConfigField("String", "REVIEW_URL", "\"\"")
-        buildConfigField("String", "SUPPORT_MAIL", "\"android@comaps.app\"") // Customized in flavors.
+        buildConfigField("String", "SUPPORT_MAIL", "\"\"") // Tabula: no support address; reports go to the issues page
         println("Version: ${versionName!!}")
         println("VersionCode: ${versionCode!!}")
     }
@@ -112,22 +115,18 @@ android {
             dimension = "default"
             applicationIdSuffix = ".google"
             versionName = "${android.defaultConfig.versionName!!}-Google"
-            buildConfigField("String", "SUPPORT_MAIL", "\"gplay@comaps.app\"")
-            buildConfigField("String", "REVIEW_URL", "\"market://details?id=app.comaps.google\"")
         }
 
         // Distributed directly by the project, e.g. in repo releases, chats, etc.
         create("web") {
             dimension = "default"
             versionName = android.defaultConfig.versionName!!
-            buildConfigField("String", "SUPPORT_MAIL", "\"apk@comaps.app\"")
         }
 
         create("fdroid") {
             dimension = "default"
             applicationIdSuffix = ".fdroid"
             versionName = "${android.defaultConfig.versionName!!}-FDroid"
-            buildConfigField("String", "SUPPORT_MAIL", "\"fdroid@comaps.app\"")
         }
 
         create("huawei") {
@@ -136,8 +135,6 @@ android {
             applicationIdSuffix = ".huawei"
             versionName = "${android.defaultConfig.versionName!!}-Huawei"
             versionCode = huaweiVersionCodeBase + android.defaultConfig.versionCode!!
-            buildConfigField("String", "SUPPORT_MAIL", "\"huawei@comaps.app\"")
-            buildConfigField("String", "REVIEW_URL", "\"appmarket://details?id=app.comaps\"")
         }
     }
 
@@ -200,7 +197,7 @@ android {
         getByName("debug") {
             storeFile = project.projectDir.resolve(File(comapsDebugKeystorePath))
             storePassword = "12345678"
-            keyAlias = "$appName Debug"
+            keyAlias = "CoMaps Debug" // the alias inside the committed debug keystore
             keyPassword = "12345678"
         }
         create("test") {
@@ -453,4 +450,54 @@ huaweiPublish {
 
 tasks.withType<JavaCompile>().configureEach {
     options.compilerArgs.addAll(listOf("-Xlint:unchecked", "-Xlint:deprecation"))
+}
+
+// Tabula: the app's name and links in CoMaps' strings, FAQ and copyright page, as a higher-priority resource and
+// asset folder per variant (android/app/plus_brand.py). Upstream's files are left untouched, so translation
+// updates from CoMaps keep merging cleanly.
+abstract class PlusBrandTask : DefaultTask() {
+    @get:Input abstract val mode: Property<String>
+    @get:Input abstract val brandName: Property<String>
+    @get:Input abstract val homeUrl: Property<String>
+    @get:InputFile @get:PathSensitive(PathSensitivity.RELATIVE) abstract val script: RegularFileProperty
+    @get:InputFiles @get:PathSensitive(PathSensitivity.RELATIVE) abstract val sources: ConfigurableFileCollection
+    @get:Internal abstract val sourceDir: DirectoryProperty
+    @get:OutputDirectory abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun run() {
+        val command = listOf(
+            "python3", "-I", script.get().asFile.path, mode.get(), sourceDir.get().asFile.path,
+            outputDir.get().asFile.path, brandName.get(), homeUrl.get()
+        )
+        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        if (process.waitFor() != 0)
+            throw GradleException("plus_brand.py failed:\n$output")
+        logger.lifecycle(output.trim())
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val suffix = variant.name.replaceFirstChar { it.uppercase() }
+        val brandRes = tasks.register<PlusBrandTask>("plusBrandRes$suffix") {
+            mode.set("res")
+            brandName.set(appName)
+            homeUrl.set(plusHomeUrl)
+            script.set(layout.projectDirectory.file("plus_brand.py"))
+            sourceDir.set(layout.projectDirectory.dir("src/main/res"))
+            sources.from(fileTree("src/main/res") { include("values*/strings.xml", "values*/donottranslate.xml") })
+        }
+        val brandAssets = tasks.register<PlusBrandTask>("plusBrandAssets$suffix") {
+            mode.set("assets")
+            brandName.set(appName)
+            homeUrl.set(plusHomeUrl)
+            script.set(layout.projectDirectory.file("plus_brand.py"))
+            sourceDir.set(layout.projectDirectory.dir("src/main/assets"))
+            sources.from(fileTree("src/main/assets") { include("faq.html", "copyright.html") })
+        }
+        variant.sources.res?.addGeneratedSourceDirectory(brandRes, PlusBrandTask::outputDir)
+        variant.sources.assets?.addGeneratedSourceDirectory(brandAssets, PlusBrandTask::outputDir)
+    }
 }

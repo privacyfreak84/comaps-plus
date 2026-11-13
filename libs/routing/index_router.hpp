@@ -103,7 +103,7 @@ public:
   void ClearState() override;
 
   void SetGuides(GuidesTracks && guides) override;
-  /// Comaps++: the router's own start/finish snapping (no start direction), so an external
+  /// Tabula: the router's own start/finish snapping (no start direction), so an external
   /// search can use exactly the same fake endings as CalculateRoute.
   /// @return 0 - ok, 1 - start not found, 2 - finish not found.
   int PlusSnap(m2::PointD const & start, m2::PointD const & finish, FakeEnding & startEnding,
@@ -139,7 +139,7 @@ private:
 
   RouterResultCode DoCalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
                                     RouterDelegate const & delegate, Route & route);
-  // Comaps++: answers a car subroute from the per-map overlay files (for the current avoid options) if
+  // Tabula: answers a car subroute from the per-map overlay files (for the current avoid options) if
   // every map the search reaches has one; false means "use the normal search".
   // NoError: answered; RouteNotFound: the overlay is complete and there is no route; any other code
   // (NeedMoreMaps used as "not applicable"): use the normal search.
@@ -156,10 +156,10 @@ private:
   size_t m_plusAvoidPlacesUsed = 0;
   void PlusResolveAvoidPlaces(Checkpoints const & checkpoints);
 public:
-  // Comaps++ tests and tools: road segments the avoided places cover for the last route.
+  // Tabula tests and tools: road segments the avoided places cover for the last route.
   plus_avoid::BlockedByMap const & PlusBlocked() const { return m_plusBlocked; }
 
-  // Comaps++ tests: the last CalculateRoute rejoined the previous route (AdjustRoute) instead of a new search.
+  // Tabula tests: the last CalculateRoute rejoined the previous route (AdjustRoute) instead of a new search.
   bool PlusLastWasAdjusted() const { return m_plusLastWasAdjusted; }
 
 private:

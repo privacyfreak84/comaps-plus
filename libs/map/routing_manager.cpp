@@ -80,7 +80,7 @@ std::string_view constexpr kRouterTypeKey = "router";
 double constexpr kRouteScaleMultiplier = 1.5;
 
 string const kRoutePointsFile = "route_points.dat";
-// Comaps++: the avoided places of the route saved in kRoutePointsFile (plus_avoid::Serialize format).
+// Tabula: the avoided places of the route saved in kRoutePointsFile (plus_avoid::Serialize format).
 string const kPlusRouteAvoidFile = "plus_route_avoid.dat";
 
 uint32_t constexpr kInvalidTransactionId = 0;
@@ -1039,7 +1039,7 @@ void RoutingManager::CloseRouting(bool removeRoutePoints)
   {
     m_bmManager->GetEditSession().ClearGroup(UserMark::Type::ROUTING);
     CancelRecommendation(Recommendation::RebuildAfterPointsLoading);
-    // Comaps++: the route is gone, and its avoided places with it.
+    // Tabula: the route is gone, and its avoided places with it.
     routing::plus_avoid::ClearPlaces();
   }
 }
@@ -1366,7 +1366,7 @@ kml::TrackId RoutingManager::SaveRoute()
   std::string const from = GetNameFromPoint(routePoints.front());
   std::string const to = GetNameFromPoint(routePoints.back());
 
-  // Comaps++: the track keeps the route's avoided places; they're drawn while it's selected.
+  // Tabula: the track keeps the route's avoided places; they're drawn while it's selected.
   kml::Properties properties;
   if (auto const avoid = routing::plus_avoid::GetPlaces(); !avoid.empty())
     properties[routing::plus_avoid::kTrackPropertyKey] = routing::plus_avoid::Serialize(avoid);
@@ -1685,7 +1685,7 @@ void RoutingManager::LoadRoutePoints(LoadRouteHandler const & handler)
       return;
     }
 
-    // Comaps++: the saved route's avoided places, if it had any.
+    // Tabula: the saved route's avoided places, if it had any.
     std::vector<routing::plus_avoid::Place> avoid;
     {
       auto const avoidFile = GetPlatform().SettingsPathForFile(kPlusRouteAvoidFile);
@@ -1770,7 +1770,7 @@ void RoutingManager::SaveRoutePoints()
     {
       LOG(LWARNING, ("Saving road points failed:", ex.Msg()));
     }
-    // Comaps++: the route's avoided places go with it.
+    // Tabula: the route's avoided places go with it.
     auto const avoidFile = GetPlatform().SettingsPathForFile(kPlusRouteAvoidFile);
     if (avoid.empty())
     {

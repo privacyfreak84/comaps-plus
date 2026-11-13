@@ -1,4 +1,4 @@
-# Comaps++ roadmap
+# Tabula roadmap
 
 What's planned, what exists so far, and what each item still needs. The order is the list from the [README](README.md#roadmap), not a schedule. Items 5 and 6 come before item 3, because an update checker needs releases to check.
 
@@ -8,7 +8,7 @@ Status words: done, almost done, started (some groundwork exists), not started.
 
 Status: done.
 
-CoMaps lets you avoid types of road: tolls, motorways, ferries, dirt roads. Comaps++ also keeps a car route away from a road or an area you pick on that route, with nothing prepared for it.
+CoMaps lets you avoid types of road: tolls, motorways, ferries, dirt roads. Tabula also keeps a car route away from a road or an area you pick on that route, with nothing prepared for it.
 
 Done:
 
@@ -45,7 +45,7 @@ Done:
 
 Decided to leave as is:
 
-- Near map borders, Comaps++ switches between maps only where a road crosses the border, while CoMaps can switch at any junction of a road present in both maps. Matching CoMaps was built and measured: long routes became about twice as slow, and 2 of 40 border test routes improved. It was removed again.
+- Near map borders, Tabula switches between maps only where a road crosses the border, while CoMaps can switch at any junction of a road present in both maps. Matching CoMaps was built and measured: long routes became about twice as slow, and 2 of 40 border test routes improved. It was removed again.
 - A cycling overlay. Cycling routes are slow only for multi-day trips.
 
 ## 3. Update checker and downloader in settings
@@ -69,34 +69,40 @@ CoMaps has a basic editor for places (name, opening hours, address and some othe
 
 ## 5. Remove references to CoMaps, keep it in the credits
 
-Status: started.
+Status: done in the Android app.
 
 Done:
 
-- The README no longer links to CoMaps' website, donation pages, app store pages or chat, and mentions CoMaps only as the project this fork is built on and in the credits.
+- The README no longer links to CoMaps' website, donation pages, app store pages or chat, and mentions CoMaps only as the project this fork is built on, as the map source and in the credits.
+- In the app, every string that names CoMaps or links to comaps.app is replaced at build time in all translations, and so are the FAQ and copyright pages ([plus_brand.py](android/app/plus_brand.py); CoMaps' own files stay untouched so translation updates keep merging). Download links go to this repository's latest release, support addresses and CoMaps' issue tracker to its issues, other comaps.app pages to the README.
+- The About screen credits CoMaps, Organic Maps, MAPS.ME and OpenStreetMap contributors and says maps come from CoMaps' servers. CoMaps' social accounts, code repository, volunteering page, terms, rating link and donation button are gone; "News" opens this repository's releases and "Email" its issues. The privacy link opens the README's privacy section.
+- No donation link anywhere (the main menu entry is gone too) and no support email: bug reports share the zipped logs through the share menu with a note to attach them to an issue.
+- Shared places carry an OpenStreetMap link (`openstreetmap.org/?mlat=...`) and the `geo:` link instead of a comaps.at page. Incoming comaps.at, `comaps://` and Organic Maps links still open in the app.
+- The Android Auto help link and the voice-language guide no longer open CoMaps' site; the guide link opens the phone's text-to-speech settings, where voices are installed.
+- OpenStreetMap changesets say `created_by=Tabula android <version>` and notes end with `#Tabula`; the note for a place that no longer exists says "A Tabula user". Exported bookmarks are `Tabula.kml`, `Tabula_backup_<date>.kmz`, GPX files say `creator="Tabula"`.
 
-Still needed:
+Kept on purpose:
 
-- The same inside the app. References to CoMaps' website and donations show up in at least `HelpFragment.java`, `MwmActivity.java`, `Utils.java`, `NavigationSettingsFragment.java`, `strings.xml` and `donottranslate.xml`, plus the support address `apk@comaps.app` in the build file.
-- An About screen with credits to CoMaps, Organic Maps, Maps.ME and OpenStreetMap contributors.
-- A note to the CoMaps team about the app downloading maps from their servers, or a decision about where maps should come from.
+- Maps download from CoMaps' servers (`cdn-*.comaps.app`, `mapgen-*.comaps.app`); the app can't work without a map source. Whether to tell the CoMaps team, or to find another source, is still the project owner's call.
+- Internal identifiers that other apps or old files depend on: the `comaps://` and comaps.at link handlers, the KML namespace `https://comaps.app`, and the content-provider types `app.comaps.navigation.*` that navigation-data apps read.
+- Code comments, test data and the iOS and desktop apps (item 9).
 
 ## 6. New package name, app name and icon
 
-Status: started.
-
-The app still uses CoMaps' app ID (`app.comaps`), name and icon. Test builds install as `app.comaps.test`.
+Status: done in the Android app.
 
 Done:
 
-- A release workflow ([plus-release.yml](.github/workflows/plus-release.yml)) that builds a signed arm64 APK and publishes it as a GitHub release, which Obtainium and the update checker (item 3) can follow. It refuses to run until the app ID is changed.
+- Name Tabula, app ID `app.tabula` (test builds `app.tabula.test`, debug builds `app.tabula.debug`), so it installs next to CoMaps and is updated on its own. Only the app ID changes; the code's package names (`app.organicmaps`) stay, so upstream merges keep working. Builds from before the rename (`app.comaps.test`) are a different app to Android: maps have to be downloaded again.
+- New launcher icon (a folded paper map with a route, on green `#61805B`), with a themed monochrome layer for Android 13 and later, legacy icons for Android 5 to 7 drawn from the same vector, a darker background for test builds and the yellow one for debug builds. The notification icon, the About logo and the settings and menu logos use the map outline.
+- The F-Droid listing icon. The app name in every string, the FAQ and copyright pages comes from item 5.
+- The [release workflow](.github/workflows/plus-release.yml) names the release and APK Tabula.
 
 Still needed:
 
 - The signing key, created by the project owner and stored as GitHub secrets.
-- The new app name and an icon, both still to be chosen by the project owner.
-- A new app ID, so Comaps++ installs next to CoMaps and can be updated on its own. Only the app ID changes; the code's package names (`app.organicmaps`) stay, so upstream merges keep working.
-- The name changed throughout the app and its texts.
+- The store listings: the English title, short and full description are Tabula's, the other languages still describe CoMaps. They matter only once the app is published in a store.
+- Renaming the GitHub repository to match is optional: `plusHomeUrl` in `android/app/build.gradle.kts` holds the only copy of the address used in the app.
 
 ## 7. Several route options, as in Google Maps
 
@@ -112,7 +118,7 @@ Still needed:
 
 ## 8. Less storage space and memory used by maps
 
-Status: done, for the parts Comaps++ controls.
+Status: done, for the parts Tabula controls.
 
 Sizes on the phone, maps version 261101 (all in decimal MB; the earlier toll figures for Maharashtra and Madhya Pradesh are from maps 261004):
 
@@ -129,7 +135,7 @@ Done:
 - Avoid-setting data about 85% smaller: it stores only the cells whose stored times differ from the normal route data. Avoiding dirt roads changes more cells (24.1 MB for Uttar Pradesh).
 - Stored travel times in 2 bytes instead of 4: each cell stores its times as steps of its own scale (its longest time divided by 65,535), which rounds a stored time by at most half a second in the tested maps. Penalties for time-restricted roads get one more byte per value, but only in cells that have such roads. Indian route data is 26 to 30% smaller, avoid data 31 to 39%; German and Austrian route data only 9 to 17%, because most of their cells have time-restricted roads. Arrival times: no change on the 10 long Indian routes; changes of at most 1.1 s on 36 of 386 German routes and two of about 7 s (one faster, one slower); at most 0.1 s on 8 of 390 Austrian routes. Search times didn't change. Damaged scales or penalty offsets are rejected when a file is opened.
 - Preparation memory: Uttar Pradesh route data 960 MB to about 800 MB at the peak (with roadmap item 2), avoid-setting data 830 MB to 770 MB.
-- Memory while routing, measured: Lucknow to Pune peaks at about 650 MB with Comaps++, against about 2.2 GB for CoMaps' own search.
+- Memory while routing, measured: Lucknow to Pune peaks at about 650 MB with Tabula, against about 2.2 GB for CoMaps' own search.
 - The new file layout makes the app prepare every map once more after updating.
 
 Not done, and why:
@@ -148,7 +154,7 @@ Needs:
 - Preparing route data on the device: after downloads, map updates and app start, as on Android. On iOS that means a background processing task, which iOS runs when it chooses (usually while charging); on desktop a background thread.
 - The same status messages, Settings entries and avoid-setting choices as on Android, in both apps.
 - The other items (avoided places, route options, update checker, rebranding) in both apps as they are done.
-- Testing both apps, which so far haven't been built with Comaps++'s changes.
+- Testing both apps, which so far haven't been built with Tabula's changes.
 
 ## 10. Route data always ready, never CoMaps' old search
 

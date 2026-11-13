@@ -332,9 +332,17 @@ public class VoiceInstructionsSettingsFragment extends BaseXmlSettingsFragment
                  0, ttsLinkText.length(), 0);
     ttsLangInfoLink.setSummary(link);
 
-    final String ttsInfoUrl = requireActivity().getString(R.string.tts_info_link);
+    // Tabula: opens the phone's text-to-speech settings, where voices are installed, instead of CoMaps' guide.
     ttsLangInfoLink.setOnPreferenceClickListener(preference -> {
-      Utils.openUrl(requireContext(), ttsInfoUrl);
+      try
+      {
+        startActivity(new android.content.Intent("com.android.settings.TTS_SETTINGS")
+                          .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK));
+      }
+      catch (android.content.ActivityNotFoundException e)
+      {
+        startActivity(new android.content.Intent(android.provider.Settings.ACTION_SETTINGS));
+      }
       return false;
     });
   }

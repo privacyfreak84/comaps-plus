@@ -420,7 +420,7 @@ Framework::Framework(FrameworkParams const & params, bool loadMaps)
   InitTransliteration();
   LOG(LDEBUG, ("Transliterators initialized"));
 
-  // Comaps++: redraw the route's avoided places whenever they change (added, removed, cleared with the route).
+  // Tabula: redraw the route's avoided places whenever they change (added, removed, cleared with the route).
   routing::plus_avoid::SetChangeListener([this]()
   { GetPlatform().RunTask(Platform::Thread::Gui, [this]() { PlusShowAvoidPlaces(); }); });
 

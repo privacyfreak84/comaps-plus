@@ -93,10 +93,10 @@ public:
 
   Geometry & GetGeometry() const { return *m_geometry; }
 
-  // Comaps++: the overlay needs the conditional-access tables (time-dependent edges).
+  // Tabula: the overlay needs the conditional-access tables (time-dependent edges).
   RoadAccess const & GetRoadAccess() const { return m_roadAccess; }
 
-  // Comaps++: road segments of avoided places (plus_avoid_places.hpp). Edges onto them are left out
+  // Tabula: road segments of avoided places (plus_avoid_places.hpp). Edges onto them are left out
   // wherever avoid options apply (useRoutingOptions).
   void SetPlusBlocked(std::shared_ptr<plus_avoid::Blocked const> blocked) { m_plusBlocked = std::move(blocked); }
   std::shared_ptr<plus_avoid::Blocked const> const & GetPlusBlocked() const { return m_plusBlocked; }

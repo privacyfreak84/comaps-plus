@@ -1431,7 +1431,7 @@ UNIT_CLASS_TEST(Runner, ExportAll)
     TEST_EQUAL(files.size(), 5, ("5 files are expected in kmz"));
     auto index = "doc.kml";
     std::vector<std::string> expectedFiles = {"doc.kml", "files/new.kml", "files/Some random route.kml",
-                                              "files/CoMaps_1.kml", "files/CoMaps_2.kml"};
+                                              "files/Tabula_1.kml", "files/Tabula_2.kml"};
     for (auto const & file : files)
       TEST(std::find(expectedFiles.begin(), expectedFiles.end(), file.first) != expectedFiles.end(), ());
     auto indexPath = base::JoinPath(GetPlatform().TmpDir(), index);
@@ -1471,7 +1471,7 @@ UNIT_CLASS_TEST(Runner, ExportSingleUnicode)
     ZipFileReader::FileList files;
     ZipFileReader::FilesList(kmz, files);
     TEST_EQUAL(1, files.size(), ());
-    TEST_EQUAL("CoMaps.kml", files.at(0).first, ());
+    TEST_EQUAL("Tabula.kml", files.at(0).first, ());
     auto tmpPath = base::JoinPath(GetPlatform().TmpDir(), "tmp.xml");
     ZipFileReader::UnzipFile(kmz, files.at(0).first, tmpPath);
     TEST(base::DeleteFileX(kmz), ());

@@ -288,7 +288,7 @@ Geometry::Geometry(unique_ptr<GeometryLoader> loader, size_t roadsCacheSize) : m
 {
   CHECK(m_loader, ());
 
-  // Comaps++: COMAPS_PLUS_ROAD_CACHE=N overrides the per-map road geometry cache size, for benchmarks.
+  // Tabula: COMAPS_PLUS_ROAD_CACHE=N overrides the per-map road geometry cache size, for benchmarks.
   if (roadsCacheSize == kRoadsCacheSize)
   {
     if (char const * env = std::getenv("COMAPS_PLUS_ROAD_CACHE"))

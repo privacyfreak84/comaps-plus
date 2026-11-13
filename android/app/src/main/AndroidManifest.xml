@@ -514,7 +514,7 @@
         android:enabled="true"
         android:stopWithTask="false"/>
 
-    <!-- Comaps++: WorkManager runs the overlay builds (PlusOverlayWork) as a dataSync foreground job. -->
+    <!-- Tabula: WorkManager runs the overlay builds (PlusOverlayWork) as a dataSync foreground job. -->
     <service
         android:name="androidx.work.impl.foreground.SystemForegroundService"
         android:foregroundServiceType="dataSync"

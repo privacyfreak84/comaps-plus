@@ -64,7 +64,7 @@ public:
                     uint32_t timeoutSec, SessionState routeRebuildingState, bool adjustToPrevRoute);
 
   /// Builds the current route again, from the current position when following it (also used by
-  /// Comaps++ once a map's fast-route data is ready).
+  /// Tabula once a map's fast-route data is ready).
   void RebuildRouteOnTrafficUpdate();
 
   m2::PointD GetStartPoint() const;
@@ -182,7 +182,7 @@ public:
   /// \brief returns points of route junctions.
   /// \returns true if there is valid route information. If the route is not valid returns false.
   bool GetRouteJunctionPoints(std::vector<geometry::PointWithAltitude> & routeJunctionPoints) const;
-  // Comaps++: the current route (null if none), for avoiding what the user taps on it.
+  // Tabula: the current route (null if none), for avoiding what the user taps on it.
   std::shared_ptr<Route const> GetRoute() const;
 
   SessionState OnLocationPositionChanged(location::GpsInfo const & info);

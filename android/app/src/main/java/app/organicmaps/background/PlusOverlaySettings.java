@@ -9,7 +9,7 @@ import app.organicmaps.sdk.downloader.MapManager;
 import app.organicmaps.sdk.routing.PlusOverlay;
 
 /**
- * Comaps++: the fast-route entries in Settings → Navigation (how many maps are ready, space used, and the
+ * Tabula: the fast-route entries in Settings → Navigation (how many maps are ready, space used, and the
  * test switch that shows how each car route was calculated).
  */
 public final class PlusOverlaySettings

@@ -44,7 +44,7 @@ jobs:
             if [ -z "${!v}" ]; then echo "::error::secret $v is not set"; missing=1; fi
           done
           if grep -q '^val appId = "app.comaps"$' android/app/build.gradle.kts; then
-            echo "::error::the app ID is still app.comaps; a release would clash with CoMaps installs. Rebrand first."
+            echo "::error::the app ID is CoMaps' app.comaps; a release would clash with CoMaps installs."
             missing=1
           fi
           exit $missing
@@ -119,7 +119,7 @@ jobs:
         run: |
           grep -q 'Using RELEASE signing keys' "$RUNNER_TEMP/gradle.log" || { echo "::error::the release key was not used"; exit 1; }
           apk=$(ls android/app/build/outputs/apk/web/release/*.apk | head -n1)
-          out="$RUNNER_TEMP/ComapsPlus-${{ steps.version.outputs.name }}-arm64.apk"
+          out="$RUNNER_TEMP/Tabula-${{ steps.version.outputs.name }}-arm64.apk"
           cp "$apk" "$out"
           apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
           "$apksigner" verify --print-certs "$out" | tee "$RUNNER_TEMP/certs.txt"
@@ -152,5 +152,5 @@ jobs:
           gh release create "$tag" \
             "${{ steps.sign.outputs.apk }}" "${{ steps.sign.outputs.apk }}.sha256" \
             --target "$(git rev-parse HEAD)" \
-            --title "Comaps++ ${{ steps.version.outputs.name }}" \
+            --title "Tabula ${{ steps.version.outputs.name }}" \
             --notes-file "$RUNNER_TEMP/notes.md"

@@ -86,7 +86,7 @@ public class DownloaderService extends Service implements MapManager.StorageCall
 
     if (!isDownloading)
     {
-      // Comaps++: prepare fast routing for the maps just downloaded or updated.
+      // Tabula: prepare fast routing for the maps just downloaded or updated.
       PlusOverlayWork.onMapsChanged(this);
       if (hasFailed)
       {
