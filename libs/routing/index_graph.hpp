@@ -100,6 +100,18 @@ public:
   // wherever avoid options apply (useRoutingOptions).
   void SetPlusBlocked(std::shared_ptr<plus_avoid::Blocked const> blocked) { m_plusBlocked = std::move(blocked); }
   std::shared_ptr<plus_avoid::Blocked const> const & GetPlusBlocked() const { return m_plusBlocked; }
+  // Tabula: turning around on a divided road. CoMaps charges its U-turn penalty only for reversing on one
+  // road; going from one carriageway over a short connector onto the other is the same manoeuvre but paid
+  // two ordinary turns. True if |u| -> |c| -> |v| is one: three different roads, |u| and |v| one-way and
+  // running opposite ways (within kPlusTurnAroundMaxDeg), |c| at most kPlusTurnAroundMaxConnectorM long.
+  // Such a step costs PlusTurnAroundExtraS() more: in the fast-route data (overlay builder and router) and,
+  // from the search's parents, in the joint search used for maps without that data.
+  static constexpr double kPlusTurnAroundMaxConnectorM = 50.0;
+  static constexpr double kPlusTurnAroundMaxDeg = 30.0;
+  // 90 s; COMAPS_PLUS_TURNAROUND_S overrides it (tests: 0 gives CoMaps' own routes back).
+  static double PlusTurnAroundExtraS();
+  bool IsPlusTurnAround(Segment const & u, Segment const & c, Segment const & v) const;
+
   // Tabula: while set, edge lists carry no weights (all zero): which edges exist doesn't depend on them,
   // and the overlay builder's first walk only counts edges.
   void SetPlusEdgesOnly(bool edgesOnly) { m_plusEdgesOnly = edgesOnly; }

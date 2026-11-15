@@ -55,6 +55,12 @@ public final class PlusOverlay
   /** Builds the current route again (from the current position when navigating); main thread only. */
   public static native void nativeRefreshRoute();
 
+  /**
+   * Switches the local list of car route calculations on or off (tabula_route_log.csv in the app's files
+   * folder: time, start, heading, finish, ETA, length). It never leaves the phone by itself.
+   */
+  public static native void nativeSetRouteLog(boolean enabled);
+
   /** Bytes used by all overlay files. */
   public static native long nativeStorageBytes();
 }

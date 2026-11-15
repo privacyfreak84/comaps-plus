@@ -153,6 +153,9 @@ public class MwmApplication extends Application implements Application.ActivityL
       ThemeSwitcher.INSTANCE.initialize(this);
       ThemeSwitcher.INSTANCE.restart(false);
       ProcessLifecycleOwner.get().getLifecycle().addObserver(mProcessLifecycleObserver);
+      // Tabula: test builds keep a local list of car route calculations, for finding routes that go wrong.
+      app.organicmaps.sdk.routing.PlusOverlay.nativeSetRouteLog(
+          BuildConfig.DEBUG || "beta".equals(BuildConfig.BUILD_TYPE));
       // Tabula: build overlay files for maps that don't have a current one (missed or interrupted runs).
       PlusOverlayWork.enqueue(this);
       app.organicmaps.sdk.routing.RoutingController.setOnCarRouteResult(code -> {

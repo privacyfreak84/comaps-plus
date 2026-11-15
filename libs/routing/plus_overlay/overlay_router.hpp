@@ -44,6 +44,15 @@ struct EngineReport
   double seconds = 0;
 };
 void SetLastEngineReport(EngineReport const & r);
+
+// A local list of car route calculations, for finding routes that go wrong: one line each in
+// <writable dir>/tabula_route_log.csv (UTC time, start, heading in degrees or -, finish, whether it was a
+// recalculation while driving, result, ETA in seconds, length in metres). Off unless switched on (the app
+// does so in test builds only). Nothing is sent anywhere; past 1 MB the file becomes
+// tabula_route_log.old.csv and a new one starts.
+void SetRouteLogEnabled(bool enabled);
+void AppendRouteLog(double startLat, double startLon, bool hasHeading, double headingDeg, double finishLat,
+                    double finishLon, bool recalculation, bool found, double etaSec, double lengthM);
 EngineReport GetLastEngineReport();
 
 struct OverlayMap

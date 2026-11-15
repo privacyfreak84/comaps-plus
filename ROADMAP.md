@@ -33,7 +33,7 @@ Status: done.
 
 Done:
 
-- Long car routes in seconds instead of minutes, with the same routes CoMaps would choose. Measurements and checks are in the [README](README.md#fast-car-routes).
+- Long car routes in seconds instead of minutes, with the same routes CoMaps would choose, except that turning around on a divided road costs more (below). Measurements and checks are in the [README](README.md#fast-car-routes).
 - Route data prepared on the phone in the background, after downloads, map updates and app start, with progress and Cancel.
 - Routes through maps that aren't prepared yet: estimated, with a message, that map prepared first, the route recalculated by itself afterwards.
 - Avoid settings, exact with or without their extra data (roadmap item 11).
@@ -42,6 +42,8 @@ Done:
 - Roads open only at certain times (access:conditional) are checked for the time the route gets there, not frozen when the map is prepared.
 - Preparation memory down by about 17% (Uttar Pradesh 960 MB to 800 MB at the peak).
 - Preparation about twice as fast, with the same route data (2026-11-15). On the 2-core test machine with 2 threads: Uttar Pradesh 127 s to 68 s for a first preparation and 54 s to 45 s after a map update; Madhya Pradesh 60 s to 31 s and Maharashtra 88 s to 49 s on one thread. Dividing a map into cells takes a third of the time it did (Uttar Pradesh 68 s to 24 s), reading the roads two thirds (35 s to 23 s). The files for Madhya Pradesh and Maharashtra are byte for byte the same as before apart from the random build id, and Uttar Pradesh gets the same cells.
+- Turning around on a divided road costs 90 s more (2026-11-15), after a report from Lucknow: heading north on a divided road, the route turned back through a gap in the median to reach a main road, for a gain of a few seconds in the search's terms. CoMaps' 2-minute U-turn penalty only covers reversing on one road. Every map is prepared once more for this (route data version 3, file format 10). Uttar Pradesh has 30,622 such places, Madhya Pradesh 15,581, Maharashtra 47,758; files grow by about 0.1 MB. Details in the [README](README.md#fast-car-routes).
+- Not changed yet: CoMaps assumes about 20 km/h on residential streets and 28 km/h on the road in that report, where the car did 44 to 58. Test builds now keep a local list of route calculations so that speeds can be set from real drives.
 - A map is prepared as soon as its download finishes, while other maps still download; before, nothing started until the whole download queue was done. Preparation uses 2 to 4 threads depending on the phone, 2 while a route is followed.
 - Tested outside India: Berlin with Brandenburg, and Tyrol, Salzburg and Vorarlberg.
 

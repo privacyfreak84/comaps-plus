@@ -29,6 +29,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace plus_overlay
@@ -41,12 +42,16 @@ namespace plus_overlay
 //   penalties, restrictions handling, the overlay model). Raise it only when such a change makes old
 //   cliques wrong; that is the only code change that makes the app rebuild every file.
 // - The partition parameters (DefaultParamsHash) are fixed; changing them also forces a rebuild.
-constexpr uint32_t kFileFormatVersion = 9;  // 5: smaller layout; 6: 16-bit clique values; 7: road types per cell;
-                                            // 8: road types of the cells' paths and boundaries;
-                                            // 9: and of each entry's row and exit's column
+constexpr uint32_t kFileFormatVersion = 10;  // 5: smaller layout; 6: 16-bit clique values; 7: road types per cell;
+                                             // 8: road types of the cells' paths and boundaries;
+                                             // 9: and of each entry's row and exit's column;
+                                             // 10: turn-around copies (kTurnArounds)
 constexpr uint32_t kMinReadableFormatVersion = 7;  // 7: road types per cell (routes with avoid options without
                                                    // their file)
-constexpr uint32_t kRoutingDataVersion = 2;  // 2: time-dependent edges, penalty units in cliques
+constexpr uint32_t kRoutingDataVersion = 3;  // 2: time-dependent edges, penalty units in cliques;
+                                             // 3: turning around on a divided road costs extra
+// Copy state of a turn-around copy (below); via-way copies hold an automaton state.
+constexpr uint32_t kTurnAroundCopyState = 0xFFFFFFFF;
 constexpr char const kFileExtension[] = ".plusovl";
 constexpr size_t kMaxLevels = 4;  // two role bits per level in one byte
 
@@ -75,6 +80,20 @@ struct FileContents
   uint32_t n = 0;      // baseN + copies
   std::vector<uint32_t> copyOrig, copyState;
   std::vector<std::vector<uint32_t>> patterns;
+  // Turning around on a divided road (routing::IndexGraph::IsPlusTurnAround): from the last piece |from| of
+  // one carriageway over the connector onto a piece of the other. |under| is a vertex of the connector (the
+  // base vertex or a via-way copy); |copy| (copy state kTurnAroundCopyState) is its copy for arriving from
+  // base vertex |from|: edges from |from|'s vertices onto |under| lead to |copy| instead, |copy| has |under|'s
+  // edges, and those onto the base vertices |charged| (or copies of them) cost
+  // IndexGraph::PlusTurnAroundExtraS() more.
+  struct TurnAround
+  {
+    uint32_t copy = 0;
+    uint32_t from = 0;
+    uint32_t under = 0;
+    std::vector<uint32_t> charged;
+  };
+  std::vector<TurnAround> turnArounds;
   std::vector<FileTransition> transitions;
   std::vector<uint32_t> special;  // sorted (overlay.hpp)
   bool timeDependent = false;     // the map has time-dependent edges (dynamic_edges.hpp)
@@ -247,6 +266,22 @@ public:
   uint32_t CopyId(uint32_t state, uint32_t base) const;
   std::vector<uint32_t> const * CopiesOf(uint32_t base) const;
   ViaWayAutomaton const * Automaton() const { return m_automaton.get(); }
+  // Turn-around copies (FileContents::turnArounds). The copy of vertex |under| for arriving from base vertex
+  // |from|, kNone if there is none; the vertex a copy stands for; whether stepping from |copy| onto base
+  // vertex |to| (or a copy of it) costs extra.
+  uint32_t TurnAroundCopy(uint32_t from, uint32_t under) const
+  {
+    if (m_turnCopy.empty())
+      return kNone;
+    auto const it = m_turnCopy.find((uint64_t(from) << 32) | under);
+    return it == m_turnCopy.end() ? kNone : it->second;
+  }
+  uint32_t TurnAroundUnder(uint32_t copy) const { return m_turnUnder.at(copy); }
+  bool TurnAroundCharged(uint32_t copy, uint32_t to) const
+  {
+    return m_turnCharged.count((uint64_t(copy) << 32) | to) != 0;
+  }
+  size_t NumTurnArounds() const { return m_turnCopy.size(); }
 
   // Partition and roles.
   // Level-1 cells are stored as runs: consecutive vertices mostly share a cell.
@@ -434,5 +469,8 @@ private:
   std::unique_ptr<ViaWayAutomaton> m_automaton;
   std::unordered_map<uint64_t, uint32_t> m_copyId;                    // (state << 32 | base) -> copy
   std::unordered_map<uint32_t, std::vector<uint32_t>> m_copiesOf;     // base -> copies
+  std::unordered_map<uint64_t, uint32_t> m_turnCopy;                  // (from << 32 | under) -> copy
+  std::unordered_map<uint32_t, uint32_t> m_turnUnder;                 // copy -> under
+  std::unordered_set<uint64_t> m_turnCharged;                         // (copy << 32 | to)
 };
 }  // namespace plus_overlay

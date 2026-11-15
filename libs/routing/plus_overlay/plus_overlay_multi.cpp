@@ -844,6 +844,29 @@ int RunRouter(Multi & m)
     std::cout << "  " << r.name << ": " << routing::DebugPrint(code) << " in " << secs << " s, ETA "
               << (code == routing::RouterResultCode::NoError ? Hms(route.GetTotalTimeSec()) : "-") << ", "
               << segs.size() << " segments, " << Mem() << "\n";
+    // Turn-arounds on divided roads the route makes (IndexGraph::IsPlusTurnAround), as "<name> turnarounds N".
+    {
+      size_t turns = 0;
+      for (size_t i = 0; i + 2 < segs.size(); ++i)
+        if (segs[i].GetMwmId() == segs[i + 1].GetMwmId() && segs[i].GetMwmId() == segs[i + 2].GetMwmId())
+        {
+          bool const t = m.world->GetIndexGraph(segs[i].GetMwmId()).IsPlusTurnAround(segs[i], segs[i + 1], segs[i + 2]);
+          turns += t;
+          if (t && FLAGS_weights)
+            std::cout << "    turn-around at step " << i << " of " << segs.size() << ": " << SegStr(segs[i]) << " "
+                      << SegStr(segs[i + 1]) << " " << SegStr(segs[i + 2]) << "\n";
+        }
+      // And what the route costs in the search's terms: CoMaps' weight of every real step plus the extra for
+      // each turn-around.
+      double model = turns * routing::IndexGraph::PlusTurnAroundExtraS();
+      for (size_t i = 0; i + 1 < segs.size(); ++i)
+        if (segs[i].GetMwmId() == segs[i + 1].GetMwmId())
+          model += m.world->GetIndexGraph(segs[i].GetMwmId())
+                       .CalculateEdgeWeight(routing::EdgeEstimator::Purpose::Weight, true /* isOutgoing */, segs[i],
+                                            segs[i + 1])
+                       .GetIntegratedWeight();
+      std::cout << "  " << r.name << " turnarounds " << turns << " cost " << model << "\n";
+    }
     out << r.name << " " << (code == routing::RouterResultCode::NoError ? 1 : 0) << " " << secs << " "
         << (code == routing::RouterResultCode::NoError ? route.GetTotalTimeSec() : 0.0) << " " << segs.size();
     for (auto const & s : segs)
@@ -1407,7 +1430,11 @@ int main(int argc, char ** argv)
     return 0;
   }
   if (FLAGS_mode == "router")
+  {
+    // COMAPS_PLUS_ROUTE_LOG=1: also write the app's local route list (plus_overlay::AppendRouteLog).
+    plus_overlay::SetRouteLogEnabled(getenv("COMAPS_PLUS_ROUTE_LOG") != nullptr);
     return RunRouter(m);
+  }
   if (FLAGS_mode == "runtime")
     return RunRuntime(m);
 

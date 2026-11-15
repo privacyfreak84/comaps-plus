@@ -319,6 +319,41 @@ void IndexGraph::GetSegmentCandidateForJoint(Segment const & parent, bool isOutg
 /// \param |parentWeights| - see |IndexGraphStarterJoints::GetEdgeList| method about this argument.
 ///                          Shortly - in case of |isOutgoing| == false, method saves here the weights
 ///                                   from parent to firstChildren.
+double IndexGraph::PlusTurnAroundExtraS()
+{
+  static double const extra = []
+  {
+    char const * e = getenv("COMAPS_PLUS_TURNAROUND_S");
+    return e ? atof(e) : 90.0;
+  }();
+  return extra;
+}
+
+bool IndexGraph::IsPlusTurnAround(Segment const & u, Segment const & c, Segment const & v) const
+{
+  uint32_t const fu = u.GetFeatureId(), fc = c.GetFeatureId(), fv = v.GetFeatureId();
+  if (fu == fc || fv == fc || fu == fv || u.GetMwmId() != c.GetMwmId() || v.GetMwmId() != c.GetMwmId())
+    return false;
+  // Values, not references: the road cache may drop a road when another one is read.
+  ms::LatLon const c0 = GetPoint(c, false /* front */);
+  ms::LatLon const c1 = GetPoint(c, true /* front */);
+  if (ms::DistanceOnEarth(c0, c1) > kPlusTurnAroundMaxConnectorM)
+    return false;
+  if (!GetRoadGeometry(fu).IsOneWay() || !GetRoadGeometry(fv).IsOneWay())
+    return false;
+  ms::LatLon const u0 = GetPoint(u, false /* front */);
+  ms::LatLon const u1 = GetPoint(u, true /* front */);
+  ms::LatLon const v0 = GetPoint(v, false /* front */);
+  ms::LatLon const v1 = GetPoint(v, true /* front */);
+  double const k = cos(u1.m_lat * math::pi / 180.0);
+  double const ux = (u1.m_lon - u0.m_lon) * k, uy = u1.m_lat - u0.m_lat;
+  double const vx = (v1.m_lon - v0.m_lon) * k, vy = v1.m_lat - v0.m_lat;
+  double const lu = sqrt(ux * ux + uy * uy), lv = sqrt(vx * vx + vy * vy);
+  if (lu <= 0.0 || lv <= 0.0)
+    return false;
+  return (ux * vx + uy * vy) / (lu * lv) <= -cos(kPlusTurnAroundMaxDeg * math::pi / 180.0);
+}
+
 void IndexGraph::ReconstructJointSegment(astar::VertexData<JointSegment, RouteWeight> const & parentVertexData,
                                          Segment const & parent, SegmentListT const & firstChildren,
                                          PointIdListT const & lastPointIds, bool isOutgoing,
@@ -401,8 +436,20 @@ void IndexGraph::ReconstructJointSegment(astar::VertexData<JointSegment, RouteWe
 
     do
     {
-      RouteWeight const weight =
+      RouteWeight weight =
           CalculateEdgeWeight(EdgeEstimator::Purpose::Weight, isOutgoing, prev, current, weightTimeToParent);
+      // Tabula: turning around on a divided road (IsPlusTurnAround). The third road is where the search
+      // came from: the end of the joint segment before |parent|'s (after it, searching backwards).
+      if (prev == parent && !parentJoint.IsFake() && parentJoint.GetStartSegmentId() == parentJoint.GetEndSegmentId())
+      {
+        auto const it = parents.find(parentJoint);
+        if (it != parents.end() && !it->second.IsFake())
+        {
+          Segment const other = it->second.GetSegment(!isOutgoing /* start */);
+          if (isOutgoing ? IsPlusTurnAround(other, parent, firstChild) : IsPlusTurnAround(firstChild, parent, other))
+            weight += RouteWeight(PlusTurnAroundExtraS());
+        }
+      }
 
       if (isOutgoing || prev != parent)
         summaryWeight += weight;
