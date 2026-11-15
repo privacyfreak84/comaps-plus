@@ -253,6 +253,12 @@ JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeRefres
   frm()->GetRoutingManager().RoutingSession().RebuildRouteOnTrafficUpdate();
 }
 
+JNIEXPORT void JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeSetRouteLog(JNIEnv *, jclass,
+                                                                                       jboolean enabled)
+{
+  plus_overlay::SetRouteLogEnabled(enabled == JNI_TRUE);
+}
+
 JNIEXPORT jlong JNICALL Java_app_organicmaps_sdk_routing_PlusOverlay_nativeStorageBytes(JNIEnv *, jclass)
 {
   uint64_t bytes = 0;

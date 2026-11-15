@@ -23,6 +23,7 @@
 #include "routing/index_graph_loader.hpp"
 #include "indexer/feature_data.hpp"
 #include "indexer/feature.hpp"
+#include "indexer/feature_algo.hpp"
 #include "indexer/ftypes_matcher.hpp"
 #include "routing/plus_overlay/overlay_router.hpp"
 
@@ -56,6 +57,18 @@ DEFINE_bool(print_points, false, "router mode: print points at 20, 40, 60 and 80
                                   "places tests).");
 DEFINE_bool(route_avoid_test, false, "router mode: what Avoid would offer (plus_avoid::RouteAvoidOption) at the "
                                      "route's 50% point, 1 km off it, and for a 3 km settlement on and off it.");
+DEFINE_bool(heading_test, false, "router mode: for every route, stand at 15/35/55/75% of it, heading the way it "
+                                 "goes there, and route back to its start and on to its finish (what a driver who "
+                                 "left a route gets). Lines <name>_<pct>_back / _fwd; after the segments count: "
+                                 "metres driven before the route first comes back within 25 m of the start point "
+                                 "(0: it never does).");
+DEFINE_string(find, "", "find mode: print every named feature whose default name contains one of these "
+                         "';'-separated texts, with its place.");
+DEFINE_string(box, "", "roads mode: 'lat1,lon1,lat2,lon2'. Prints every car road with a point in the box: feature, "
+                       "class, speeds used for the route choice and for the ETA (km/h), in a city or not, through "
+                       "traffic allowed, one way, name, first and last point.");
+DEFINE_bool(weights, false, "router mode: print how each route's weight (what the search minimises) is made up: "
+                            "seconds by road class, and every step that carries a penalty.");
 DEFINE_bool(force_joints, true, "router mode: COMAPS_PLUS_FORCE_JOINTS=1 for the normal search.");
 
 namespace
@@ -831,11 +844,142 @@ int RunRouter(Multi & m)
     std::cout << "  " << r.name << ": " << routing::DebugPrint(code) << " in " << secs << " s, ETA "
               << (code == routing::RouterResultCode::NoError ? Hms(route.GetTotalTimeSec()) : "-") << ", "
               << segs.size() << " segments, " << Mem() << "\n";
+    // Turn-arounds on divided roads the route makes (IndexGraph::IsPlusTurnAround), as "<name> turnarounds N".
+    {
+      size_t turns = 0;
+      for (size_t i = 0; i + 2 < segs.size(); ++i)
+        if (segs[i].GetMwmId() == segs[i + 1].GetMwmId() && segs[i].GetMwmId() == segs[i + 2].GetMwmId())
+        {
+          bool const t = m.world->GetIndexGraph(segs[i].GetMwmId()).IsPlusTurnAround(segs[i], segs[i + 1], segs[i + 2]);
+          turns += t;
+          if (t && FLAGS_weights)
+            std::cout << "    turn-around at step " << i << " of " << segs.size() << ": " << SegStr(segs[i]) << " "
+                      << SegStr(segs[i + 1]) << " " << SegStr(segs[i + 2]) << "\n";
+        }
+      // And what the route costs in the search's terms: CoMaps' weight of every real step plus the extra for
+      // each turn-around.
+      double model = turns * routing::IndexGraph::PlusTurnAroundExtraS();
+      for (size_t i = 0; i + 1 < segs.size(); ++i)
+        if (segs[i].GetMwmId() == segs[i + 1].GetMwmId())
+          model += m.world->GetIndexGraph(segs[i].GetMwmId())
+                       .CalculateEdgeWeight(routing::EdgeEstimator::Purpose::Weight, true /* isOutgoing */, segs[i],
+                                            segs[i + 1])
+                       .GetIntegratedWeight();
+      std::cout << "  " << r.name << " turnarounds " << turns << " cost " << model << "\n";
+    }
     out << r.name << " " << (code == routing::RouterResultCode::NoError ? 1 : 0) << " " << secs << " "
         << (code == routing::RouterResultCode::NoError ? route.GetTotalTimeSec() : 0.0) << " " << segs.size();
     for (auto const & s : segs)
       out << " " << SegStr(s);
     out << "\n";
+    if (code == routing::RouterResultCode::NoError && FLAGS_weights && segs.size() > 1)
+    {
+      std::map<std::string, std::pair<double, double>> byClass;  // class -> (weight seconds, metres)
+      double total = 0;
+      std::cout.precision(9);
+      for (size_t i = 0; i + 1 < segs.size(); ++i)
+      {
+        auto & ig = m.world->GetIndexGraph(segs[i + 1].GetMwmId());
+        if (segs[i].GetMwmId() != segs[i + 1].GetMwmId())
+          continue;
+        auto const w = ig.CalculateEdgeWeight(routing::EdgeEstimator::Purpose::Weight, true /* isOutgoing */, segs[i],
+                                              segs[i + 1]);
+        auto const & road = ig.GetRoadGeometry(segs[i + 1].GetFeatureId());
+        auto const hw = road.GetHighwayType();
+        auto & c = byClass[hw ? DebugPrint(*hw) : std::string("?")];
+        double const lenM = ms::DistanceOnEarth(ig.GetPoint(segs[i + 1], false), ig.GetPoint(segs[i + 1], true));
+        double const integrated = w.GetIntegratedWeight();
+        total += integrated;
+        double const drive = lenM / (road.GetSpeed(segs[i + 1].IsForward()).m_weight / 3.6);
+        c.first += integrated;
+        c.second += lenM;
+        if (integrated > drive + 2.5)
+        {
+          auto const pt = ig.GetPoint(segs[i], true);
+          std::ostringstream os;
+          os << w;
+          std::cout << "    step " << i << " f" << segs[i].GetFeatureId() << " -> f" << segs[i + 1].GetFeatureId()
+                    << " at " << pt.m_lat << "," << pt.m_lon << ": " << integrated << " s for " << lenM
+                    << " m (driving " << drive << " s) " << os.str() << "\n";
+        }
+      }
+      for (auto const & [name, c] : byClass)
+        std::cout << "    " << name << ": " << c.first << " s, " << c.second << " m\n";
+      std::cout << "    weight of the real steps: " << total << " s\n";
+    }
+    if (code == routing::RouterResultCode::NoError && FLAGS_heading_test)
+    {
+      std::vector<m2::PointD> const poly = route.GetPoly().GetPoints();
+      double total = 0;
+      for (size_t i = 1; i < poly.size(); ++i)
+        total += mercator::DistanceOnEarth(poly[i - 1], poly[i]);
+      for (int pct : {15, 35, 55, 75})
+      {
+        double run = 0;
+        size_t at = 0;
+        for (size_t i = 1; i < poly.size(); ++i)
+        {
+          run += mercator::DistanceOnEarth(poly[i - 1], poly[i]);
+          if (run >= total * pct / 100.0)
+          {
+            at = i;
+            break;
+          }
+        }
+        if (at == 0 || at + 1 >= poly.size())
+          continue;
+        m2::PointD ahead = poly[at];
+        for (size_t i = at + 1; i < poly.size(); ++i)
+        {
+          ahead = poly[i];
+          if (mercator::DistanceOnEarth(poly[at], ahead) > 30)
+            break;
+        }
+        m2::PointD const heading = (ahead - poly[at]).Normalize();
+        for (int back = 0; back < 2; ++back)
+        {
+          routing::Route rr("" /* router */, 0 /* routeId */);
+          auto const t1 = Clock::now();
+          auto const c2 = router->CalculateRoute(
+              routing::Checkpoints(std::vector<m2::PointD>{poly[at], mercator::FromLatLon(back ? r.a : r.b)}), heading,
+              false /* adjustToPrevRoute */, delegate, rr);
+          double const s2 = Since(t1);
+          double comesBack = 0, lenM = 0;
+          size_t nSegs = 0;
+          std::ostringstream segStr;
+          if (c2 == routing::RouterResultCode::NoError)
+          {
+            auto const & pp = rr.GetPoly().GetPoints();
+            double d = 0;
+            bool away = false;
+            for (size_t i = 1; i < pp.size(); ++i)
+            {
+              d += mercator::DistanceOnEarth(pp[i - 1], pp[i]);
+              double const fromStart = mercator::DistanceOnEarth(pp[0], pp[i]);
+              if (fromStart > 40)
+                away = true;
+              if (away && fromStart < 25 && comesBack == 0)
+                comesBack = d;
+            }
+            lenM = d;
+            routing::Segment last;
+            for (auto const & rs : rr.GetRouteSegments())
+            {
+              auto const & sg = rs.GetSegment();
+              if (sg.IsRealSegment() && (nSegs == 0 || !(last == sg)))
+              {
+                segStr << " " << SegStr(sg);
+                last = sg;
+                ++nSegs;
+              }
+            }
+          }
+          out << r.name << "_" << pct << (back ? "_back " : "_fwd ") << (c2 == routing::RouterResultCode::NoError ? 1 : 0)
+              << " " << s2 << " " << (c2 == routing::RouterResultCode::NoError ? rr.GetTotalTimeSec() : 0.0) << " "
+              << nSegs << " " << comesBack << " " << lenM << segStr.str() << "\n";
+        }
+      }
+    }
   }
   routing::RoutingOptions::SaveOptionsToSettings(savedOptions);
   return 0;
@@ -1223,8 +1367,74 @@ int main(int argc, char ** argv)
       setenv("COMAPS_PLUS_FORCE_JOINTS", "1", 1);
     return RunReroute(m);
   }
+  if (FLAGS_mode == "find" || FLAGS_mode == "roads")
+  {
+    std::cout.precision(9);
+    auto const texts = SplitList(FLAGS_find, ';');
+    double box[4] = {0, 0, 0, 0};
+    if (FLAGS_mode == "roads")
+    {
+      auto const parts = SplitList(FLAGS_box, ',');
+      CHECK_EQUAL(parts.size(), 4, ());
+      for (int i = 0; i < 4; ++i)
+        box[i] = std::stod(parts[i]);
+    }
+    for (size_t mi = 0; mi < m.names.size(); ++mi)
+    {
+      auto const mwmId = m.dataSource.GetMwmIdByCountryFile(platform::CountryFile(m.names[mi]));
+      FeaturesLoaderGuard guard(m.dataSource, mwmId);
+      auto const model = m.factory->GetVehicleModelForCountry(m.names[mi]);
+      auto & ig = m.world->GetIndexGraph(m.ids[mi]);
+      for (uint32_t f = 0; f < guard.GetNumFeatures(); ++f)
+      {
+        auto ft = guard.GetFeatureByIndex(f);
+        if (!ft)
+          continue;
+        std::string const name(ft->GetName(localisation::kDefaultNameIndex));
+        if (FLAGS_mode == "find")
+        {
+          if (name.empty())
+            continue;
+          bool hit = false;
+          for (auto const & t : texts)
+            hit = hit || name.find(t) != std::string::npos;
+          if (!hit)
+            continue;
+          auto const ll = mercator::ToLatLon(feature::GetCenter(*ft));
+          std::cout << "  " << name << " | " << ll.m_lat << " " << ll.m_lon << " | "
+                    << (ft->GetGeomType() == feature::GeomType::Line ? "line" : "point/area") << " f" << f << "\n";
+          continue;
+        }
+        if (ft->GetGeomType() != feature::GeomType::Line || !model->IsRoad(feature::TypesHolder(*ft)))
+          continue;
+        auto const & road = ig.GetRoadGeometry(f);
+        if (!road.IsValid() || road.GetPointsCount() < 2)
+          continue;
+        bool inside = false;
+        for (uint32_t i = 0; i < road.GetPointsCount() && !inside; ++i)
+        {
+          auto const & pt = road.GetPoint(i);
+          inside = pt.m_lat >= box[0] && pt.m_lat <= box[2] && pt.m_lon >= box[1] && pt.m_lon <= box[3];
+        }
+        if (!inside)
+          continue;
+        auto const hw = road.GetHighwayType();
+        auto const & a = road.GetPoint(0);
+        auto const & b = road.GetPoint(road.GetPointsCount() - 1);
+        std::cout << "  f" << f << " " << (hw ? DebugPrint(*hw) : std::string("?")) << " choice "
+                  << road.GetSpeed(true).m_weight << " eta " << road.GetSpeed(true).m_eta << " city " << road.IsInCity()
+                  << " through " << road.IsPassThroughAllowed() << " oneway " << road.IsOneWay() << " '" << name << "' "
+                  << a.m_lat << "," << a.m_lon << " -> " << b.m_lat << "," << b.m_lon << "\n";
+      }
+    }
+    return 0;
+  }
   if (FLAGS_mode == "router")
+  {
+    // COMAPS_PLUS_ROUTE_LOG=1: also write the app's local route list (plus_overlay::AppendRouteLog).
+    plus_overlay::SetRouteLogEnabled(getenv("COMAPS_PLUS_ROUTE_LOG") != nullptr);
     return RunRouter(m);
+  }
   if (FLAGS_mode == "runtime")
     return RunRuntime(m);
 

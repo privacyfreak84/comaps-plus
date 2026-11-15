@@ -48,6 +48,8 @@ enum Section : uint32_t
   kEntryRoads,          // u8 per entry of every cell, level 1 first: road types of the entry's own segment
                         // (format 8), packed with those its row's paths rely on (format 9, PackBoundaryRoads)
   kExitRoads,           // u8 per exit, likewise (its column's paths)
+  kTurnArounds,         // u32: per turn-around copy: copy, from, under, number of charged targets, the targets
+                        // (format 10; absent means none)
 };
 
 enum LevelSection : uint32_t
@@ -387,6 +389,19 @@ bool WriteOverlayFile(std::string const & path, FileContents const & fc, Partiti
     pat.insert(pat.end(), pt.begin(), pt.end());
   }
   putVec(kPatterns, pat);
+  if (!fc.turnArounds.empty())
+  {
+    std::vector<uint32_t> ta;
+    for (auto const & t : fc.turnArounds)
+    {
+      ta.push_back(t.copy);
+      ta.push_back(t.from);
+      ta.push_back(t.under);
+      ta.push_back(static_cast<uint32_t>(t.charged.size()));
+      ta.insert(ta.end(), t.charged.begin(), t.charged.end());
+    }
+    putVec(kTurnArounds, ta);
+  }
   if (fc.timeDependent)
     h.flags |= kTimeDependent;
   {
@@ -794,6 +809,41 @@ bool MappedOverlay::Parse(std::string * error)
   }
   if (!patterns.empty())
     m_automaton = std::make_unique<ViaWayAutomaton>(patterns);
+  {
+    auto const * ta = reinterpret_cast<uint32_t const *>(sec(kTurnArounds));
+    size_t const words = count(kTurnArounds, 4);
+    for (size_t i = 0; i < words;)
+    {
+      if (i + 4 > words || i + 4 + ta[i + 3] > words)
+      {
+        SetError(error, "bad turn-around table");
+        return false;
+      }
+      uint32_t const copy = ta[i], from = ta[i + 1], under = ta[i + 2], num = ta[i + 3];
+      // |under|: the copied base vertex itself or one of its via-way copies (never a turn-around copy).
+      if (copy < m_baseN || copy >= m_n || from >= m_baseN || m_copyState[copy - m_baseN] != kTurnAroundCopyState ||
+          under >= m_n ||
+          (under < m_baseN ? under != m_copyOrig[copy - m_baseN]
+                           : (m_copyState[under - m_baseN] == kTurnAroundCopyState ||
+                              m_copyOrig[under - m_baseN] != m_copyOrig[copy - m_baseN])))
+      {
+        SetError(error, "bad turn-around table");
+        return false;
+      }
+      m_turnCopy[(uint64_t(from) << 32) | under] = copy;
+      m_turnUnder[copy] = under;
+      for (uint32_t k = 0; k < num; ++k)
+      {
+        if (ta[i + 4 + k] >= m_baseN)
+        {
+          SetError(error, "bad turn-around table");
+          return false;
+        }
+        m_turnCharged.insert((uint64_t(copy) << 32) | ta[i + 4 + k]);
+      }
+      i += 4 + num;
+    }
+  }
   for (uint32_t i = 0; i < m_n - m_baseN; ++i)
   {
     uint32_t const local = m_baseN + i;

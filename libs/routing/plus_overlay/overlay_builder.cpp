@@ -132,6 +132,14 @@ struct LeanGraph
   // Base vertices the search must be able to stand on at any level: ends of time-dependent edges.
   std::vector<uint32_t> allLevels;
   uint64_t rawSlots = 0, rawValid = 0, rawEdges = 0, dynamicEdges = 0;
+  // Turning around on a divided road (routing::IndexGraph::IsPlusTurnAround): raw slots from, connector, to.
+  // LeanExtract finds them and keeps their segments; LeanExpandTurnArounds turns them into copies.
+  struct TurnTriple
+  {
+    uint32_t from, connector, to;
+  };
+  std::vector<TurnTriple> turnTriples;
+  std::vector<FileContents::TurnAround> turnArounds;
 
   bool Kept(uint32_t v) const { return (keptBits[v >> 6] >> (v & 63)) & 1; }
   uint32_t Rank(uint32_t v) const
@@ -328,7 +336,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   // Pass 1: degrees.
   std::vector<uint8_t> indeg(n, 0), outdeg(n, 0), valid(n, 0);
   std::vector<uint8_t> special(n, 0);  // kept, and a boundary at every level
-  routing::IndexGraph::SegmentEdgeListT edges;
+  routing::IndexGraph::SegmentEdgeListT edges, onward;
   ig.SetPlusEdgesOnly(true);  // this walk only counts edges
   forEachValid(0.0, 0.12, "reading roads", [&](routing::Segment const & s)
   {
@@ -339,15 +347,33 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
     ig.GetEdgeList(s, true /* isOutgoing */, true /* useRoutingOptions */, edges);
     outdeg[v] = static_cast<uint8_t>(std::min<size_t>(255, edges.size()));
     lg.rawEdges += edges.size();
+    uint32_t const f = s.GetFeatureId();
     for (auto const & e : edges)
     {
-      uint32_t const t = lg.Slot(e.GetTarget());
+      routing::Segment const c = e.GetTarget();
+      uint32_t const t = lg.Slot(c);
       if (indeg[t] < 2)
         ++indeg[t];
-      if (sp.Dynamic(s, e.GetTarget()))
+      if (sp.Dynamic(s, c))
       {
         special[v] = special[t] = 1;
         ++lg.dynamicEdges;
+        continue;
+      }
+      // Turn-arounds starting on |s|: from a one-way road onto another road, then onto a third, one-way.
+      uint32_t const fc = c.GetFeatureId();
+      if (!oneway[f] || fc == f)
+        continue;
+      onward.clear();
+      ig.GetEdgeList(c, true /* isOutgoing */, true /* useRoutingOptions */, onward);
+      for (auto const & e2 : onward)
+      {
+        routing::Segment const w = e2.GetTarget();
+        uint32_t const fw = w.GetFeatureId();
+        if (fw == fc || fw == f || fw > maxF || !oneway[fw] || sp.Dynamic(c, w))
+          continue;
+        if (ig.IsPlusTurnAround(s, c, w))
+          lg.turnTriples.push_back({v, t, lg.Slot(w)});
       }
     }
   });
@@ -385,6 +411,10 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         for (uint32_t v = 2 * lg.featBase[f]; v < 2 * lg.featBase[f + 1]; ++v)
           if (valid[v])
             keep(v);
+  // The three segments of a turn-around are vertices, so its two steps are plain edges.
+  for (auto const & t : lg.turnTriples)
+    for (uint32_t v : {t.from, t.connector, t.to})
+      keep(v);
   lg.keptRank.assign(lg.keptBits.size(), 0);
   for (size_t w = 1; w < lg.keptBits.size(); ++w)
     lg.keptRank[w] = lg.keptRank[w - 1] + static_cast<uint32_t>(__builtin_popcountll(lg.keptBits[w - 1]));
@@ -532,6 +562,99 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   os << "pass 2 (chains): " << kn << " kept, " << g.NumEdges() << " compressed edges, " << dropped
      << " dead-end chains, " << lg.dynamicEdges << " time-dependent steps (" << lg.allLevels.size()
      << " special vertices) in " << Since(t1) << " s, " << Mem();
+  rep.Log(os.str());
+}
+
+// Turn-arounds on the compressed graph, after the via-way copies. A vertex here is a base vertex or a
+// via-way copy of one. For every edge from a vertex of |from| onto a vertex y of the connector, y gets a
+// copy (one per from and y) that the edge leads to instead; the copy has y's edges, and those onto the
+// roads that complete the turn-around cost extra. Copies are made after every redirection, so one
+// turn-around leading straight into another is covered too.
+void LeanExpandTurnArounds(LeanGraph & lg, Reporter const & rep)
+{
+  if (lg.turnTriples.empty())
+    return;
+  Graph & g = lg.g;
+  // (from, connector) -> charged targets, in compressed base ids.
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> groups;
+  for (auto const & t : lg.turnTriples)
+    groups[{lg.Rank(t.from), lg.Rank(t.connector)}].push_back(lg.Rank(t.to));
+  std::vector<LeanGraph::TurnTriple>().swap(lg.turnTriples);
+  for (auto & [key, charged] : groups)
+  {
+    std::sort(charged.begin(), charged.end());
+    charged.erase(std::unique(charged.begin(), charged.end()), charged.end());
+  }
+
+  uint32_t const firstCopy = g.n;
+  auto baseOf = [&](uint32_t v) { return v < lg.baseN ? v : lg.copyOrig[v - lg.baseN]; };
+  // Redirect first, then copy.
+  std::map<std::pair<uint32_t, uint32_t>, uint32_t> copyOf;  // (from base, y) -> copy
+  std::vector<std::pair<uint32_t, uint32_t>> copies;         // per copy: (from base, y)
+  for (uint32_t x = 0; x < firstCopy; ++x)
+  {
+    uint32_t const from = baseOf(x);
+    auto const lo = groups.lower_bound({from, 0});
+    if (lo == groups.end() || lo->first.first != from)
+      continue;
+    for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
+    {
+      if (lg.interior[e] || !(g.fwdW[e] < kInf))
+        continue;
+      uint32_t const y = g.fwdTo[e];
+      if (groups.find({from, baseOf(y)}) == groups.end())
+        continue;
+      auto const ins = copyOf.emplace(std::make_pair(from, y), firstCopy + static_cast<uint32_t>(copies.size()));
+      if (ins.second)
+        copies.emplace_back(from, y);
+      g.fwdTo[e] = ins.first->second;
+    }
+  }
+  uint64_t chargedEdges = 0;
+  for (size_t i = 0; i < copies.size(); ++i)
+  {
+    auto const [from, y] = copies[i];
+    uint32_t const c = baseOf(y);
+    auto const & charged = groups.at({from, c});
+    for (uint64_t e = g.fwdOff[y]; e < g.fwdOff[y + 1]; ++e)
+    {
+      uint32_t const to = g.fwdTo[e];
+      // A target that is itself a new copy stands for the vertex it copies.
+      uint32_t const toBase = baseOf(to >= firstCopy ? copies[to - firstCopy].second : to);
+      bool const extra = !lg.interior[e] && g.fwdW[e] < kInf && std::binary_search(charged.begin(), charged.end(), toBase);
+      chargedEdges += extra;
+      g.fwdTo.push_back(to);
+      g.fwdW.push_back(g.fwdW[e] + (extra ? routing::IndexGraph::PlusTurnAroundExtraS() : 0.0));
+      if (!g.fwdK.empty())
+        g.fwdK.push_back(g.fwdK[e]);
+      if (!g.fwdR.empty())
+        g.fwdR.push_back(g.fwdR[e]);
+      lg.interior.push_back(lg.interior[e]);
+    }
+    g.fwdOff.push_back(g.fwdTo.size());
+    if (!g.lat.empty())
+    {
+      g.lat.push_back(g.lat[y]);
+      g.lon.push_back(g.lon[y]);
+    }
+    if (!g.selfR.empty())
+      g.selfR.push_back(g.selfR[y]);
+    FileContents::TurnAround ta;
+    ta.copy = firstCopy + static_cast<uint32_t>(i);
+    ta.from = from;
+    ta.under = y;
+    ta.charged = charged;
+    lg.turnArounds.push_back(std::move(ta));
+  }
+  for (auto const & fy : copies)
+  {
+    lg.copyOrig.push_back(baseOf(fy.second));
+    lg.copyState.push_back(kTurnAroundCopyState);
+  }
+  g.n += static_cast<uint32_t>(copies.size());
+  std::ostringstream os;
+  os << "turn-arounds: " << groups.size() << " places, " << copies.size() << " copies, " << chargedEdges
+     << " edges cost " << routing::IndexGraph::PlusTurnAroundExtraS() << " s more";
   rep.Log(os.str());
 }
 
@@ -754,6 +877,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     mg.reset();  // the router keeps its own IndexGraph; this one was only needed for extraction
     ReleaseFreedMemory();
     LeanExpandViaWay(lg, viaWay, rep);
+    LeanExpandTurnArounds(lg, rep);
     std::vector<uint8_t>().swap(lg.interior);
     ReleaseFreedMemory();
     Graph & g = lg.g;
@@ -902,6 +1026,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     fc.n = g.n;
     fc.copyOrig = lg.copyOrig;
     fc.copyState = lg.copyState;
+    fc.turnArounds = lg.turnArounds;
     fc.patterns = viaWay;
     auto addTransitions = [&](std::vector<routing::Segment> const & segs, std::vector<uint64_t> const & osm,
                               bool isEnter)

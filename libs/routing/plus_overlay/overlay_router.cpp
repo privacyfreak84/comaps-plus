@@ -10,11 +10,17 @@
 #include "routing/segment.hpp"
 #include "routing/world_graph.hpp"
 
+#include "platform/platform.hpp"
+
 #include "geometry/distance_on_sphere.hpp"
 
 #include "base/logging.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -33,6 +39,52 @@ namespace
 std::mutex g_reportMutex;
 EngineReport g_report;
 }  // namespace
+
+namespace
+{
+std::atomic<bool> g_routeLog{false};
+std::mutex g_routeLogMutex;
+}  // namespace
+
+void SetRouteLogEnabled(bool enabled)
+{
+  g_routeLog = enabled;
+}
+
+void AppendRouteLog(double startLat, double startLon, bool hasHeading, double headingDeg, double finishLat,
+                    double finishLon, bool recalculation, bool found, double etaSec, double lengthM)
+{
+  if (!g_routeLog)
+    return;
+  std::lock_guard<std::mutex> lock(g_routeLogMutex);
+  std::string const path = GetPlatform().WritableDir() + "tabula_route_log.csv";
+  uint64_t size = 0;
+  bool const exists = Platform::GetFileSizeByFullPath(path, size);
+  if (exists && size > 1024 * 1024)
+  {
+    std::string const old = GetPlatform().WritableDir() + "tabula_route_log.old.csv";
+    std::remove(old.c_str());
+    std::rename(path.c_str(), old.c_str());
+    size = 0;
+  }
+  std::ofstream out(path, std::ios::app);
+  if (!out)
+    return;
+  if (size == 0)
+    out << "utc,start_lat,start_lon,heading_deg,finish_lat,finish_lon,recalculation,found,eta_s,length_m\n";
+  char when[32] = "";
+  std::time_t const now = std::time(nullptr);
+  std::tm tmUtc{};
+  gmtime_r(&now, &tmUtc);
+  std::strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+  out << when << "," << std::fixed << std::setprecision(6) << startLat << "," << startLon << ",";
+  if (hasHeading)
+    out << std::setprecision(0) << headingDeg;
+  else
+    out << "-";
+  out << "," << std::setprecision(6) << finishLat << "," << finishLon << "," << (recalculation ? 1 : 0) << ","
+      << (found ? 1 : 0) << "," << std::setprecision(0) << etaSec << "," << lengthM << "\n";
+}
 
 void SetLastEngineReport(EngineReport const & r)
 {
@@ -403,32 +455,49 @@ struct OverlayRouter::Impl
 
   uint32_t StartState(MappedOverlay const & o, uint32_t local)
   {
-    auto const * ac = o.Automaton();
-    if (!ac)
-      return 0;
     if (o.IsCopy(local))
-      return o.CopyState(local);
-    return ac->Start(o.FeatureOfLocal(local));
+      return o.CopyState(local);  // an automaton state, or kTurnAroundCopyState
+    auto const * ac = o.Automaton();
+    return ac ? ac->Start(o.FeatureOfLocal(local)) : 0;
   }
 
-  // The overlay target of stepping from (state, feature) onto overlay vertex |base| of |feature t|.
-  // kNone if the step is forbidden by a via-way restriction.
-  uint32_t StepTarget(MappedOverlay const & o, uint32_t state, uint32_t fromFeature, uint32_t base, uint32_t toFeature,
-                      bool inner)
+  // The overlay target of stepping from overlay vertex |from| (in |state|, on |fromFeature|) onto overlay
+  // vertex |base| of |toFeature|. kNone if the step is forbidden by a via-way restriction. |extra|: seconds
+  // the step costs on top of CoMaps' weight (completing a turn-around, FileContents::turnArounds).
+  uint32_t StepTarget(MappedOverlay const & o, uint32_t from, uint32_t state, uint32_t fromFeature, uint32_t base,
+                      uint32_t toFeature, bool inner, double & extra)
   {
+    extra = 0;
     auto const * ac = o.Automaton();
-    if (!ac)
-      return base;
-    uint32_t next = state;
-    if (inner)
-      next = ac->Start(toFeature);
-    else if (toFeature != fromFeature)
-      next = ac->Step(state, toFeature);
-    if (ac->Terminal(next))
-      return kNone;
-    if (ac->Depth(next) >= 2)
-      return o.CopyId(next, base);
-    return base;
+    if (state == kTurnAroundCopyState)
+    {
+      // A turn-around copy steps like the vertex it stands for, and charges the steps that complete the
+      // turn-around.
+      if (!inner && o.TurnAroundCharged(from, base))
+        extra = routing::IndexGraph::PlusTurnAroundExtraS();
+      uint32_t const under = o.TurnAroundUnder(from);
+      state = o.IsCopy(under) ? o.CopyState(under) : (ac ? ac->Start(fromFeature) : 0);
+    }
+    uint32_t target = base;
+    if (ac)
+    {
+      uint32_t next = state;
+      if (inner)
+        next = ac->Start(toFeature);
+      else if (toFeature != fromFeature)
+        next = ac->Step(state, toFeature);
+      if (ac->Terminal(next))
+        return kNone;
+      if (ac->Depth(next) >= 2)
+        target = o.CopyId(next, base);
+    }
+    if (!inner && o.NumTurnArounds() != 0)
+    {
+      uint32_t const copy = o.TurnAroundCopy(o.IsCopy(from) ? o.CopyOrig(from) : from, target);
+      if (copy != kNone)
+        target = copy;
+    }
+    return target;
   }
 
   // Forward chain from real segment |s| in map |m| to the next overlay vertex. |segs| (optional)
@@ -547,10 +616,11 @@ struct OverlayRouter::Impl
       Segment const kseg = chains ? segs.back() : SegOf(m, kept);
       if (kseg == s)
         continue;  // chain back to itself
-      uint32_t const target = StepTarget(o, state, fx, kept, kseg.GetFeatureId(), inner);
+      double extra;
+      uint32_t const target = StepTarget(o, v, state, fx, kept, kseg.GetFeatureId(), inner, extra);
       if (target == kNone)
         continue;
-      out.push_back({MakeKey(m, target), w, kBaseEdge, pen, dyn});
+      out.push_back({MakeKey(m, target), w + extra, kBaseEdge, pen, dyn});
       if (chains)
         chains->push_back(segs);
     }
@@ -594,8 +664,9 @@ struct OverlayRouter::Impl
       auto consider = [&](uint32_t cand)
       {
         uint32_t const st = StartState(o, cand);
-        if (StepTarget(o, st, fp, base, fx, inner) == v)
-          out.push_back({MakeKey(m, cand), w, false});
+        double extra;
+        if (StepTarget(o, cand, st, fp, base, fx, inner, extra) == v)
+          out.push_back({MakeKey(m, cand), w + extra, false});
       };
       consider(kept);
       if (auto const * copies = o.CopiesOf(kept))
@@ -880,6 +951,24 @@ struct OverlayRouter::Impl
       if (!UnpackHop(a, b, l, out))
         return false;
     return true;
+  }
+
+  // The overlay vertex of the real segment under the fake segment next to real segment |s| in a FakeSearch
+  // (|parent| from that search): the segment the route starts on, or finishes on. kNone if there is none in
+  // map |m| or it is no overlay vertex.
+  uint32_t KeptOfFakeNeighbour(uint32_t m, Segment const & s, std::map<Segment, Segment> const & parent)
+  {
+    auto const it = parent.find(s);
+    if (it == parent.end())
+      return kNone;
+    Segment r = it->second;
+    if (!starter->ConvertToReal(r) || r.GetMwmId() != maps[m].id)
+      return kNone;
+    auto const & o = *maps[m].ovl;
+    if (!o.HasSegment(r.GetFeatureId(), r.GetSegmentIdx()))
+      return kNone;
+    uint32_t const slot = o.Slot(r.GetFeatureId(), r.GetSegmentIdx(), r.IsForward());
+    return o.Kept(slot) ? o.Rank(slot) : kNone;
   }
 
   // Dijkstra over the starter's fake vertices from the start (forward) or the finish (backward).
@@ -1195,6 +1284,12 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     std::vector<Segment> chain{s};
     if (!I.WalkForward(m, s, w, kept, inner, &chain, &pen))
       continue;
+    // The route's first whole segment may be the connector of a turn-around that began on the start's own
+    // segment: stand on the connector's copy for that segment then.
+    if (chain.size() == 1)
+      if (uint32_t const before = I.KeptOfFakeNeighbour(m, s, parF); before != kNone)
+        if (uint32_t const copy = I.maps[m].ovl->TurnAroundCopy(before, kept); copy != kNone)
+          kept = copy;
     Key const k = MakeKey(m, kept);
     auto it = src.find(k);
     if (it == src.end() || w < it->second.cost)
@@ -1212,12 +1307,19 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     if (!I.WalkBackward(m, s, w, kept, inner, &chain))
       continue;
     auto const & o = *I.maps[m].ovl;
+    // Likewise at the finish: a turn-around completed onto the finish's own segment.
+    uint32_t const after = chain.empty() ? I.KeptOfFakeNeighbour(m, s, parB) : kNone;
     auto add = [&](uint32_t local)
     {
+      double const wl =
+          w + (after != kNone && o.IsCopy(local) && o.CopyState(local) == kTurnAroundCopyState &&
+                       o.TurnAroundCharged(local, after)
+                   ? routing::IndexGraph::PlusTurnAroundExtraS()
+                   : 0.0);
       Key const k = MakeKey(m, local);
       auto it = tgt.find(k);
-      if (it == tgt.end() || w < it->second.cost)
-        tgt[k] = {s, w, chain, false};
+      if (it == tgt.end() || wl < it->second.cost)
+        tgt[k] = {s, wl, chain, false};
     };
     add(kept);
     if (auto const * copies = o.CopiesOf(kept))

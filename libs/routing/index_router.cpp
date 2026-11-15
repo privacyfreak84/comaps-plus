@@ -388,6 +388,22 @@ RouterResultCode IndexRouter::CalculateRoute(Checkpoints const & checkpoints, m2
       plus_overlay::SetLastEngineReport(r);
     };
     SCOPE_GUARD(plusReport, publishReport);
+    // Tabula: the local route list of test builds (plus_overlay::AppendRouteLog).
+    SCOPE_GUARD(plusRouteLog, ([this, &checkpoints, &startDirection, adjustToPrevRoute, &route]()
+    {
+      if (m_vehicleType != VehicleType::Car)
+        return;
+      auto const a = mercator::ToLatLon(checkpoints.GetStart());
+      auto const b = mercator::ToLatLon(checkpoints.GetFinish());
+      bool const hasHeading = !startDirection.IsAlmostZero();
+      // Compass heading: 0 north, 90 east.
+      double heading = hasHeading ? math::RadToDeg(atan2(startDirection.x, startDirection.y)) : 0.0;
+      if (heading < 0)
+        heading += 360.0;
+      bool const found = route.IsValid();
+      plus_overlay::AppendRouteLog(a.m_lat, a.m_lon, hasHeading, heading, b.m_lat, b.m_lon, adjustToPrevRoute, found,
+                                   found ? route.GetTotalTimeSec() : 0.0, found ? route.GetTotalDistanceMeters() : 0.0);
+    }));
 
     // Tabula: car reroutes are full overlay routes (best route from the new position, 0.3-3 s); CoMaps'
     // rejoin search is kept for the other vehicle types and when the overlay is switched off.
