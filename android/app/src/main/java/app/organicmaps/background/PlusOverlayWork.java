@@ -27,6 +27,7 @@ import app.organicmaps.MwmApplication;
 import app.organicmaps.R;
 import app.organicmaps.sdk.downloader.MapManager;
 import app.organicmaps.sdk.routing.PlusOverlay;
+import app.organicmaps.sdk.routing.RoutingController;
 import app.organicmaps.sdk.util.log.Logger;
 import java.util.Collection;
 import java.util.Collections;
@@ -40,7 +41,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Tabula: builds the overlay files for fast car routing on the phone, one map at a time, after a map
- * download or update (and at app start for anything missed). Shows a progress notification with a
+ * download or update, also while other maps still download (and at app start for anything missed). Shows a progress notification with a
  * Cancel button; cancelling stops the running build until the app starts again or a route needs a map.
  * Until a map's base file is built, routes cross that map on estimates (see PlusRouteStatus); maps a
  * route needs are built first. Every downloaded map gets one file; avoid options and avoided places need
@@ -57,7 +58,14 @@ public class PlusOverlayWork extends Worker
   private static final String CHANNEL_ID = "plus_overlay";
   private static final int PROGRESS_NOTIFICATION_ID = 7301;
   private static final int RESULT_NOTIFICATION_ID = 7302;
-  private static final int BUILD_THREADS = 2;
+  // Half the cores, between 2 and 4: phones have about that many fast cores, and the build's memory hardly
+  // grows with threads. Two while a route is being followed, so the map stays smooth.
+  private static int buildThreads()
+  {
+    if (RoutingController.get().isNavigating())
+      return 2;
+    return Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2));
+  }
   // A build the app didn't live to finish (the system killed it, e.g. for memory): retried with one
   // thread (less memory), after the maps that haven't been killed.
   private static final String KEY_BUILDING = "plus_overlay_building";
@@ -282,7 +290,7 @@ public class PlusOverlayWork extends Worker
           updateProgress(name, PlusOverlay.nativeProgress(), PlusOverlay.nativeStage());
         }, 1, 1, TimeUnit.SECONDS);
 
-        final int threads = killedCount(countryId) > 0 ? 1 : BUILD_THREADS;
+        final int threads = killedCount(countryId) > 0 ? 1 : buildThreads();
         Logger.i(TAG, "Building the fast-routing overlay for " + countryId + " with " + threads + " threads");
         prefs.edit().putString(KEY_BUILDING, countryId).commit();
         sBuilding = countryId;

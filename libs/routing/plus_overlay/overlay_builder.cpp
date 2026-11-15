@@ -89,8 +89,8 @@ struct Cancelled
 {
 };
 
-// Progress over the build, by the share of time each stage took on a desktop (UP: extraction ~30%,
-// partition ~55%, customize ~15%).
+// Progress over the build, by the share of time each stage took on a desktop (UP: extraction ~35%,
+// partition ~35%, customize ~30%).
 struct Reporter
 {
   BuildOptions const & o;
@@ -223,7 +223,29 @@ private:
   bool m_parked = false;
 };
 
+// Z-order (Morton) number of a point, 16 bits per axis within the box of all points given.
+uint32_t ZOrder(double x, double y, double minX, double minY, double spanX, double spanY)
+{
+  auto spread = [](uint32_t v)
+  {
+    v &= 0xFFFF;
+    v = (v | (v << 8)) & 0x00FF00FF;
+    v = (v | (v << 4)) & 0x0F0F0F0F;
+    v = (v | (v << 2)) & 0x33333333;
+    v = (v | (v << 1)) & 0x55555555;
+    return v;
+  };
+  auto cell = [](double v, double mn, double span)
+  { return static_cast<uint32_t>(std::clamp(span > 0 ? (v - mn) / span * 65535.0 : 0.0, 0.0, 65535.0)); };
+  return spread(cell(x, minX, spanX)) | (spread(cell(y, minY, spanY)) << 1);
+}
+
 // Two walks over CoMaps' IndexGraph: degrees, then chains between kept segments.
+//
+// Both walks go through the roads in Z-order of their first point, not by feature id: a segment's edges need
+// the geometry of the roads it meets, CoMaps keeps only the last 10,000 roads it read, and feature ids say
+// little about where a road is. Going by place, the roads met are mostly ones just read. The result doesn't
+// depend on the order.
 void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<routing::Segment> const & forced,
                  std::vector<std::vector<uint32_t>> const & viaWay, Special const & sp, LeanGraph & lg,
                  Reporter const & rep)
@@ -240,14 +262,45 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   uint32_t const maxF = roads.empty() ? 0 : roads.back();
   std::vector<uint32_t> segs(maxF + 1, 0);
   std::vector<uint8_t> oneway(maxF + 1, 0);
-  for (uint32_t f : roads)
+  std::vector<float> firstLat(roads.size(), 0), firstLon(roads.size(), 0);
+  for (size_t r = 0; r < roads.size(); ++r)
   {
+    uint32_t const f = roads[r];
     auto const & road = ig.GetRoadGeometry(f);
     if (!road.IsValid() || road.GetPointsCount() < 2)
       continue;
     segs[f] = road.GetPointsCount() - 1;
     oneway[f] = road.IsOneWay() ? 1 : 0;
+    auto const & pt = road.GetPoint(0);
+    firstLat[r] = static_cast<float>(pt.m_lat);
+    firstLon[r] = static_cast<float>(pt.m_lon);
   }
+  // The roads by place (see above).
+  std::vector<uint32_t> byPlace;
+  {
+    double minLat = 1e9, maxLat = -1e9, minLon = 1e9, maxLon = -1e9;
+    for (size_t r = 0; r < roads.size(); ++r)
+    {
+      if (segs[roads[r]] == 0)
+        continue;
+      minLat = std::min<double>(minLat, firstLat[r]);
+      maxLat = std::max<double>(maxLat, firstLat[r]);
+      minLon = std::min<double>(minLon, firstLon[r]);
+      maxLon = std::max<double>(maxLon, firstLon[r]);
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> keyed;
+    keyed.reserve(roads.size());
+    for (size_t r = 0; r < roads.size(); ++r)
+      if (segs[roads[r]] != 0)
+        keyed.emplace_back(ZOrder(firstLon[r], firstLat[r], minLon, minLat, maxLon - minLon, maxLat - minLat),
+                           roads[r]);
+    std::sort(keyed.begin(), keyed.end());
+    byPlace.reserve(keyed.size());
+    for (auto const & kf : keyed)
+      byPlace.push_back(kf.second);
+  }
+  std::vector<float>().swap(firstLat);
+  std::vector<float>().swap(firstLon);
   lg.featBase.assign(maxF + 2, 0);
   for (uint32_t f = 0; f <= maxF; ++f)
     lg.featBase[f + 1] = lg.featBase[f] + segs[f];
@@ -258,12 +311,12 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   auto forEachValid = [&](double from, double span, std::string const & stage, auto && fn)
   {
     size_t done = 0;
-    for (uint32_t f : roads)
+    for (uint32_t f : byPlace)
     {
       if ((++done & 4095) == 0)
       {
         rep.CheckCancelled();
-        rep.Progress(from + span * done / roads.size(), stage);
+        rep.Progress(from + span * done / byPlace.size(), stage);
       }
       for (uint32_t i = 0; i < segs[f]; ++i)
         for (bool fwd : {true, false})
@@ -276,6 +329,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   std::vector<uint8_t> indeg(n, 0), outdeg(n, 0), valid(n, 0);
   std::vector<uint8_t> special(n, 0);  // kept, and a boundary at every level
   routing::IndexGraph::SegmentEdgeListT edges;
+  ig.SetPlusEdgesOnly(true);  // this walk only counts edges
   forEachValid(0.0, 0.12, "reading roads", [&](routing::Segment const & s)
   {
     uint32_t const v = lg.Slot(s);
@@ -283,7 +337,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
     ++lg.rawValid;
     edges.clear();
     ig.GetEdgeList(s, true /* isOutgoing */, true /* useRoutingOptions */, edges);
-    outdeg[v] = static_cast<uint8_t>(std::min<size_t>(2, edges.size()));
+    outdeg[v] = static_cast<uint8_t>(std::min<size_t>(255, edges.size()));
     lg.rawEdges += edges.size();
     for (auto const & e : edges)
     {
@@ -297,6 +351,7 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
       }
     }
   });
+  ig.SetPlusEdgesOnly(false);
   {
     std::ostringstream os;
     os << "pass 1 (degrees): " << lg.rawValid << " directed segments, " << lg.rawEdges << " edges in " << Since(t0)
@@ -342,20 +397,28 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   Graph & g = lg.g;
   g.n = kn;
   lg.baseN = kn;
-  lg.origId.reserve(kn);
+  // The walk isn't in vertex order, so every kept vertex gets room for as many edges as its segment has
+  // (pass 1), writes into it, and the few unused places are closed up afterwards.
+  lg.origId.assign(kn, 0);
   g.fwdOff.assign(kn + 1, 0);
-  g.lat.reserve(kn);
-  g.lon.reserve(kn);
-  // Compressed edges per kept vertex are ~2.2 on road graphs; a close reserve avoids the vector's
-  // doubling growth (a transient 1.5-2x of the largest arrays).
-  uint64_t const guess = static_cast<uint64_t>(kn * 2.3) + 1024;
-  g.fwdTo.reserve(guess);
-  g.fwdW.reserve(guess);
-  lg.interior.reserve(guess);
-  g.fwdK.reserve(guess);
-  g.fwdR.reserve(guess);
-  g.selfR.reserve(kn);
-  lg.roads.reserve(kn);
+  for (uint32_t v = 0, cu = 0; v < n; ++v)
+    if (lg.Kept(v))
+    {
+      lg.origId[cu] = v;
+      g.fwdOff[cu + 1] = g.fwdOff[cu] + outdeg[v];
+      ++cu;
+    }
+  uint64_t const room = g.fwdOff[kn];
+  std::vector<uint8_t> used(kn, 0);
+  g.lat.assign(kn, 0);
+  g.lon.assign(kn, 0);
+  g.fwdTo.assign(room, 0);
+  g.fwdW.assign(room, 0);
+  lg.interior.assign(room, 0);
+  g.fwdK.assign(room, 0);
+  g.fwdR.assign(room, 0);
+  g.selfR.assign(kn, 0);
+  lg.roads.assign(kn, 0);
   auto roadBits = [&ig](routing::Segment const & x)
   { return static_cast<uint8_t>(ig.GetRoadGeometry(x.GetFeatureId()).GetRoutingOptions().GetOptions()); };
   struct Out
@@ -370,19 +433,18 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   std::vector<Out> tmp;
   routing::IndexGraph::SegmentEdgeListT chainEdges;
   uint64_t dropped = 0;
-  forEachValid(0.12, 0.18, "joining road pieces", [&](routing::Segment const & s)
+  forEachValid(0.12, 0.23, "joining road pieces", [&](routing::Segment const & s)
   {
     uint32_t const v = lg.Slot(s);
     if (!lg.Kept(v))
       return;
-    uint32_t const cu = static_cast<uint32_t>(lg.origId.size());
-    lg.origId.push_back(v);
+    uint32_t const cu = lg.Rank(v);
     if (special[v])
       lg.allLevels.push_back(cu);
     auto const & pt = ig.GetPoint(s, true /* front */);
-    g.lat.push_back(static_cast<float>(pt.m_lat));
-    g.lon.push_back(static_cast<float>(pt.m_lon));
-    g.selfR.push_back(roadBits(s));
+    g.lat[cu] = static_cast<float>(pt.m_lat);
+    g.lon[cu] = static_cast<float>(pt.m_lon);
+    g.selfR[cu] = roadBits(s);
     edges.clear();
     ig.GetEdgeList(s, true, true, edges);
     tmp.clear();
@@ -424,20 +486,46 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
       tmp.push_back({lg.Rank(xs), inner, w, k, r});
     }
     std::sort(tmp.begin(), tmp.end());
+    uint64_t at = g.fwdOff[cu];
     for (size_t i = 0; i < tmp.size(); ++i)
     {
       if (i > 0 && tmp[i].to == tmp[i - 1].to && tmp[i].interior == tmp[i - 1].interior)
         continue;  // cheapest parallel edge
-      g.fwdTo.push_back(tmp[i].to);
-      g.fwdW.push_back(tmp[i].w);
-      g.fwdK.push_back(static_cast<uint8_t>(std::min<uint32_t>(tmp[i].k, 255)));
-      g.fwdR.push_back(tmp[i].r);
-      lg.interior.push_back(tmp[i].interior);
+      CHECK_LESS(at, g.fwdOff[cu + 1], (s));
+      g.fwdTo[at] = tmp[i].to;
+      g.fwdW[at] = tmp[i].w;
+      g.fwdK[at] = static_cast<uint8_t>(std::min<uint32_t>(tmp[i].k, 255));
+      g.fwdR[at] = tmp[i].r;
+      lg.interior[at] = tmp[i].interior;
+      ++at;
     }
-    g.fwdOff[cu + 1] = g.fwdTo.size();
-    lg.roads.push_back(roads);
+    used[cu] = static_cast<uint8_t>(at - g.fwdOff[cu]);
+    lg.roads[cu] = roads;
   });
-  CHECK_EQUAL(lg.origId.size(), kn, ());
+  // Close up the unused places (in vertex order, moving edges only towards the front).
+  {
+    uint64_t at = 0;
+    for (uint32_t cu = 0; cu < kn; ++cu)
+    {
+      uint64_t const from = g.fwdOff[cu];
+      g.fwdOff[cu] = at;
+      for (uint64_t i = 0; i < used[cu]; ++i, ++at)
+      {
+        g.fwdTo[at] = g.fwdTo[from + i];
+        g.fwdW[at] = g.fwdW[from + i];
+        g.fwdK[at] = g.fwdK[from + i];
+        g.fwdR[at] = g.fwdR[from + i];
+        lg.interior[at] = lg.interior[from + i];
+      }
+    }
+    g.fwdOff[kn] = at;
+    g.fwdTo.resize(at);
+    g.fwdW.resize(at);
+    g.fwdK.resize(at);
+    g.fwdR.resize(at);
+    lg.interior.resize(at);
+  }
+  std::sort(lg.allLevels.begin(), lg.allLevels.end());
   std::vector<uint8_t>().swap(outdeg);
   std::vector<uint8_t>().swap(special);
   std::ostringstream os;
@@ -704,14 +792,14 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     ParkedWeights parked(result.path + ".weights.tmp");
     if (parked.Park(g))
       ReleaseFreedMemory();
-    rep.Progress(0.30, "dividing the map into cells");
+    rep.Progress(0.35, "dividing the map into cells");
     PartitionParams pp;
     pp.cellSizes = DefaultCellSizes();
     pp.minBalance = kDefaultMinBalance;
     pp.directions = kDefaultDirections;
     pp.threads = threads;
     pp.cancelled = options.cancelled;
-    pp.progress = [&rep](double f) { rep.Progress(0.30 + 0.55 * f, "dividing the map into cells"); };
+    pp.progress = [&rep](double f) { rep.Progress(0.35 + 0.35 * f, "dividing the map into cells"); };
     t0 = Clock::now();
     Partition part;
     if (!options.partitionTreePath.empty())
@@ -750,7 +838,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
     }
     ReleaseFreedMemory();
 
-    rep.Progress(0.85, "computing shortcuts");
+    rep.Progress(0.70, "computing shortcuts");
     Overlay ov;
     t0 = Clock::now();
     BuildBoundaries(g, part, ov, &extra, &special);
@@ -768,7 +856,7 @@ BuildResult BuildOverlayFile(platform::LocalCountryFile const & localFileIn,
       rep.Log(os.str());
     }
     Customize(g, part, ov, threads, options.cancelled,
-              [&rep](double f) { rep.Progress(0.85 + 0.14 * f, "computing shortcuts"); });
+              [&rep](double f) { rep.Progress(0.70 + 0.29 * f, "computing shortcuts"); });
     rep.CheckCancelled();
     double const custSec = Since(t0);
     {

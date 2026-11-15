@@ -84,7 +84,19 @@ public class DownloaderService extends Service implements MapManager.StorageCall
 
     Logger.i(TAG, "Downloading: " + isDownloading + " failure: " + hasFailed);
 
-    if (!isDownloading)
+    if (isDownloading)
+    {
+      // Tabula: a map that has just arrived is prepared right away, while the others still download.
+      for (MapManager.StorageCallbackData item : data)
+      {
+        if (item.isLeafNode && item.newStatus == CountryItem.STATUS_DONE)
+        {
+          PlusOverlayWork.enqueue(this);
+          break;
+        }
+      }
+    }
+    else
     {
       // Tabula: prepare fast routing for the maps just downloaded or updated.
       PlusOverlayWork.onMapsChanged(this);

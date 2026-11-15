@@ -41,6 +41,8 @@ Done:
 - Once every map on a route is prepared, the route doesn't use CoMaps' old car search.
 - Roads open only at certain times (access:conditional) are checked for the time the route gets there, not frozen when the map is prepared.
 - Preparation memory down by about 17% (Uttar Pradesh 960 MB to 800 MB at the peak).
+- Preparation about twice as fast, with the same route data (2026-11-15). On the 2-core test machine with 2 threads: Uttar Pradesh 127 s to 68 s for a first preparation and 54 s to 45 s after a map update; Madhya Pradesh 60 s to 31 s and Maharashtra 88 s to 49 s on one thread. Dividing a map into cells takes a third of the time it did (Uttar Pradesh 68 s to 24 s), reading the roads two thirds (35 s to 23 s). The files for Madhya Pradesh and Maharashtra are byte for byte the same as before apart from the random build id, and Uttar Pradesh gets the same cells.
+- A map is prepared as soon as its download finishes, while other maps still download; before, nothing started until the whole download queue was done. Preparation uses 2 to 4 threads depending on the phone, 2 while a route is followed.
 - Tested outside India: Berlin with Brandenburg, and Tyrol, Salzburg and Vorarlberg.
 
 Decided to leave as is:
@@ -178,7 +180,7 @@ Tested: with Madhya Pradesh unprepared, all 10 long Indian test routes stayed on
 
 What's left, and why:
 
-- A map that isn't prepared yet (just downloaded or updated) is crossed on estimates, and the stretch inside it uses CoMaps' search, until its data is ready (a minute or two per map). This is the design chosen in item 2; preparing on the phone can't be instant.
+- A map that isn't prepared yet (just downloaded or updated) is crossed on estimates, and the stretch inside it uses CoMaps' search, until its data is ready (about a minute for the largest maps on the test machine, less for most). This is the design chosen in item 2; preparing on the phone can't be instant.
 - One internal safety net remains: if a stretch can't be unpacked even on the roads, the route goes to CoMaps' search. It means a bug, and it didn't happen in any test.
 - A phone that can never spare the memory for a large map (about 800 MB for Uttar Pradesh) keeps retrying without finishing. Lower preparation memory would be the next step.
 - Cancel in the notification stops preparation until the app starts again or a route needs a map.
