@@ -190,15 +190,23 @@ std::vector<uint8_t> StronglyConnectedFrom(Graph const & g, VertexId seed, uint3
 
 namespace
 {
+// Recursive geometric bisection. At every node the points are projected onto |directions| lines; along each
+// line every balanced cut position is scored by the number of roads it crosses, and the best one is taken.
+//
+// Speed (the cells are the same as with a plain sort and a count over every road):
+// - a node's points are kept in ascending vertex id and numbered locally, with the node's roads listed once
+//   in those numbers, so every direction reads small dense arrays instead of jumping around the whole map;
+// - cuts are only allowed at positions kLo..kHi, so only the points around them are sorted (the rest only
+//   need to be on the right side), and only the roads reaching into that band are counted;
+// - big nodes, where no subtree runs beside this one yet, use the idle threads.
 class Bisector
 {
 public:
   Bisector(Graph const & g, PartitionParams const & params, Partition & p)
-    : m_g(g), m_params(params), m_p(p), m_memb(new std::atomic<uint32_t>[g.n])
+    : m_g(g), m_params(params), m_p(p), m_pos(new std::atomic<uint32_t>[g.n])
   {
     for (uint32_t v = 0; v < g.n; ++v)
-      m_memb[v].store(0, std::memory_order_relaxed);
-    m_rank.assign(g.n, 0);
+      m_pos[v].store(0, std::memory_order_relaxed);
     double latSum = 0;
     for (uint32_t v = 0; v < g.n; ++v)
       latSum += g.lat[v];
@@ -207,9 +215,10 @@ public:
     m_freeThreads = static_cast<int>(std::max(1u, params.threads)) - 1;
   }
 
-  // Subtrees touch disjoint vertex sets, so they can run on different threads: m_rank is only written
-  // for the subtree's own vertices, and m_memb (read for neighbours) holds a stamp unique to the call.
-  // Returns the node of |verts| in the partition tree.
+  // Subtrees touch disjoint vertex sets, so they can run on different threads: m_pos is only written for
+  // the subtree's own vertices; a neighbour's entry (possibly being rewritten by another subtree) is checked
+  // against this node's own vertex list.
+  // |verts| is in ascending order. Returns the node of |verts| in the partition tree.
   uint32_t Run(std::vector<VertexId> verts, uint64_t parentSize)
   {
     auto const & cs = m_params.cellSizes;
@@ -224,13 +233,10 @@ public:
     {
       if (m <= cs[li] && parentSize > cs[li])
       {
-        {
-          std::lock_guard<std::mutex> lock(m_cellMutex);
-          m_p.tree.nodes[node].closes |= static_cast<uint8_t>(1u << li);
-        }
         uint32_t id;
         {
           std::lock_guard<std::mutex> lock(m_cellMutex);
+          m_p.tree.nodes[node].closes |= static_cast<uint8_t>(1u << li);
           id = m_p.numCells[li]++;
         }
         for (VertexId v : verts)
@@ -246,78 +252,231 @@ public:
     if (m_params.cancelled && m_params.cancelled())
       return node;
 
-    uint32_t const stamp = m_stamp.fetch_add(1) + 1;
-    for (VertexId v : verts)
-      m_memb[v].store(stamp, std::memory_order_relaxed);
-
     size_t const kLo = std::max<size_t>(1, static_cast<size_t>(std::ceil(m_params.minBalance * m)));
     size_t const kHi = std::min<size_t>(m - 1, static_cast<size_t>(std::floor((1.0 - m_params.minBalance) * m)));
+    bool const hasBand = kLo <= kHi;
+    size_t const bandSize = hasBand ? kHi - kLo + 1 : 0;
 
-    std::vector<std::pair<float, VertexId>> kv(m);
-    std::vector<int32_t> diff(m + 2);
-    std::vector<VertexId> bestOrder;
+    int const helpers = m >= kHelpFrom ? Borrow() : 0;
+    // fn(from, to, shared) over [0, count), on this thread and the helpers.
+    auto inParts = [helpers](size_t count, auto && fn)
+    {
+      if (helpers == 0 || count < 4096)
+      {
+        fn(size_t(0), count, false);
+        return;
+      }
+      size_t const parts = static_cast<size_t>(helpers) + 1;
+      std::vector<std::thread> pool;
+      for (size_t t = 1; t < parts; ++t)
+        pool.emplace_back([&fn, t, parts, count]() { fn(count * t / parts, count * (t + 1) / parts, true); });
+      fn(size_t(0), count / parts, true);
+      for (auto & th : pool)
+        th.join();
+    };
+
+    inParts(m, [&](size_t from, size_t to, bool)
+    {
+      for (size_t i = from; i < to; ++i)
+        m_pos[verts[i]].store(static_cast<uint32_t>(i), std::memory_order_relaxed);
+    });
+    // The roads inside the node, in local numbers: built once, read by every direction. The largest nodes
+    // go without it (it would be the build's biggest array) and look their neighbours up instead.
+    bool const localRoads = m <= kLocalRoadsUpTo;
+    std::vector<uint32_t> adjOff, adjTo;
+    if (localRoads)
+    {
+      uint64_t total = 0;
+      for (VertexId v : verts)
+        total += m_g.fwdOff[v + 1] - m_g.fwdOff[v];
+      adjOff.resize(m + 1);
+      adjTo.reserve(total);
+      for (size_t i = 0; i < m; ++i)
+      {
+        adjOff[i] = static_cast<uint32_t>(adjTo.size());
+        VertexId const v = verts[i];
+        for (uint64_t e = m_g.fwdOff[v]; e < m_g.fwdOff[v + 1]; ++e)
+        {
+          VertexId const w = m_g.fwdTo[e];
+          uint32_t const pw = m_pos[w].load(std::memory_order_relaxed);
+          if (pw < m && verts[pw] == w)
+            adjTo.push_back(pw);
+        }
+      }
+      adjOff[m] = static_cast<uint32_t>(adjTo.size());
+    }
+
+    // Per direction. A point's rank is its position in the order by (projection, local number); the local
+    // number follows the vertex id. Points before position kLo - 1 all get rank 0 and points after kHi all
+    // get rank m - 1: the counts below read the same from them as from their exact ranks.
+    std::vector<float> key(m);
+    std::vector<uint16_t> bucket(m);
+    std::vector<uint32_t> rank(m);
+    std::vector<uint64_t> bestLeft;  // one bit per point: on the first side of the best cut so far
+    std::vector<uint32_t> start, cursor;
+    std::vector<uint64_t> mid;  // (projection, local number) of the points whose order matters, sorted
+    // band[j]: change of the cut count between positions kLo + j - 1 and kLo + j (band[0]: the count at kLo).
+    std::unique_ptr<std::atomic<int32_t>[]> band(new std::atomic<int32_t>[bandSize + 1]);
     int64_t bestCut = std::numeric_limits<int64_t>::max();
     size_t bestK = m / 2;
     int bestDir = -1;
     float bestThreshold = 0;
 
-    for (int d = 0; d < m_params.directions; ++d)
+    for (int d = 0; hasBand && d < m_params.directions; ++d)
     {
       double const a = M_PI * d / m_params.directions;
       float const c = static_cast<float>(std::cos(a)) * m_k;
       float const s = static_cast<float>(std::sin(a));
-      for (size_t i = 0; i < m; ++i)
-        kv[i] = {m_g.lon[verts[i]] * c + m_g.lat[verts[i]] * s, verts[i]};
-      std::sort(kv.begin(), kv.end());
-      for (size_t i = 0; i < m; ++i)
-        m_rank[kv[i].second] = static_cast<uint32_t>(i);
-
-      std::fill(diff.begin(), diff.end(), 0);
-      for (VertexId v : verts)
+      inParts(m, [&](size_t from, size_t to, bool)
       {
-        uint32_t const rv = m_rank[v];
-        for (uint64_t e = m_g.fwdOff[v]; e < m_g.fwdOff[v + 1]; ++e)
+        for (size_t i = from; i < to; ++i)
+          key[i] = m_g.lon[verts[i]] * c + m_g.lat[verts[i]] * s;
+      });
+      float mn = key[0], mx = key[0];
+      for (size_t i = 1; i < m; ++i)
+      {
+        mn = std::min(mn, key[i]);
+        mx = std::max(mx, key[i]);
+      }
+      // Buckets along the line (a point further along is never in an earlier bucket), so that only the
+      // buckets holding positions kLo - 1 .. kHi have to be sorted.
+      uint32_t const numBuckets = mx > mn ? static_cast<uint32_t>(std::clamp<size_t>(m / 16, 1, 65536)) : 1;
+      double const scale = mx > mn ? numBuckets / (static_cast<double>(mx) - mn) : 0.0;
+      start.assign(numBuckets + 1, 0);
+      for (size_t i = 0; i < m; ++i)
+      {
+        double const x = (static_cast<double>(key[i]) - mn) * scale;
+        uint32_t const bk = x >= numBuckets ? numBuckets - 1 : static_cast<uint32_t>(x);
+        bucket[i] = static_cast<uint16_t>(bk);
+        ++start[bk + 1];
+      }
+      for (uint32_t bk = 0; bk < numBuckets; ++bk)
+        start[bk + 1] += start[bk];
+      // The buckets holding positions kLo - 1 and kHi.
+      uint32_t const bLo =
+          static_cast<uint32_t>(std::upper_bound(start.begin(), start.end(), static_cast<uint32_t>(kLo - 1)) - start.begin()) - 1;
+      uint32_t const bHi =
+          static_cast<uint32_t>(std::upper_bound(start.begin(), start.end(), static_cast<uint32_t>(kHi)) - start.begin()) - 1;
+      uint32_t const midBase = start[bLo];
+      mid.resize(start[bHi + 1] - midBase);
+      cursor.assign(start.begin(), start.end() - 1);
+      for (size_t i = 0; i < m; ++i)
+      {
+        uint32_t const bk = bucket[i];
+        if (bk < bLo)
+          rank[i] = 0;
+        else if (bk > bHi)
+          rank[i] = static_cast<uint32_t>(m - 1);
+        else
+          mid[cursor[bk]++ - midBase] = (static_cast<uint64_t>(KeyBits(key[i])) << 32) | i;
+      }
+      inParts(bHi - bLo + 1, [&](size_t from, size_t to, bool)
+      {
+        for (size_t bk = bLo + from; bk < bLo + to; ++bk)
+          std::sort(mid.begin() + (start[bk] - midBase), mid.begin() + (start[bk + 1] - midBase));
+      });
+      inParts(mid.size(), [&](size_t from, size_t to, bool)
+      {
+        for (size_t j = from; j < to; ++j)
+          rank[static_cast<uint32_t>(mid[j])] = midBase + static_cast<uint32_t>(j);
+      });
+
+      for (size_t j = 0; j <= bandSize; ++j)
+        band[j].store(0, std::memory_order_relaxed);
+      // A road between ranks lo < hi is cut at position k when lo < k <= hi.
+      auto count = [&band, kLo, kHi](uint32_t ra, uint32_t rb, bool shared)
+      {
+        uint32_t const lo = std::min(ra, rb), hi = std::max(ra, rb);
+        if (lo >= kHi || hi < kLo)
+          return;
+        size_t const up = lo + 1 > kLo ? lo + 1 - kLo : 0;
+        if (shared)
         {
-          VertexId const w = m_g.fwdTo[e];
-          if (m_memb[w].load(std::memory_order_relaxed) != stamp)
-            continue;
-          uint32_t lo = rv, hi = m_rank[w];
-          if (lo > hi)
-            std::swap(lo, hi);
-          ++diff[lo + 1];
-          --diff[hi + 1];
+          band[up].fetch_add(1, std::memory_order_relaxed);
+          if (hi + 1 <= kHi)
+            band[hi + 1 - kLo].fetch_sub(1, std::memory_order_relaxed);
         }
+        else
+        {
+          band[up].store(band[up].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+          if (hi + 1 <= kHi)
+            band[hi + 1 - kLo].store(band[hi + 1 - kLo].load(std::memory_order_relaxed) - 1,
+                                     std::memory_order_relaxed);
+        }
+      };
+      if (localRoads)
+      {
+        inParts(m, [&](size_t from, size_t to, bool shared)
+        {
+          for (size_t i = from; i < to; ++i)
+          {
+            uint32_t const rv = rank[i];
+            for (uint32_t e = adjOff[i]; e < adjOff[i + 1]; ++e)
+              count(rv, rank[adjTo[e]], shared);
+          }
+        });
+      }
+      else
+      {
+        inParts(m, [&](size_t from, size_t to, bool shared)
+        {
+          for (size_t i = from; i < to; ++i)
+          {
+            VertexId const v = verts[i];
+            uint32_t const rv = rank[i];
+            for (uint64_t e = m_g.fwdOff[v]; e < m_g.fwdOff[v + 1]; ++e)
+            {
+              VertexId const w = m_g.fwdTo[e];
+              uint32_t const pw = m_pos[w].load(std::memory_order_relaxed);
+              if (pw < m && verts[pw] == w)
+                count(rv, rank[pw], shared);
+            }
+          }
+        });
       }
       int64_t cut = 0;
-      for (size_t k = 1; k <= kHi; ++k)
+      bool improved = false;
+      for (size_t k = kLo; k <= kHi; ++k)
       {
-        cut += diff[k];
-        if (k < kLo)
-          continue;
+        cut += band[k - kLo].load(std::memory_order_relaxed);
         bool const better = cut < bestCut || (cut == bestCut && std::llabs(static_cast<long long>(k) - static_cast<long long>(m / 2)) <
                                                                       std::llabs(static_cast<long long>(bestK) - static_cast<long long>(m / 2)));
         if (better)
         {
           bestCut = cut;
           bestK = k;
-          bestThreshold = kv[k - 1].first + (kv[k].first - kv[k - 1].first) / 2;
-          if (bestOrder.size() != m || d != bestDir)
-          {
-            bestOrder.resize(m);
-            for (size_t i = 0; i < m; ++i)
-              bestOrder[i] = kv[i].second;
-            bestDir = d;
-          }
+          float const before = KeyOfBits(static_cast<uint32_t>(mid[k - 1 - midBase] >> 32));
+          float const after = KeyOfBits(static_cast<uint32_t>(mid[k - midBase] >> 32));
+          bestThreshold = before + (after - before) / 2;
+          bestDir = d;
+          improved = true;
         }
       }
+      if (improved)
+      {
+        bestLeft.assign((m + 63) / 64, 0);
+        for (size_t i = 0; i < m; ++i)
+          if (rank[i] < bestK)
+            bestLeft[i >> 6] |= uint64_t(1) << (i & 63);
+      }
     }
-    std::vector<std::pair<float, VertexId>>().swap(kv);
-    std::vector<int32_t>().swap(diff);
+    std::vector<float>().swap(key);
+    std::vector<uint16_t>().swap(bucket);
+    std::vector<uint32_t>().swap(rank);
+    std::vector<uint64_t>().swap(mid);
+    std::vector<uint32_t>().swap(adjOff);
+    std::vector<uint32_t>().swap(adjTo);
+    band.reset();
+    GiveBack(helpers);
 
-    std::vector<VertexId> left(bestOrder.begin(), bestOrder.begin() + bestK);
-    std::vector<VertexId> right(bestOrder.begin() + bestK, bestOrder.end());
+    // Both halves in ascending vertex id again.
+    std::vector<VertexId> left, right;
+    left.reserve(bestK);
+    right.reserve(m - bestK);
+    for (size_t i = 0; i < m; ++i)
+      ((bestDir >= 0 ? ((bestLeft[i >> 6] >> (i & 63)) & 1) != 0 : i < bestK) ? left : right).push_back(verts[i]);
+    std::vector<uint64_t>().swap(bestLeft);
     std::vector<VertexId>().swap(verts);
-    std::vector<VertexId>().swap(bestOrder);
 
     {
       std::lock_guard<std::mutex> lock(m_cellMutex);
@@ -356,13 +515,47 @@ public:
   float K() const { return m_k; }
 
 private:
+  static constexpr size_t kHelpFrom = 200000;
+  static constexpr size_t kLocalRoadsUpTo = 2000000;
+
+  // A float's bits as an integer that sorts like the float (-0 and +0 alike).
+  static uint32_t KeyBits(float f)
+  {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    if (u == 0x80000000u)
+      u = 0;
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  }
+  static float KeyOfBits(uint32_t u)
+  {
+    u = (u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u;
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+  }
+
+  // Takes every thread that is idle right now; GiveBack returns them.
+  int Borrow()
+  {
+    int f = m_freeThreads.load();
+    while (f > 0 && !m_freeThreads.compare_exchange_weak(f, 0))
+    {
+    }
+    return std::max(0, f);
+  }
+  void GiveBack(int n)
+  {
+    if (n > 0)
+      m_freeThreads.fetch_add(n);
+  }
+
   Graph const & m_g;
   PartitionParams const & m_params;
   Partition & m_p;
-  std::unique_ptr<std::atomic<uint32_t>[]> m_memb;
-  std::vector<uint32_t> m_rank;
+  // Index of a vertex in the vertex list of the node that holds it now.
+  std::unique_ptr<std::atomic<uint32_t>[]> m_pos;
   float m_k = 1;
-  std::atomic<uint32_t> m_stamp{0};
   std::atomic<int> m_freeThreads{0};
   std::atomic<uint64_t> m_placed{0};
   std::mutex m_cellMutex;

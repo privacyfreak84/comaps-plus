@@ -441,6 +441,11 @@ void IndexGraph::GetNeighboringEdge(astar::VertexData<Segment, RouteWeight> cons
   if (IsAccessNoForSure(rp, weightToFrom, useAccessConditional))
     return;
 
+  if (m_plusEdgesOnly)
+  {
+    edges.emplace_back(to, RouteWeight(0.0));
+    return;
+  }
   auto const weight = CalculateEdgeWeight(EdgeEstimator::Purpose::Weight, isOutgoing, from, to, weightToFrom);
 
   edges.emplace_back(to, weight);

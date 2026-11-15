@@ -100,6 +100,9 @@ public:
   // wherever avoid options apply (useRoutingOptions).
   void SetPlusBlocked(std::shared_ptr<plus_avoid::Blocked const> blocked) { m_plusBlocked = std::move(blocked); }
   std::shared_ptr<plus_avoid::Blocked const> const & GetPlusBlocked() const { return m_plusBlocked; }
+  // Tabula: while set, edge lists carry no weights (all zero): which edges exist doesn't depend on them,
+  // and the overlay builder's first walk only counts edges.
+  void SetPlusEdgesOnly(bool edgesOnly) { m_plusEdgesOnly = edgesOnly; }
   bool IsPlusBlocked(uint32_t featureId, uint32_t segmentIdx) const
   {
     return m_plusBlocked && m_plusBlocked->IsBlocked(featureId, segmentIdx);
@@ -236,6 +239,7 @@ private:
   RoadPenalty m_roadPenalty;
   RoutingOptions m_avoidRoutingOptions;
   std::shared_ptr<plus_avoid::Blocked const> m_plusBlocked;
+  bool m_plusEdgesOnly = false;
   bool m_isLeftHandTraffic;
 
   std::function<time_t()> m_currentTimeGetter = []() { return GetCurrentTimestamp(); };
