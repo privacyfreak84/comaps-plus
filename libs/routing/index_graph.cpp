@@ -18,6 +18,7 @@
 #include "base/timer.hpp"
 
 #include <algorithm>
+#include <unordered_map>
 #include <limits>
 #include <utility>
 
@@ -329,29 +330,170 @@ double IndexGraph::PlusTurnAroundExtraS()
   return extra;
 }
 
-bool IndexGraph::IsPlusTurnAround(Segment const & u, Segment const & c, Segment const & v) const
+namespace
 {
-  uint32_t const fu = u.GetFeatureId(), fc = c.GetFeatureId(), fv = v.GetFeatureId();
-  if (fu == fc || fv == fc || fu == fv || u.GetMwmId() != c.GetMwmId() || v.GetMwmId() != c.GetMwmId())
+thread_local std::unordered_map<JointSegment, std::vector<Segment>, std::hash<JointSegment>> g_plusFakeJoints;
+
+// Compass-free direction of a segment (x east, y north, in degrees of latitude).
+std::pair<double, double> PlusDir(ms::LatLon const & a, ms::LatLon const & b)
+{
+  double const k = cos(b.m_lat * math::pi / 180.0);
+  return {(b.m_lon - a.m_lon) * k, b.m_lat - a.m_lat};
+}
+
+double PlusCos(std::pair<double, double> const & a, std::pair<double, double> const & b)
+{
+  double const la = sqrt(a.first * a.first + a.second * a.second);
+  double const lb = sqrt(b.first * b.first + b.second * b.second);
+  if (la <= 0.0 || lb <= 0.0)
+    return 0.0;
+  return (a.first * b.first + a.second * b.second) / (la * lb);
+}
+}  // namespace
+
+void IndexGraph::PlusNoteFakeJoint(JointSegment const & fake, std::vector<Segment> reals)
+{
+  g_plusFakeJoints[fake] = std::move(reals);
+}
+
+void IndexGraph::PlusClearFakeJoints()
+{
+  g_plusFakeJoints.clear();
+}
+
+std::vector<Segment> const * IndexGraph::PlusFakeJointReals(JointSegment const & fake)
+{
+  auto const it = g_plusFakeJoints.find(fake);
+  return it == g_plusFakeJoints.end() ? nullptr : &it->second;
+}
+
+bool IndexGraph::IsPlusTurnAround(Segment const & u, Segment const * pieces, size_t k, Segment const & v) const
+{
+  if (k == 0 || k > kPlusTurnAroundMaxPieces || u.GetMwmId() != v.GetMwmId())
     return false;
+  uint32_t const fu = u.GetFeatureId(), fv = v.GetFeatureId();
   // Values, not references: the road cache may drop a road when another one is read.
-  ms::LatLon const c0 = GetPoint(c, false /* front */);
-  ms::LatLon const c1 = GetPoint(c, true /* front */);
-  if (ms::DistanceOnEarth(c0, c1) > kPlusTurnAroundMaxConnectorM)
-    return false;
-  if (!GetRoadGeometry(fu).IsOneWay() || !GetRoadGeometry(fv).IsOneWay())
-    return false;
   ms::LatLon const u0 = GetPoint(u, false /* front */);
   ms::LatLon const u1 = GetPoint(u, true /* front */);
   ms::LatLon const v0 = GetPoint(v, false /* front */);
   ms::LatLon const v1 = GetPoint(v, true /* front */);
-  double const k = cos(u1.m_lat * math::pi / 180.0);
-  double const ux = (u1.m_lon - u0.m_lon) * k, uy = u1.m_lat - u0.m_lat;
-  double const vx = (v1.m_lon - v0.m_lon) * k, vy = v1.m_lat - v0.m_lat;
-  double const lu = sqrt(ux * ux + uy * uy), lv = sqrt(vx * vx + vy * vy);
-  if (lu <= 0.0 || lv <= 0.0)
+  auto const du = PlusDir(u0, u1);
+  double const cosMax = cos(kPlusTurnAroundMaxDeg * math::pi / 180.0);
+  if (PlusCos(du, PlusDir(v0, v1)) > -cosMax)
     return false;
-  return (ux * vx + uy * vy) / (lu * lv) <= -cos(kPlusTurnAroundMaxDeg * math::pi / 180.0);
+  auto reversal = [](Segment const & a, Segment const & b)
+  {
+    return a.GetFeatureId() == b.GetFeatureId() && a.GetSegmentIdx() == b.GetSegmentIdx() &&
+           a.IsForward() != b.IsForward();
+  };
+  if (reversal(u, pieces[0]) || reversal(pieces[k - 1], v))
+    return false;
+  double len = 0.0;
+  for (size_t i = 0; i < k; ++i)
+  {
+    Segment const & c = pieces[i];
+    if (c.GetMwmId() != u.GetMwmId() || c.GetFeatureId() == fu || c.GetFeatureId() == fv ||
+        (i > 0 && reversal(pieces[i - 1], c)))
+      return false;
+    len += ms::DistanceOnEarth(GetPoint(c, false /* front */), GetPoint(c, true /* front */));
+    if (len > kPlusTurnAroundMaxConnectorM)
+      return false;
+  }
+  bool const uOneWay = GetRoadGeometry(fu).IsOneWay();
+  bool const vOneWay = GetRoadGeometry(fv).IsOneWay();
+  if (fu == fv)
+  {
+    // Back over the part of the road u came along.
+    if (uOneWay || u.IsForward() == v.IsForward())
+      return false;
+    return u.IsForward() ? v.GetSegmentIdx() <= u.GetSegmentIdx() : v.GetSegmentIdx() >= u.GetSegmentIdx();
+  }
+  if (!uOneWay || !vOneWay)
+    return false;
+  // How far to the side of u's direction v starts, from where u ends.
+  double const gap = ms::DistanceOnEarth(u1, v0);
+  double const along = PlusCos(du, PlusDir(u1, v0));
+  double const side = gap * sqrt(std::max(0.0, 1.0 - along * along));
+  return side <= kPlusTurnAroundMaxSideM;
+}
+
+bool IndexGraph::PlusTurnAroundEndsAt(std::vector<Segment> const & seq) const
+{
+  size_t const n = seq.size();
+  for (size_t k = 1; k <= kPlusTurnAroundMaxPieces && k + 2 <= n; ++k)
+    if (IsPlusTurnAround(seq[n - k - 2], &seq[n - k - 1], k, seq[n - 1]))
+      return true;
+  return false;
+}
+
+bool IndexGraph::PlusTurnAroundStartsAt(std::vector<Segment> const & seq) const
+{
+  size_t const n = seq.size();
+  for (size_t k = 1; k <= kPlusTurnAroundMaxPieces && k + 2 <= n; ++k)
+    if (IsPlusTurnAround(seq[0], &seq[1], k, seq[k + 1]))
+      return true;
+  return false;
+}
+
+bool IndexGraph::PlusJointTurnAround(JointSegment const & parentJoint, Segment const & parent,
+                                     Segment const & firstChild, bool isOutgoing,
+                                     Parents<JointSegment> const & parents) const
+{
+  // The segments the search came along, nearest first, back to the pieces' longest possible run and the
+  // segment before it: forward these come before |parent| (driving order reversed), backward after it.
+  std::vector<Segment> came;
+  size_t const want = kPlusTurnAroundMaxPieces + 1;
+  JointSegment j = parentJoint;
+  for (size_t hops = 0; hops <= want && came.size() < want; ++hops)
+  {
+    if (j.IsFake())
+    {
+      // Its real segments, outward from the end next to the new step.
+      if (auto const * reals = PlusFakeJointReals(j))
+      {
+        auto push = [&](Segment const & r)
+        {
+          if (came.size() < want && (came.empty() || !(came.back() == r)))
+            came.push_back(r);
+        };
+        if (isOutgoing)
+          for (auto it = reals->rbegin(); it != reals->rend(); ++it)
+            push(*it);
+        else
+          for (auto const & r : *reals)
+            push(r);
+      }
+      break;
+    }
+    // j's segments from the end next to the new step outward.
+    Segment s = j.GetSegment(!isOutgoing /* start */);
+    Segment const other = j.GetSegment(isOutgoing /* start */);
+    bool const inc = s.GetSegmentIdx() < other.GetSegmentIdx();
+    while (came.size() < want)
+    {
+      came.push_back(s);
+      if (s == other)
+        break;
+      s.Next(inc);
+    }
+    auto const it = parents.find(j);
+    if (it == parents.end())
+      break;
+    j = it->second;
+  }
+  if (came.empty() || !(came.front() == parent))
+    return false;
+  std::vector<Segment> seq;
+  seq.reserve(came.size() + 1);
+  if (isOutgoing)
+  {
+    seq.assign(came.rbegin(), came.rend());
+    seq.push_back(firstChild);
+    return PlusTurnAroundEndsAt(seq);
+  }
+  seq.push_back(firstChild);
+  seq.insert(seq.end(), came.begin(), came.end());
+  return PlusTurnAroundStartsAt(seq);
 }
 
 void IndexGraph::ReconstructJointSegment(astar::VertexData<JointSegment, RouteWeight> const & parentVertexData,
@@ -438,18 +580,10 @@ void IndexGraph::ReconstructJointSegment(astar::VertexData<JointSegment, RouteWe
     {
       RouteWeight weight =
           CalculateEdgeWeight(EdgeEstimator::Purpose::Weight, isOutgoing, prev, current, weightTimeToParent);
-      // Tabula: turning around on a divided road (IsPlusTurnAround). The third road is where the search
-      // came from: the end of the joint segment before |parent|'s (after it, searching backwards).
-      if (prev == parent && !parentJoint.IsFake() && parentJoint.GetStartSegmentId() == parentJoint.GetEndSegmentId())
-      {
-        auto const it = parents.find(parentJoint);
-        if (it != parents.end() && !it->second.IsFake())
-        {
-          Segment const other = it->second.GetSegment(!isOutgoing /* start */);
-          if (isOutgoing ? IsPlusTurnAround(other, parent, firstChild) : IsPlusTurnAround(firstChild, parent, other))
-            weight += RouteWeight(PlusTurnAroundExtraS());
-        }
-      }
+      // Tabula: completing a turn-around (IsPlusTurnAround) with this step, judged from the segments the
+      // search came along (its parents; from a fake joint, the segment the route starts or finishes on).
+      if (prev == parent && PlusTurnAroundExtraS() > 0.0 && PlusJointTurnAround(parentJoint, parent, firstChild, isOutgoing, parents))
+        weight += RouteWeight(PlusTurnAroundExtraS());
 
       if (isOutgoing || prev != parent)
         summaryWeight += weight;

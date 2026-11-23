@@ -1946,6 +1946,29 @@ RouterResultCode IndexRouter::RedressRoute(vector<Segment> const & segments, bas
   vector<double> times;
   times.reserve(segments.size());
 
+  // Tabula (tests): COMAPS_PLUS_LOG_WEIGHT=1 logs the route's weight as the forward search sees it, step by
+  // step from the starter's own edges, so that routes of different searches can be compared exactly.
+  if (getenv("COMAPS_PLUS_LOG_WEIGHT"))
+  {
+    double total = 0.0;
+    size_t missing = 0;
+    IndexGraphStarter::EdgeListT es;
+    for (size_t i = 1; i < segments.size(); ++i)
+    {
+      es.clear();
+      starter.GetOutgoingEdgesList(astar::VertexData<Segment, RouteWeight>(segments[i - 1], RouteWeight(total)), es);
+      double best = -1.0;
+      for (auto const & e : es)
+        if (e.GetTarget() == segments[i] && (best < 0.0 || e.GetWeight().GetIntegratedWeight() < best))
+          best = e.GetWeight().GetIntegratedWeight();
+      if (best < 0.0)
+        ++missing;
+      else
+        total += best;
+    }
+    LOG(LINFO, ("Tabula path weight:", total, "steps without an edge:", missing));
+  }
+
   // Time at first route point - weight of first segment.
   double time = starter.CalculateETAWithoutPenalty(segments.front());
   times.emplace_back(time);

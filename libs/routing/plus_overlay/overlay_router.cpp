@@ -469,7 +469,8 @@ struct OverlayRouter::Impl
   {
     extra = 0;
     auto const * ac = o.Automaton();
-    if (state == kTurnAroundCopyState)
+    bool const fromTurnCopy = state == kTurnAroundCopyState;
+    if (fromTurnCopy)
     {
       // A turn-around copy steps like the vertex it stands for, and charges the steps that complete the
       // turn-around.
@@ -493,7 +494,10 @@ struct OverlayRouter::Impl
     }
     if (!inner && o.NumTurnArounds() != 0)
     {
-      uint32_t const copy = o.TurnAroundCopy(o.IsCopy(from) ? o.CopyOrig(from) : from, target);
+      // The next piece of the run this copy is on, else a run starting here.
+      uint32_t copy = fromTurnCopy ? o.TurnAroundCopy(from, target) : kNone;
+      if (copy == kNone)
+        copy = o.TurnAroundCopy(o.IsCopy(from) ? o.CopyOrig(from) : from, target);
       if (copy != kNone)
         target = copy;
     }
@@ -956,24 +960,146 @@ struct OverlayRouter::Impl
   // The overlay vertex of the real segment under the fake segment next to real segment |s| in a FakeSearch
   // (|parent| from that search): the segment the route starts on, or finishes on. kNone if there is none in
   // map |m| or it is no overlay vertex.
-  uint32_t KeptOfFakeNeighbour(uint32_t m, Segment const & s, std::map<Segment, Segment> const & parent)
+  // Follows the turn-around copies (FileContents::turnArounds) along real segments |seq| (driving order),
+  // from overlay vertex |cur| of map |m| (kNone: from nothing). Adds the extra of every turn-around
+  // completed on the way to |extra| and returns the vertex to stand on at seq.back(): its turn-around copy
+  // if a run is open there, else its overlay vertex (kNone if it has none).
+  uint32_t TurnAroundWalk(uint32_t m, uint32_t cur, std::vector<Segment> const & seq, double & extra)
   {
-    auto const it = parent.find(s);
-    if (it == parent.end())
-      return kNone;
-    Segment r = it->second;
-    if (!starter->ConvertToReal(r) || r.GetMwmId() != maps[m].id)
-      return kNone;
-    auto const & o = *maps[m].ovl;
-    if (!o.HasSegment(r.GetFeatureId(), r.GetSegmentIdx()))
-      return kNone;
-    uint32_t const slot = o.Slot(r.GetFeatureId(), r.GetSegmentIdx(), r.IsForward());
-    return o.Kept(slot) ? o.Rank(slot) : kNone;
+    for (auto const & sg : seq)
+    {
+      uint32_t const sm = MapOfSegment(sg);
+      if (sm == kNone || (cur != kNone && sm != m))
+        cur = kNone;
+      m = sm;
+      if (sm == kNone)
+        continue;
+      auto const & o = *maps[m].ovl;
+      if (!o.HasSegment(sg.GetFeatureId(), sg.GetSegmentIdx()))
+      {
+        cur = kNone;
+        continue;
+      }
+      uint32_t const slot = o.Slot(sg.GetFeatureId(), sg.GetSegmentIdx(), sg.IsForward());
+      if (!o.Kept(slot))
+      {
+        cur = kNone;
+        continue;
+      }
+      uint32_t const b = o.Rank(slot);
+      uint32_t next = b;
+      if (cur != kNone && o.NumTurnArounds() != 0)
+      {
+        bool const turnCopy = o.IsCopy(cur) && o.CopyState(cur) == kTurnAroundCopyState;
+        if (turnCopy && o.TurnAroundCharged(cur, b))
+          extra += routing::IndexGraph::PlusTurnAroundExtraS();
+        uint32_t c = turnCopy ? o.TurnAroundCopy(cur, b) : kNone;
+        if (c == kNone)
+          c = o.TurnAroundCopy(o.IsCopy(cur) ? o.CopyOrig(cur) : cur, b);
+        if (c != kNone)
+          next = c;
+      }
+      cur = next;
+    }
+    return cur;
   }
+
 
   // Dijkstra over the starter's fake vertices from the start (forward) or the finish (backward).
   // |real| gets the first real segments reached with their costs; |parent| the fake predecessors.
   // |realPen| (optional) gets the penalty part of each real segment's cost (dynamic_edges.hpp).
+  // Every path over the starter's fake segments from the start (forward) or the finish (backward) to a real
+  // segment, or to the other end. The fake parts of the roads the ends snapped to are few, so the paths are
+  // too; unlike FakeSearch's one best path per real segment, they let a turn-around on the way be charged
+  // and a path without one be taken instead. |fakes|: from the end outward, the real segment not included;
+  // |cost| and |pen| as in FakeSearch.
+  struct FakePath
+  {
+    double cost = 0;
+    double pen = 0;
+    std::vector<Segment> fakes;
+  };
+  void EnumFakePaths(bool forward, std::map<Segment, std::vector<FakePath>> & toReal, std::vector<FakePath> & toEnd)
+  {
+    auto & st = *starter;
+    Segment const src = forward ? st.GetStartSegment() : st.GetFinishSegment();
+    Segment const dst = forward ? st.GetFinishSegment() : st.GetStartSegment();
+    std::vector<Segment> stack{src};
+    size_t found = 0;
+    std::function<void(double, double)> dive = [&](double cost, double pen)
+    {
+      routing::IndexGraphStarter::EdgeListT es;
+      routing::astar::VertexData<Segment, routing::RouteWeight> const vd(stack.back(), routing::RouteWeight(cost));
+      if (forward)
+        st.GetOutgoingEdgesList(vd, es);
+      else
+        st.GetIngoingEdgesList(vd, es);
+      for (auto const & e : es)
+      {
+        Segment const y = e.GetTarget();
+        if (std::find(stack.begin(), stack.end(), y) != stack.end() || found > kMaxFakePaths)
+          continue;
+        double const nc = cost + e.GetWeight().GetIntegratedWeight();
+        double const np = pen + PenaltyUnits(e.GetWeight()) * kPenaltyUnitS;
+        if (y == dst)
+        {
+          ++found;
+          toEnd.push_back({nc, np, stack});
+          toEnd.back().fakes.push_back(y);
+          continue;
+        }
+        if (!routing::IndexGraphStarter::IsFakeSegment(y))
+        {
+          ++found;
+          toReal[y].push_back({nc, np, stack});
+          continue;
+        }
+        if (stack.size() < kMaxFakeDepth)
+        {
+          stack.push_back(y);
+          dive(nc, np);
+          stack.pop_back();
+        }
+      }
+    };
+    dive(0.0, 0.0);
+  }
+  static constexpr size_t kMaxFakePaths = 4000;
+  static constexpr size_t kMaxFakeDepth = 12;
+
+  // Forward weight of the steps along |seq| over the starter (fake or real segments); kInf if a step is
+  // missing.
+  double ForwardCost(std::vector<Segment> const & seq)
+  {
+    routing::IndexGraphStarter::EdgeListT es;
+    double fw = 0;
+    for (size_t i = 0; i + 1 < seq.size(); ++i)
+    {
+      es.clear();
+      routing::astar::VertexData<Segment, routing::RouteWeight> const vd(seq[i], routing::RouteWeight(0));
+      starter->GetOutgoingEdgesList(vd, es);
+      double w = kInf;
+      for (auto const & e : es)
+        if (e.GetTarget() == seq[i + 1])
+          w = std::min(w, e.GetWeight().GetIntegratedWeight());
+      if (w >= kInf)
+        return kInf;
+      fw += w;
+    }
+    return fw;
+  }
+
+  // The real segments under fake segments |fakes| (driving order), consecutive repeats dropped.
+  std::vector<Segment> RealsOf(std::vector<Segment> const & fakes)
+  {
+    std::vector<Segment> out;
+    for (Segment r : fakes)
+      if ((!routing::IndexGraphStarter::IsFakeSegment(r) || starter->ConvertToReal(r)) &&
+          (out.empty() || !(out.back() == r)))
+        out.push_back(r);
+    return out;
+  }
+
   void FakeSearch(bool forward, std::map<Segment, double> & real, std::map<Segment, Segment> & parent,
                   double & direct, Segment & directLast, std::map<Segment, double> * realPen = nullptr)
   {
@@ -1153,6 +1279,23 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
   Segment dummy;
   std::map<Segment, double> srcPen;
   I.FakeSearch(true, srcReal, parF, direct, dummy, &srcPen);
+  // All paths over the ends' fake parts (Impl::EnumFakePaths), for the turn-arounds on them.
+  std::map<Segment, std::vector<Impl::FakePath>> startPaths, finishPaths;
+  std::vector<Impl::FakePath> directPaths, unusedPaths;
+  I.EnumFakePaths(true, startPaths, directPaths);
+  I.EnumFakePaths(false, finishPaths, unusedPaths);
+  std::vector<Segment> directFakes;  // a route on the ends' fake parts alone, if |direct| is one
+  direct = kInf;
+  for (auto const & dp : directPaths)
+  {
+    double ex = 0;
+    I.TurnAroundWalk(kNone, kNone, I.RealsOf(dp.fakes), ex);
+    if (dp.cost + ex < direct - 1e-6 || (dp.cost + ex <= direct + 1e-6 && dp.fakes.size() < directFakes.size()))
+    {
+      direct = dp.cost + ex;
+      directFakes = dp.fakes;
+    }
+  }
   double directB = kInf;
   I.FakeSearch(false, tgtReal, parB, directB, dummy);
   // The backward search ran on ingoing weights, which for fake segments differ slightly from the
@@ -1210,6 +1353,10 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     std::vector<Segment> chain;  // real segments from |real| to the overlay vertex (both included)
     bool leap = false;           // a border transition of an end's map without overlay (cost estimated)
     double pen = 0;              // penalty part of cost (start seeds; dynamic_edges.hpp)
+    // The fake segments between the end and |real| in driving order: start seeds from the start segment
+    // on, finish seeds up to the finish segment.
+    std::vector<Segment> fakes;
+    double fakeCost = 0;         // start seeds: cost of |fakes| alone, without turn-around extras
   };
   std::unordered_map<Key, Seed> src, tgt;
   // Ends in maps without a usable overlay: like CoMaps' long-route mode, the end connects to that map's
@@ -1272,70 +1419,104 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
       if (it == tgt.end() || w < it->second.cost)
         tgt[k] = {e, w, {}, true};
     });
-  for (auto const & [s, c] : srcReal)
+  for (auto const & [s, paths] : startPaths)
   {
     uint32_t const m = I.MapOfSegment(s);
     if (m == kNone)
       continue;
-    double w = c;
-    double pen = srcPen[s];
+    double chainW = 0;
+    double chainPen = 0;
     uint32_t kept;
     bool inner;
     std::vector<Segment> chain{s};
-    if (!I.WalkForward(m, s, w, kept, inner, &chain, &pen))
+    if (!I.WalkForward(m, s, chainW, kept, inner, &chain, &chainPen))
       continue;
-    // The route's first whole segment may be the connector of a turn-around that began on the start's own
-    // segment: stand on the connector's copy for that segment then.
-    if (chain.size() == 1)
-      if (uint32_t const before = I.KeptOfFakeNeighbour(m, s, parF); before != kNone)
-        if (uint32_t const copy = I.maps[m].ovl->TurnAroundCopy(before, kept); copy != kNone)
-          kept = copy;
-    Key const k = MakeKey(m, kept);
-    auto it = src.find(k);
-    if (it == src.end() || w < it->second.cost)
-      src[k] = {s, w, chain, false, pen};
+    for (auto const & fp : paths)
+    {
+      // Turn-arounds on the way from the start (over the parts of the roads the start snapped to) to |s|:
+      // charge those completed by |s|, and stand on |s|'s turn-around copy if a run is still open there.
+      std::vector<Segment> seq = I.RealsOf(fp.fakes);
+      seq.push_back(s);
+      double ex = 0;
+      uint32_t const at = I.TurnAroundWalk(kNone, kNone, seq, ex);
+      uint32_t const local = chain.size() == 1 && at != kNone ? at : kept;
+      double const w = fp.cost + chainW + ex;
+      Key const k = MakeKey(m, local);
+      auto it = src.find(k);
+      // Equal costs: the path over fewer fake parts (no zero-length detour at the start).
+      if (it == src.end() || w < it->second.cost - 1e-6 ||
+          (w <= it->second.cost + 1e-6 && fp.fakes.size() < it->second.fakes.size()))
+      {
+        Seed sd{s, w, chain, false, fp.pen + chainPen};
+        sd.fakes = fp.fakes;
+        sd.fakeCost = fp.cost;
+        src[k] = std::move(sd);
+      }
+    }
   }
-  for (auto const & [s, c] : tgtReal)
+  for (auto const & [s, paths] : finishPaths)
   {
     uint32_t const m = I.MapOfSegment(s);
     if (m == kNone)
       continue;
-    double w = c;
+    double chainW = 0;
     uint32_t kept;
     bool inner;
     std::vector<Segment> chain;  // segments after the overlay vertex up to and including |s| (empty if |s| is it)
-    if (!I.WalkBackward(m, s, w, kept, inner, &chain))
+    if (!I.WalkBackward(m, s, chainW, kept, inner, &chain))
       continue;
     auto const & o = *I.maps[m].ovl;
-    // Likewise at the finish: a turn-around completed onto the finish's own segment.
-    uint32_t const after = chain.empty() ? I.KeptOfFakeNeighbour(m, s, parB) : kNone;
-    auto add = [&](uint32_t local)
+    for (auto const & fp : paths)
     {
-      double const wl =
-          w + (after != kNone && o.IsCopy(local) && o.CopyState(local) == kTurnAroundCopyState &&
-                       o.TurnAroundCharged(local, after)
-                   ? routing::IndexGraph::PlusTurnAroundExtraS()
-                   : 0.0);
-      Key const k = MakeKey(m, local);
-      auto it = tgt.find(k);
-      if (it == tgt.end() || wl < it->second.cost)
-        tgt[k] = {s, wl, chain, false};
-    };
-    add(kept);
-    if (auto const * copies = o.CopiesOf(kept))
-      for (uint32_t cpy : *copies)
-        add(cpy);
+      // The backward enumeration ran on ingoing weights, which for fake segments differ slightly from the
+      // forward weights CoMaps scores a route with: cost the finish part forward.
+      std::vector<Segment> fakes(fp.fakes.rbegin(), fp.fakes.rend());
+      std::vector<Segment> steps{s};
+      steps.insert(steps.end(), fakes.begin(), fakes.end());
+      double const fw = I.ForwardCost(steps);
+      if (fw >= kInf)
+        continue;
+      // Turn-arounds completed after the overlay vertex, over the parts of the roads the finish snapped to.
+      std::vector<Segment> const after = I.RealsOf(fakes);
+      double exFree = 0;
+      if (!chain.empty())
+      {
+        std::vector<Segment> seq{s};
+        seq.insert(seq.end(), after.begin(), after.end());
+        I.TurnAroundWalk(kNone, kNone, seq, exFree);
+      }
+      auto add = [&](uint32_t local)
+      {
+        double ex = exFree;
+        if (chain.empty())
+          I.TurnAroundWalk(m, local, after, ex);
+        double const wl = fw + chainW + ex;
+        Key const k = MakeKey(m, local);
+        auto it = tgt.find(k);
+        if (it == tgt.end() || wl < it->second.cost - 1e-6 ||
+            (wl <= it->second.cost + 1e-6 && fakes.size() < it->second.fakes.size()))
+        {
+          Seed sd{s, wl, chain, false};
+          sd.fakes = fakes;
+          tgt[k] = std::move(sd);
+        }
+      };
+      add(kept);
+      if (auto const * copies = o.CopiesOf(kept))
+        for (uint32_t cpy : *copies)
+          add(cpy);
+    }
   }
 
   // A target real segment on a source chain: a route that never reaches an overlay vertex.
   double bestDirect = direct;
   std::vector<Segment> directReal;
-  Segment directSrc, directTgt;
+  std::vector<Segment> directPre, directSuf;  // fake segments before and after |directReal|
   for (auto const & [k, sd] : src)
   {
     if (sd.leap)
       continue;
-    double acc = srcReal.at(sd.real);
+    double acc = sd.fakeCost;
     for (size_t i = 0; i < sd.chain.size(); ++i)
     {
       if (i > 0)
@@ -1349,13 +1530,30 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
             w = std::min(w, e.GetWeight().GetIntegratedWeight());
         acc += w;
       }
-      auto it = tgtReal.find(sd.chain[i]);
-      if (it != tgtReal.end() && acc + it->second < bestDirect)
+      auto it = finishPaths.find(sd.chain[i]);
+      if (it == finishPaths.end() || acc >= bestDirect)
+        continue;
+      for (auto const & fp : it->second)
       {
-        bestDirect = acc + it->second;
-        directReal.assign(sd.chain.begin(), sd.chain.begin() + i + 1);
-        directSrc = sd.real;
-        directTgt = sd.chain[i];
+        std::vector<Segment> fakes(fp.fakes.rbegin(), fp.fakes.rend());
+        std::vector<Segment> steps{sd.chain[i]};
+        steps.insert(steps.end(), fakes.begin(), fakes.end());
+        double const fw = I.ForwardCost(steps);
+        if (fw >= kInf || acc + fw >= bestDirect)
+          continue;
+        std::vector<Segment> seq = I.RealsOf(sd.fakes);
+        seq.insert(seq.end(), sd.chain.begin(), sd.chain.begin() + i + 1);
+        auto const after = I.RealsOf(fakes);
+        seq.insert(seq.end(), after.begin(), after.end());
+        double ex = 0;
+        I.TurnAroundWalk(kNone, kNone, seq, ex);
+        if (acc + fw + ex < bestDirect)
+        {
+          bestDirect = acc + fw + ex;
+          directReal.assign(sd.chain.begin(), sd.chain.begin() + i + 1);
+          directPre = sd.fakes;
+          directSuf = fakes;
+        }
       }
     }
   }
@@ -1482,30 +1680,6 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
 
   lap(stats.searchMs);
   // 4. Assemble the starter path.
-  auto fakePrefix = [&](Segment const & firstReal)
-  {
-    std::vector<Segment> pre;
-    for (Segment x = parF.at(firstReal);; x = parF.at(x))
-    {
-      pre.push_back(x);
-      if (x == starter.GetStartSegment())
-        break;
-    }
-    std::reverse(pre.begin(), pre.end());
-    return pre;
-  };
-  auto fakeSuffix = [&](Segment const & lastReal)
-  {
-    std::vector<Segment> suf;
-    for (Segment x = parB.at(lastReal);; x = parB.at(x))
-    {
-      suf.push_back(x);
-      if (x == starter.GetFinishSegment())
-        break;
-    }
-    return suf;
-  };
-
   if (mu >= kInf && bestDirect >= kInf)
     return finish(Result::NoRoute, "");
 
@@ -1515,22 +1689,14 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     stats.weight = bestDirect;
     if (directReal.empty())
     {
-      // Fake vertices only: rebuild from the forward fake parents.
-      std::vector<Segment> pre;
-      for (Segment x = starter.GetFinishSegment();; x = parF.at(x))
-      {
-        pre.push_back(x);
-        if (x == starter.GetStartSegment())
-          break;
-      }
-      path.assign(pre.rbegin(), pre.rend());
+      // Fake vertices only.
+      path = directFakes;
     }
     else
     {
-      path = fakePrefix(directSrc);
+      path = directPre;
       path.insert(path.end(), directReal.begin(), directReal.end());
-      auto const suf = fakeSuffix(directTgt);
-      path.insert(path.end(), suf.begin(), suf.end());
+      path.insert(path.end(), directSuf.begin(), directSuf.end());
     }
   }
   else
@@ -1560,7 +1726,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     }
     else
     {
-      path = fakePrefix(s0.real);
+      path = s0.fakes;
       path.insert(path.end(), s0.chain.begin(), s0.chain.end());
     }
     stats.srcCost = s0.cost;
@@ -1612,8 +1778,7 @@ OverlayRouter::Result OverlayRouter::FindPath(routing::IndexGraphStarter & start
     if (!t0.leap)
     {
       path.insert(path.end(), t0.chain.begin(), t0.chain.end());
-      auto const suf = fakeSuffix(t0.real);
-      path.insert(path.end(), suf.begin(), suf.end());
+      path.insert(path.end(), t0.fakes.begin(), t0.fakes.end());
     }
     if (s0.leap || t0.leap)
     {
