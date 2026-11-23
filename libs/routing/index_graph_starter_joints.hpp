@@ -2,6 +2,7 @@
 
 #include "routing/base/astar_graph.hpp"
 #include "routing/base/astar_vertex_data.hpp"
+#include "routing/index_graph.hpp"
 
 #include "routing/joint_segment.hpp"
 #include "routing/segment.hpp"
@@ -564,6 +565,15 @@ typename IndexGraphStarterJoints<Graph>::EdgeListT IndexGraphStarterJoints<Graph
     fakeJoint =
         fromStart ? CreateFakeJoint(startSegment, segment, firstFeatureId) : CreateFakeJoint(segment, startSegment);
     result.emplace_back(fakeJoint, weight[beforeConvert]);
+    // Tabula: the turn-around rule (IndexGraph::IsPlusTurnAround) looks through fake joints to the real
+    // segments under them.
+    {
+      std::vector<Segment> reals;
+      for (Segment r : reconstructPath(beforeConvert, fromStart))
+        if ((IsRealSegment(r) || m_graph.ConvertToReal(r)) && (reals.empty() || !(reals.back() == r)))
+          reals.push_back(r);
+      IndexGraph::PlusNoteFakeJoint(fakeJoint, std::move(reals));
+    }
 
     std::vector<Segment> path = reconstructPath(beforeConvert, fromStart);
     m_reconstructedFakeJoints.emplace(fakeJoint, ReconstructedPath(std::move(path), fromStart));
@@ -643,6 +653,7 @@ void IndexGraphStarterJoints<Graph>::Reset()
   m_savedWeight.clear();
   m_fakeJointSegments.clear();
   m_reconstructedFakeJoints.clear();
+  IndexGraph::PlusClearFakeJoints();
   m_startOutEdges.clear();
   m_endOutEdges.clear();
   m_fakeId = 0;

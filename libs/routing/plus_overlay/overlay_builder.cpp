@@ -27,6 +27,7 @@
 #include <malloc.h>
 
 #include <algorithm>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -132,13 +133,12 @@ struct LeanGraph
   // Base vertices the search must be able to stand on at any level: ends of time-dependent edges.
   std::vector<uint32_t> allLevels;
   uint64_t rawSlots = 0, rawValid = 0, rawEdges = 0, dynamicEdges = 0;
-  // Turning around on a divided road (routing::IndexGraph::IsPlusTurnAround): raw slots from, connector, to.
-  // LeanExtract finds them and keeps their segments; LeanExpandTurnArounds turns them into copies.
-  struct TurnTriple
-  {
-    uint32_t from, connector, to;
-  };
-  std::vector<TurnTriple> turnTriples;
+  // Turn-arounds (routing::IndexGraph::IsPlusTurnAround), in raw slots: from, number of pieces k, the k
+  // pieces, to; one after the other. LeanExtract finds them and keeps their segments;
+  // LeanExpandTurnArounds turns them into copies.
+  std::vector<uint32_t> turnPaths;
+  size_t numTurnPaths = 0;
+  uint64_t turnsByPieces[5] = {0, 0, 0, 0, 0};  // found turn-arounds by number of pieces (4: 4 or more)
   std::vector<FileContents::TurnAround> turnArounds;
 
   bool Kept(uint32_t v) const { return (keptBits[v >> 6] >> (v & 63)) & 1; }
@@ -336,7 +336,57 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
   // Pass 1: degrees.
   std::vector<uint8_t> indeg(n, 0), outdeg(n, 0), valid(n, 0);
   std::vector<uint8_t> special(n, 0);  // kept, and a boundary at every level
-  routing::IndexGraph::SegmentEdgeListT edges, onward;
+  routing::IndexGraph::SegmentEdgeListT edges;
+  // Depth-first over the pieces after |u|: every run of up to kPlusTurnAroundMaxPieces segments off u's road,
+  // at most kPlusTurnAroundMaxConnectorM long, followed by a segment that completes a turn-around.
+  std::vector<routing::IndexGraph::SegmentEdgeListT> onward(routing::IndexGraph::kPlusTurnAroundMaxPieces);
+  std::vector<routing::Segment> pieces;
+  auto pieceLen = [&](routing::Segment const & p)
+  {
+    return ms::DistanceOnEarth(ig.GetPoint(p, false /* front */), ig.GetPoint(p, true /* front */));
+  };
+  std::function<void(routing::Segment const &, double)> dive = [&](routing::Segment const & u, double len)
+  {
+    size_t const depth = pieces.size();
+    auto & next = onward[depth - 1];
+    next.clear();
+    ig.GetEdgeList(pieces.back(), true /* isOutgoing */, true /* useRoutingOptions */, next);
+    for (size_t i = 0; i < next.size(); ++i)
+    {
+      routing::Segment const w = onward[depth - 1][i].GetTarget();
+      uint32_t const fw = w.GetFeatureId();
+      if (fw > maxF || w == u || sp.Dynamic(pieces.back(), w) ||
+          std::find(pieces.begin(), pieces.end(), w) != pieces.end())
+        continue;
+      if (ig.IsPlusTurnAround(u, pieces.data(), depth, w))
+      {
+        ++lg.turnsByPieces[std::min<size_t>(depth, 4)];
+        lg.turnPaths.push_back(lg.Slot(u));
+        lg.turnPaths.push_back(static_cast<uint32_t>(depth));
+        for (auto const & p : pieces)
+          lg.turnPaths.push_back(lg.Slot(p));
+        lg.turnPaths.push_back(lg.Slot(w));
+        ++lg.numTurnPaths;
+        continue;
+      }
+      if (fw == u.GetFeatureId() || depth >= routing::IndexGraph::kPlusTurnAroundMaxPieces)
+        continue;
+      double const l = len + pieceLen(w);
+      if (l > routing::IndexGraph::kPlusTurnAroundMaxConnectorM)
+        continue;
+      pieces.push_back(w);
+      dive(u, l);
+      pieces.pop_back();
+    }
+  };
+  auto findTurnArounds = [&](routing::Segment const & u, routing::Segment const & c)
+  {
+    double const l = pieceLen(c);
+    if (l > routing::IndexGraph::kPlusTurnAroundMaxConnectorM)
+      return;
+    pieces.assign(1, c);
+    dive(u, l);
+  };
   ig.SetPlusEdgesOnly(true);  // this walk only counts edges
   forEachValid(0.0, 0.12, "reading roads", [&](routing::Segment const & s)
   {
@@ -360,21 +410,9 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         ++lg.dynamicEdges;
         continue;
       }
-      // Turn-arounds starting on |s|: from a one-way road onto another road, then onto a third, one-way.
-      uint32_t const fc = c.GetFeatureId();
-      if (!oneway[f] || fc == f)
-        continue;
-      onward.clear();
-      ig.GetEdgeList(c, true /* isOutgoing */, true /* useRoutingOptions */, onward);
-      for (auto const & e2 : onward)
-      {
-        routing::Segment const w = e2.GetTarget();
-        uint32_t const fw = w.GetFeatureId();
-        if (fw == fc || fw == f || fw > maxF || !oneway[fw] || sp.Dynamic(c, w))
-          continue;
-        if (ig.IsPlusTurnAround(s, c, w))
-          lg.turnTriples.push_back({v, t, lg.Slot(w)});
-      }
+      // Turn-arounds starting on |s| with |c| as the first piece.
+      if (c.GetFeatureId() != f && c.GetFeatureId() <= maxF)
+        findTurnArounds(s, c);
     }
   });
   ig.SetPlusEdgesOnly(false);
@@ -411,10 +449,15 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
         for (uint32_t v = 2 * lg.featBase[f]; v < 2 * lg.featBase[f + 1]; ++v)
           if (valid[v])
             keep(v);
-  // The three segments of a turn-around are vertices, so its two steps are plain edges.
-  for (auto const & t : lg.turnTriples)
-    for (uint32_t v : {t.from, t.connector, t.to})
-      keep(v);
+  // The segments of a turn-around are vertices, so its steps are plain edges.
+  for (size_t i = 0; i < lg.turnPaths.size();)
+  {
+    uint32_t const k = lg.turnPaths[i + 1];
+    keep(lg.turnPaths[i]);
+    for (uint32_t j = 0; j <= k; ++j)
+      keep(lg.turnPaths[i + 2 + j]);
+    i += 3 + k;
+  }
   lg.keptRank.assign(lg.keptBits.size(), 0);
   for (size_t w = 1; w < lg.keptBits.size(); ++w)
     lg.keptRank[w] = lg.keptRank[w - 1] + static_cast<uint32_t>(__builtin_popcountll(lg.keptBits[w - 1]));
@@ -566,65 +609,115 @@ void LeanExtract(routing::IndexGraph & ig, routing::NumMwmId mwmId, std::vector<
 }
 
 // Turn-arounds on the compressed graph, after the via-way copies. A vertex here is a base vertex or a
-// via-way copy of one. For every edge from a vertex of |from| onto a vertex y of the connector, y gets a
-// copy (one per from and y) that the edge leads to instead; the copy has y's edges, and those onto the
-// roads that complete the turn-around cost extra. Copies are made after every redirection, so one
-// turn-around leading straight into another is covered too.
+// via-way copy of one ("under" vertex). The turn-arounds form a tree per |from| (base vertex of u): a node
+// per run of pieces c_1..c_i, holding the base vertices that complete a turn-around after it. Every node
+// that is entered gets a copy per under vertex of its last piece: an edge from a vertex of |from| onto an
+// under vertex y of c_1 leads to the copy (from, y) instead, and an edge of a copy onto an under vertex of a
+// child node's piece to the child's copy; a copy has its under vertex's edges otherwise, and those onto
+// vertices that complete a turn-around cost IndexGraph::PlusTurnAroundExtraS() more.
 void LeanExpandTurnArounds(LeanGraph & lg, Reporter const & rep)
 {
-  if (lg.turnTriples.empty())
+  if (lg.turnPaths.empty())
     return;
   Graph & g = lg.g;
-  // (from, connector) -> charged targets, in compressed base ids.
-  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> groups;
-  for (auto const & t : lg.turnTriples)
-    groups[{lg.Rank(t.from), lg.Rank(t.connector)}].push_back(lg.Rank(t.to));
-  std::vector<LeanGraph::TurnTriple>().swap(lg.turnTriples);
-  for (auto & [key, charged] : groups)
+  struct Node
   {
-    std::sort(charged.begin(), charged.end());
-    charged.erase(std::unique(charged.begin(), charged.end()), charged.end());
+    std::map<uint32_t, uint32_t> children;  // base vertex of the next piece -> node
+    std::vector<uint32_t> charged;          // base vertices completing a turn-around after this node
+  };
+  std::vector<Node> nodes;
+  std::map<std::pair<uint32_t, uint32_t>, uint32_t> roots;  // (from, base of c_1) -> node
+  for (size_t i = 0; i < lg.turnPaths.size();)
+  {
+    uint32_t const from = lg.Rank(lg.turnPaths[i]);
+    uint32_t const k = lg.turnPaths[i + 1];
+    uint32_t node = 0;
+    for (uint32_t j = 0; j < k; ++j)
+    {
+      uint32_t const c = lg.Rank(lg.turnPaths[i + 2 + j]);
+      uint32_t * slot;
+      if (j == 0)
+        slot = &roots.emplace(std::make_pair(from, c), uint32_t(-1)).first->second;
+      else
+        slot = &nodes[node].children.emplace(c, uint32_t(-1)).first->second;
+      if (*slot == uint32_t(-1))
+      {
+        *slot = static_cast<uint32_t>(nodes.size());
+        nodes.emplace_back();
+      }
+      node = *slot;
+    }
+    nodes[node].charged.push_back(lg.Rank(lg.turnPaths[i + 2 + k]));
+    i += 3 + k;
+  }
+  std::vector<uint32_t>().swap(lg.turnPaths);
+  for (auto & nd : nodes)
+  {
+    std::sort(nd.charged.begin(), nd.charged.end());
+    nd.charged.erase(std::unique(nd.charged.begin(), nd.charged.end()), nd.charged.end());
   }
 
   uint32_t const firstCopy = g.n;
   auto baseOf = [&](uint32_t v) { return v < lg.baseN ? v : lg.copyOrig[v - lg.baseN]; };
-  // Redirect first, then copy.
-  std::map<std::pair<uint32_t, uint32_t>, uint32_t> copyOf;  // (from base, y) -> copy
-  std::vector<std::pair<uint32_t, uint32_t>> copies;         // per copy: (from base, y)
+  struct Copy
+  {
+    uint32_t node, under, key;
+  };
+  std::vector<Copy> copies;
+  std::map<std::pair<uint32_t, uint32_t>, uint32_t> copyOf;  // (key, under) -> copy
+  auto copyFor = [&](uint32_t key, uint32_t node, uint32_t under)
+  {
+    auto const ins = copyOf.emplace(std::make_pair(key, under), firstCopy + static_cast<uint32_t>(copies.size()));
+    if (ins.second)
+      copies.push_back({node, under, key});
+    return ins.first->second;
+  };
+  auto usable = [&](uint64_t e) { return !lg.interior[e] && g.fwdW[e] < kInf; };
+  // Entering the trees: edges of the vertices of each |from|.
   for (uint32_t x = 0; x < firstCopy; ++x)
   {
     uint32_t const from = baseOf(x);
-    auto const lo = groups.lower_bound({from, 0});
-    if (lo == groups.end() || lo->first.first != from)
+    auto const lo = roots.lower_bound({from, 0});
+    if (lo == roots.end() || lo->first.first != from)
       continue;
     for (uint64_t e = g.fwdOff[x]; e < g.fwdOff[x + 1]; ++e)
     {
-      if (lg.interior[e] || !(g.fwdW[e] < kInf))
+      if (!usable(e))
         continue;
       uint32_t const y = g.fwdTo[e];
-      if (groups.find({from, baseOf(y)}) == groups.end())
-        continue;
-      auto const ins = copyOf.emplace(std::make_pair(from, y), firstCopy + static_cast<uint32_t>(copies.size()));
-      if (ins.second)
-        copies.emplace_back(from, y);
-      g.fwdTo[e] = ins.first->second;
+      auto const it = roots.find({from, baseOf(y)});
+      if (it != roots.end())
+        g.fwdTo[e] = copyFor(from, it->second, y);
     }
   }
+  // The copies, in id order (a copy made here gets a higher id and its turn later).
   uint64_t chargedEdges = 0;
   for (size_t i = 0; i < copies.size(); ++i)
   {
-    auto const [from, y] = copies[i];
-    uint32_t const c = baseOf(y);
-    auto const & charged = groups.at({from, c});
+    Copy const cp = copies[i];
+    uint32_t const id = firstCopy + static_cast<uint32_t>(i);
+    Node const & nd = nodes[cp.node];
+    uint32_t const y = cp.under;
     for (uint64_t e = g.fwdOff[y]; e < g.fwdOff[y + 1]; ++e)
     {
-      uint32_t const to = g.fwdTo[e];
-      // A target that is itself a new copy stands for the vertex it copies.
-      uint32_t const toBase = baseOf(to >= firstCopy ? copies[to - firstCopy].second : to);
-      bool const extra = !lg.interior[e] && g.fwdW[e] < kInf && std::binary_search(charged.begin(), charged.end(), toBase);
-      chargedEdges += extra;
+      uint32_t to = g.fwdTo[e];
+      double w = g.fwdW[e];
+      if (usable(e))
+      {
+        // A target that is a copy of another tree stands for its under vertex here.
+        uint32_t const toUnder = to >= firstCopy ? copies[to - firstCopy].under : to;
+        uint32_t const toBase = baseOf(toUnder);
+        if (std::binary_search(nd.charged.begin(), nd.charged.end(), toBase))
+        {
+          w += routing::IndexGraph::PlusTurnAroundExtraS();
+          ++chargedEdges;
+        }
+        auto const child = nd.children.find(toBase);
+        if (child != nd.children.end())
+          to = copyFor(id, child->second, toUnder);
+      }
       g.fwdTo.push_back(to);
-      g.fwdW.push_back(g.fwdW[e] + (extra ? routing::IndexGraph::PlusTurnAroundExtraS() : 0.0));
+      g.fwdW.push_back(w);
       if (!g.fwdK.empty())
         g.fwdK.push_back(g.fwdK[e]);
       if (!g.fwdR.empty())
@@ -640,21 +733,19 @@ void LeanExpandTurnArounds(LeanGraph & lg, Reporter const & rep)
     if (!g.selfR.empty())
       g.selfR.push_back(g.selfR[y]);
     FileContents::TurnAround ta;
-    ta.copy = firstCopy + static_cast<uint32_t>(i);
-    ta.from = from;
+    ta.copy = id;
+    ta.key = cp.key;
     ta.under = y;
-    ta.charged = charged;
+    ta.charged = nd.charged;
     lg.turnArounds.push_back(std::move(ta));
-  }
-  for (auto const & fy : copies)
-  {
-    lg.copyOrig.push_back(baseOf(fy.second));
+    lg.copyOrig.push_back(baseOf(y));
     lg.copyState.push_back(kTurnAroundCopyState);
   }
   g.n += static_cast<uint32_t>(copies.size());
   std::ostringstream os;
-  os << "turn-arounds: " << groups.size() << " places, " << copies.size() << " copies, " << chargedEdges
-     << " edges cost " << routing::IndexGraph::PlusTurnAroundExtraS() << " s more";
+  os << "turn-arounds by pieces 1/2/3/4+: " << lg.turnsByPieces[1] << "/" << lg.turnsByPieces[2] << "/"
+     << lg.turnsByPieces[3] << "/" << lg.turnsByPieces[4] << "; " << roots.size() << " starts, " << nodes.size() << " piece runs, " << copies.size()
+     << " copies, " << chargedEdges << " edges cost " << routing::IndexGraph::PlusTurnAroundExtraS() << " s more";
   rep.Log(os.str());
 }
 

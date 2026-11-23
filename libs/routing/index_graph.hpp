@@ -100,17 +100,37 @@ public:
   // wherever avoid options apply (useRoutingOptions).
   void SetPlusBlocked(std::shared_ptr<plus_avoid::Blocked const> blocked) { m_plusBlocked = std::move(blocked); }
   std::shared_ptr<plus_avoid::Blocked const> const & GetPlusBlocked() const { return m_plusBlocked; }
-  // Tabula: turning around on a divided road. CoMaps charges its U-turn penalty only for reversing on one
-  // road; going from one carriageway over a short connector onto the other is the same manoeuvre but paid
-  // two ordinary turns. True if |u| -> |c| -> |v| is one: three different roads, |u| and |v| one-way and
-  // running opposite ways (within kPlusTurnAroundMaxDeg), |c| at most kPlusTurnAroundMaxConnectorM long.
-  // Such a step costs PlusTurnAroundExtraS() more: in the fast-route data (overlay builder and router) and,
-  // from the search's parents, in the joint search used for maps without that data.
+  // Tabula: turning around. CoMaps charges its U-turn penalty only for reversing on one segment; turning
+  // around over other roads (a gap in a median, a loop, a lay-by, a small roundabout) paid ordinary turns.
+  // A turn-around is u, c_1..c_k, v: consecutive segments, 1 <= k <= kPlusTurnAroundMaxPieces pieces on
+  // other roads than u's and v's, together at most kPlusTurnAroundMaxConnectorM long, no step a reversal on
+  // one segment (CoMaps charges those already), v running the opposite way of u (within
+  // kPlusTurnAroundMaxDeg), and either
+  //  - u and v on two different one-way roads, v starting at most kPlusTurnAroundMaxSideM to the side of
+  //    where u ends (the other carriageway of a divided road, not a parallel street around a block); or
+  //  - u and v on the same two-way road, v going back over the part u came along (a loop, a lay-by, a
+  //    turning circle, a roundabout). A hairpin bend goes on along its road, so it isn't one.
+  // Completing one costs PlusTurnAroundExtraS() more: in the fast-route data (overlay builder and router)
+  // and, from the search's parents, in the joint search used for maps without that data.
   static constexpr double kPlusTurnAroundMaxConnectorM = 50.0;
   static constexpr double kPlusTurnAroundMaxDeg = 30.0;
+  static constexpr double kPlusTurnAroundMaxSideM = 30.0;
+  static constexpr size_t kPlusTurnAroundMaxPieces = 8;
   // 90 s; COMAPS_PLUS_TURNAROUND_S overrides it (tests: 0 gives CoMaps' own routes back).
   static double PlusTurnAroundExtraS();
-  bool IsPlusTurnAround(Segment const & u, Segment const & c, Segment const & v) const;
+  bool IsPlusTurnAround(Segment const & u, Segment const * pieces, size_t k, Segment const & v) const;
+  // Whether |seq| (segments in driving order) ends with a turn-around onto seq.back(), or starts with one
+  // from seq.front(); seq may be longer than needed.
+  bool PlusTurnAroundEndsAt(std::vector<Segment> const & seq) const;
+  bool PlusTurnAroundStartsAt(std::vector<Segment> const & seq) const;
+  // Tabula: the real segments under a fake joint of the joint search (the parts of the roads the start or
+  // finish snapped to, and the real segment it ends at), in driving order, noted by
+  // IndexGraphStarterJoints for the turn-around rule above.
+  static void PlusNoteFakeJoint(JointSegment const & fake, std::vector<Segment> reals);
+  static void PlusClearFakeJoints();
+  static std::vector<Segment> const * PlusFakeJointReals(JointSegment const & fake);
+  bool PlusJointTurnAround(JointSegment const & parentJoint, Segment const & parent, Segment const & firstChild,
+                           bool isOutgoing, Parents<JointSegment> const & parents) const;
 
   // Tabula: while set, edge lists carry no weights (all zero): which edges exist doesn't depend on them,
   // and the overlay builder's first walk only counts edges.

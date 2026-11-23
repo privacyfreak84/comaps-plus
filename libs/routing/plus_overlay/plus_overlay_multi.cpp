@@ -67,6 +67,7 @@ DEFINE_string(find, "", "find mode: print every named feature whose default name
 DEFINE_string(box, "", "roads mode: 'lat1,lon1,lat2,lon2'. Prints every car road with a point in the box: feature, "
                        "class, speeds used for the route choice and for the ETA (km/h), in a city or not, through "
                        "traffic allowed, one way, name, first and last point.");
+DEFINE_bool(print_turns, false, "router mode: print each route's last 3 turn instructions.");
 DEFINE_bool(weights, false, "router mode: print how each route's weight (what the search minimises) is made up: "
                             "seconds by road class, and every step that carries a penalty.");
 DEFINE_bool(force_joints, true, "router mode: COMAPS_PLUS_FORCE_JOINTS=1 for the normal search.");
@@ -847,15 +848,36 @@ int RunRouter(Multi & m)
     // Turn-arounds on divided roads the route makes (IndexGraph::IsPlusTurnAround), as "<name> turnarounds N".
     {
       size_t turns = 0;
-      for (size_t i = 0; i + 2 < segs.size(); ++i)
-        if (segs[i].GetMwmId() == segs[i + 1].GetMwmId() && segs[i].GetMwmId() == segs[i + 2].GetMwmId())
-        {
-          bool const t = m.world->GetIndexGraph(segs[i].GetMwmId()).IsPlusTurnAround(segs[i], segs[i + 1], segs[i + 2]);
-          turns += t;
-          if (t && FLAGS_weights)
-            std::cout << "    turn-around at step " << i << " of " << segs.size() << ": " << SegStr(segs[i]) << " "
-                      << SegStr(segs[i + 1]) << " " << SegStr(segs[i + 2]) << "\n";
-        }
+      size_t const window = routing::IndexGraph::kPlusTurnAroundMaxPieces + 2;
+      // A first or last segment the route only touches (the point snapped to its end) isn't driven on.
+      auto touched = [&](routing::Segment const & sg, m2::PointD const & pt, bool first)
+      {
+        auto & ig = m.world->GetIndexGraph(sg.GetMwmId());
+        m2::PointD const a = mercator::FromLatLon(ig.GetPoint(sg, false /* front */));
+        m2::PointD const b = mercator::FromLatLon(ig.GetPoint(sg, true /* front */));
+        m2::PointD const ab = b - a;
+        double const l2 = ab.SquaredLength();
+        double const t = l2 > 0 ? std::clamp(m2::DotProduct(pt - a, ab) / l2, 0.0, 1.0) : 0.0;
+        double const len = mercator::DistanceOnEarth(a, b);
+        return (first ? 1.0 - t : t) * len < 1.0;
+      };
+      size_t const firstDriven = !segs.empty() && segs.size() > 1 && touched(segs.front(), mercator::FromLatLon(r.a), true) ? 1 : 0;
+      size_t const lastDriven = !segs.empty() && segs.size() > 1 && touched(segs.back(), mercator::FromLatLon(r.b), false) ? segs.size() - 2 : segs.size() - 1;
+      for (size_t i = firstDriven + 2; !segs.empty() && i <= lastDriven; ++i)
+      {
+        size_t const from = std::max(firstDriven, i + 1 >= window ? i + 1 - window : 0);
+        std::vector<routing::Segment> seq(segs.begin() + from, segs.begin() + i + 1);
+        bool sameMap = true;
+        for (auto const & sg : seq)
+          sameMap = sameMap && sg.GetMwmId() == segs[i].GetMwmId();
+        if (!sameMap)
+          continue;
+        bool const t = m.world->GetIndexGraph(segs[i].GetMwmId()).PlusTurnAroundEndsAt(seq);
+        turns += t;
+        if (t && FLAGS_weights)
+          std::cout << "    turn-around ending at step " << i << " of " << segs.size() << ": onto " << SegStr(segs[i])
+                    << "\n";
+      }
       // And what the route costs in the search's terms: CoMaps' weight of every real step plus the extra for
       // each turn-around.
       double model = turns * routing::IndexGraph::PlusTurnAroundExtraS();
@@ -865,13 +887,54 @@ int RunRouter(Multi & m)
                        .CalculateEdgeWeight(routing::EdgeEstimator::Purpose::Weight, true /* isOutgoing */, segs[i],
                                             segs[i + 1])
                        .GetIntegratedWeight();
-      std::cout << "  " << r.name << " turnarounds " << turns << " cost " << model << "\n";
+      // Exact cost of the route in CoMaps' terms between the two points' projections: whole steps as above,
+      // plus the part of the first segment after the start's projection, minus the part of the last segment
+      // after the finish's projection. "off" = metres from each point to its projection.
+      double exact = model, offA = 0, offB = 0;
+      if (!segs.empty())
+      {
+        auto frac = [&](routing::Segment const & sg, m2::PointD const & pt, double & off)
+        {
+          auto & ig = m.world->GetIndexGraph(sg.GetMwmId());
+          m2::PointD const a = mercator::FromLatLon(ig.GetPoint(sg, false /* front */));
+          m2::PointD const b = mercator::FromLatLon(ig.GetPoint(sg, true /* front */));
+          m2::PointD const ab = b - a;
+          double const l2 = ab.SquaredLength();
+          double t = l2 > 0 ? m2::DotProduct(pt - a, ab) / l2 : 0.0;
+          t = std::clamp(t, 0.0, 1.0);
+          off = mercator::DistanceOnEarth(pt, a + ab * t);
+          return t;  // share of the segment before the projection
+        };
+        auto segW = [&](routing::Segment const & sg)
+        {
+          return m.world->GetIndexGraph(sg.GetMwmId())
+              .CalculateEdgeWeight(routing::EdgeEstimator::Purpose::Weight, true, sg, sg)
+              .GetIntegratedWeight();
+        };
+        double const t0 = frac(segs.front(), mercator::FromLatLon(r.a), offA);
+        double const tL = frac(segs.back(), mercator::FromLatLon(r.b), offB);
+        exact += (1.0 - t0) * segW(segs.front());
+        exact -= (1.0 - tL) * segW(segs.back());
+        if (segs.size() == 1)
+          exact = (tL - t0) * segW(segs.front());
+      }
+      std::cout << "  " << r.name << " turnarounds " << turns << " cost " << model << " exact " << exact << " off "
+                << offA << " " << offB << "\n";
     }
     out << r.name << " " << (code == routing::RouterResultCode::NoError ? 1 : 0) << " " << secs << " "
         << (code == routing::RouterResultCode::NoError ? route.GetTotalTimeSec() : 0.0) << " " << segs.size();
     for (auto const & s : segs)
       out << " " << SegStr(s);
     out << "\n";
+    if (code == routing::RouterResultCode::NoError && FLAGS_print_turns)
+    {
+      std::vector<routing::turns::TurnItem> turns;
+      route.GetTurnsForTesting(turns);
+      std::cout << "  " << r.name << " last turns:";
+      for (size_t i = turns.size() > 3 ? turns.size() - 3 : 0; i < turns.size(); ++i)
+        std::cout << " " << DebugPrint(turns[i].m_turn);
+      std::cout << "\n";
+    }
     if (code == routing::RouterResultCode::NoError && FLAGS_weights && segs.size() > 1)
     {
       std::map<std::string, std::pair<double, double>> byClass;  // class -> (weight seconds, metres)
